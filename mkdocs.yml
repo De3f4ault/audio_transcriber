@@ -1,0 +1,23 @@
+site_name: Audio Transcriber
+site_description: Professional-grade offline audio transcription
+site_author: de3f4ault
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: teal
+    accent: cyan
+  features:
+    - content.code.copy
+    - navigation.sections
+
+nav:
+  - Home: index.md
+  - Usage Guide: USAGE.md
+  - Architecture: ARCHITECTURE.md
+
+markdown_extensions:
+  - tables
+  - fenced_code
+  - codehilite

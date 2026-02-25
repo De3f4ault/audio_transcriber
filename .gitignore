@@ -1,11 +1,60 @@
-# Python virtual environment
+# Virtual environment
 venv/
 .venv/
+env/
 
-# Python cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Models (downloaded at runtime)
+models/
+*.bin
+*.pt
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
 
 # OS
 .DS_Store
+Thumbs.db
 
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Logs
+*.log
+logs/
+
+# Temporary audio files
+tmp/
+*.tmp
+site/
