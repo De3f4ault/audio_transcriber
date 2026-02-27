@@ -112,59 +112,6 @@ audiobench transcribe --check recording.m4a
 
 ---
 
-### `listen` — Real-Time Transcription (Live STT)
-
-Transcribe microphone input in real-time. Audio is processed continuously using voice activity detection (VAD). Results are automatically saved to your history database.
-
-```bash
-# Basic live transcription
-audiobench listen
-
-# Force a specific language (faster & more accurate if known)
-audiobench listen --language en
-
-# Use the fastest model (lower accuracy)
-audiobench listen --model tiny
-
-# Also save transcript to a text file
-audiobench listen --save meeting.txt
-```
-
-#### Live STT Tuning
-- **Cadence**: Text appears every ~4 seconds of continuous speech or after a 0.4s pause.
-- **Model**: Defaults to `base` (tuned with 4 CPU threads for ~0.5x real-time speed).
-- **History**: Live sessions appear in `audiobench history` as "🎤 Live session" and can be searched or spoken via TTS.
-
----
-
-### `speak` — Text-to-Speech (TTS)
-
-Speak text, files, or past transcripts aloud using the offline Piper TTS engine. High-quality voices are downloaded on-demand.
-
-```bash
-# Speak text directly
-audiobench speak "Hello world"
-
-# Speak a text file
-audiobench speak notes.txt
-
-# Speak a previous transcript from history
-audiobench speak --id 3
-
-# Save TTS output to a WAV file instead of playing
-audiobench speak "Hello" -o greeting.wav
-
-# Use a specific high-quality voice
-audiobench speak --voice en_US-lessac-high "Hello world"
-```
-
-#### Recommended High-Quality Voices
-- `en_US-lessac-high` (Female, Clear & Natural)
-- `en_US-ryan-high` (Male, Clear & Articulate)
-- `en_US-ljspeech-high` (Female, Audiobook style)
-
----
-
 ### `history` — View Past Transcriptions
 
 ```bash

@@ -13,11 +13,35 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 
 # ── Shared console ──────────────────────────────────────────
 console = Console(stderr=True)  # Chrome → stderr (keeps stdout clean for piping)
 stdout = Console()  # Raw text → stdout
+
+# ── Chat Markdown theme ────────────────────────────────────
+CHAT_THEME = Theme(
+    {
+        "markdown.h1": "bold bright_cyan underline",
+        "markdown.h2": "bold bright_cyan",
+        "markdown.h3": "bold cyan",
+        "markdown.h4": "bold dim cyan",
+        "markdown.code": "bright_green on grey11",
+        "markdown.code_inline": "bright_green on grey11",
+        "markdown.bold": "bold bright_white",
+        "markdown.italic": "italic magenta",
+        "markdown.block_quote": "italic bright_yellow",
+        "markdown.link": "underline bright_blue",
+        "markdown.link_url": "dim bright_blue",
+        "markdown.item.bullet": "bright_cyan",
+        "markdown.hr": "dim cyan",
+        "markdown.paragraph": "white",
+    }
+)
+CHAT_CODE_THEME = "dracula"
+
+chat_console = Console(stderr=True, theme=CHAT_THEME)
 
 # ── Color palette ───────────────────────────────────────────
 ACCENT = "cyan"
@@ -34,7 +58,7 @@ PHASE_PENDING = f"[{DIM}]  ○[/]"
 PHASE_ERROR = f"[{ERROR}]  ✗[/]"
 
 # ── App branding ───────────────────────────────────────────
-APP_NAME = "Audio Transcriber"
+APP_NAME = "AudioBench"
 APP_VERSION = "0.1.0"
 
 
