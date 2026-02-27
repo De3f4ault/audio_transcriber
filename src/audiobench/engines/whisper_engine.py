@@ -21,11 +21,11 @@ from collections.abc import Callable
 
 import numpy as np
 
-from src.transcriber.config.logging_config import get_logger
-from src.transcriber.core.exceptions import EngineError, ModelLoadError, ModelNotFoundError
-from src.transcriber.core.filters import collapse_repetitions, fix_broken_words
-from src.transcriber.core.models import Segment, Transcript, Word
-from src.transcriber.engines.base import TranscriptionEngine
+from src.audiobench.config.logging_config import get_logger
+from src.audiobench.core.exceptions import EngineError, ModelLoadError, ModelNotFoundError
+from src.audiobench.core.filters import collapse_repetitions, fix_broken_words
+from src.audiobench.core.models import Segment, Transcript, Word
+from src.audiobench.engines.base import TranscriptionEngine
 
 logger = get_logger("engines.whisper")
 

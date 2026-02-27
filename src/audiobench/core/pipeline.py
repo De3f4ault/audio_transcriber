@@ -15,14 +15,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from src.transcriber.config.logging_config import get_logger
-from src.transcriber.config.settings import get_settings
-from src.transcriber.core.ffmpeg import AudioLoader
-from src.transcriber.core.models import AudioMetadata, Segment, Transcript
-from src.transcriber.engines.base import TranscriptionEngine
-from src.transcriber.engines.factory import create_engine
-from src.transcriber.storage.database import init_db
-from src.transcriber.storage.repository import TranscriptionRepository
+from src.audiobench.config.logging_config import get_logger
+from src.audiobench.config.settings import get_settings
+from src.audiobench.core.ffmpeg import AudioLoader
+from src.audiobench.core.models import AudioMetadata, Segment, Transcript
+from src.audiobench.engines.base import TranscriptionEngine
+from src.audiobench.engines.factory import create_engine
+from src.audiobench.storage.database import init_db
+from src.audiobench.storage.repository import TranscriptionRepository
 
 logger = get_logger("core.pipeline")
 
@@ -74,6 +74,8 @@ class TranscriptionPipeline:
         skip_cache: bool = False,
         speed_preset: str | None = None,
         initial_prompt: str | None = None,
+        translate: bool = False,
+        enable_diarization: bool = False,
         on_phase: PhaseCallback | None = None,
         on_segment: SegmentCallback | None = None,
         filters: list[str] | None = None,
@@ -131,8 +133,10 @@ class TranscriptionPipeline:
                         return self._reconstruct_transcript(cached_data, metadata)
 
             # Step 2: Transcribe
+            task = "translate" if translate else "transcribe"
             if on_phase:
-                on_phase("transcribing", "Transcribing...", 0.0)
+                label = "Translating to English..." if translate else "Transcribing..."
+                on_phase("transcribing", label, 0.0)
 
             logger.info("Pipeline: transcribing with %s (preset=%s)", engine.engine_name, preset)
 
@@ -143,6 +147,7 @@ class TranscriptionPipeline:
             transcript = engine.transcribe(
                 wav_path,
                 language=language or self._settings.language,
+                task=task,
                 word_timestamps=word_ts,
                 beam_size=beam,
                 batch_size=batch,
@@ -157,6 +162,21 @@ class TranscriptionPipeline:
                 on_segment=on_segment,
             )
             transcript.audio = metadata
+
+            # Step 2.5: Diarization (optional)
+            if enable_diarization:
+                if on_phase:
+                    on_phase("diarizing", "Identifying speakers...", None)
+
+                logger.info("Pipeline: running speaker diarization")
+                try:
+                    from src.audiobench.diarization.engine import PyannoteDiarizer
+
+                    diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token)
+                    transcript = diarizer.diarize(wav_path, transcript)
+                    logger.info("Pipeline: diarization complete")
+                except Exception as e:
+                    logger.warning("Diarization failed (continuing without): %s", e)
 
             # Step 3: Store
             if on_phase:
@@ -178,7 +198,7 @@ class TranscriptionPipeline:
 
     def _write_output(self, transcript: Transcript, fmt: str, output_path: str) -> None:
         """Format transcript and write to file."""
-        from src.transcriber.output.base import get_formatter
+        from src.audiobench.output.base import get_formatter
 
         formatter = get_formatter(fmt)
         content = formatter.format(transcript)
@@ -189,7 +209,7 @@ class TranscriptionPipeline:
 
     def _reconstruct_transcript(self, data: dict, metadata: AudioMetadata) -> Transcript:
         """Reconstruct a Transcript from cached DB data."""
-        from src.transcriber.core.models import Segment
+        from src.audiobench.core.models import Segment
 
         segments = [
             Segment(

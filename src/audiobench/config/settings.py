@@ -1,12 +1,12 @@
 """Application settings using Pydantic Settings.
 
 Configuration is loaded from (in priority order):
-1. Environment variables (prefixed with TRANSCRIBER_)
+1. Environment variables (prefixed with AUDIOBENCH_)
 2. .env file in project root
 3. Default values defined here
 
 Usage:
-    from src.transcriber.config.settings import get_settings
+    from src.audiobench.config.settings import get_settings
     settings = get_settings()
     print(settings.model_name)  # "large-v3-turbo"
 """
@@ -22,11 +22,11 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class TranscriberSettings(BaseSettings):
-    """Central configuration for the audio transcriber."""
+class AudioBenchSettings(BaseSettings):
+    """Central configuration for the AudioBench."""
 
     model_config = SettingsConfigDict(
-        env_prefix="TRANSCRIBER_",
+        env_prefix="AUDIOBENCH_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
@@ -84,12 +84,32 @@ class TranscriberSettings(BaseSettings):
 
     # --- Storage ---
     models_dir: Path = Field(
-        default=Path.home() / ".transcriber" / "models",
+        default=Path.home() / ".audiobench" / "models",
         description="Directory for downloaded models",
     )
     data_dir: Path = Field(
-        default=Path.home() / ".transcriber",
+        default=Path.home() / ".audiobench",
         description="Base directory for app data",
+    )
+
+    # --- Text-to-Speech ---
+    tts_voice: str = Field(
+        default="en_US-amy-medium",
+        description="Default Piper TTS voice model name",
+    )
+    voices_dir: Path = Field(
+        default=Path.home() / ".audiobench" / "voices",
+        description="Directory for TTS voice models",
+    )
+
+    # --- AI / LLM ---
+    ollama_model: str = Field(
+        default="qwen3-next:80b-cloud",
+        description="Default Ollama model for AI features",
+    )
+    ollama_base_url: str = Field(
+        default="http://localhost:11434",
+        description="Ollama server base URL",
     )
 
     # --- Logging ---
@@ -222,6 +242,6 @@ class TranscriberSettings(BaseSettings):
 
 
 @lru_cache(maxsize=1)
-def get_settings() -> TranscriberSettings:
+def get_settings() -> AudioBenchSettings:
     """Get cached application settings (singleton)."""
-    return TranscriberSettings()
+    return AudioBenchSettings()

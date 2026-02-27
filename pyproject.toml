@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "audio-transcriber"
+name = "audiobench"
 version = "0.1.0"
-description = "Professional-grade offline audio transcription with multilingual support"
+description = "Offline audio workbench — transcription, TTS, streaming, and more"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -37,8 +37,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-streaming = ["pyaudio>=0.2.14", "sounddevice>=0.5.0"]
+streaming = ["RealtimeSTT>=0.3.0"]
 diarization = ["pyannote.audio>=3.3.0", "torch>=2.0.0", "torchaudio>=2.0.0"]
+tts = ["piper-tts>=1.2.0", "sounddevice>=0.5.0"]
+ai = ["requests>=2.31.0"]
 vosk = ["vosk>=0.3.45"]
 dev = [
     "pytest>=8.0.0",
@@ -48,10 +50,10 @@ dev = [
     "mypy>=1.10.0",
 ]
 docs = ["zensical>=0.0.23"]
-all = ["audio-transcriber[streaming,diarization,vosk,dev,docs]"]
+all = ["audiobench[streaming,diarization,tts,ai,vosk,dev,docs]"]
 
 [project.scripts]
-transcriber = "cli.main:cli"
+audiobench = "cli.main:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]

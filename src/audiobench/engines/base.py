@@ -18,7 +18,7 @@ from typing import Optional
 
 import numpy as np
 
-from src.transcriber.core.models import Transcript
+from src.audiobench.core.models import Transcript
 
 
 class TranscriptionEngine(ABC):

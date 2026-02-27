@@ -1,7 +1,7 @@
 """Engine factory — creates transcription engines from configuration.
 
 Usage:
-    from src.transcriber.engines.factory import create_engine
+    from src.audiobench.engines.factory import create_engine
 
     engine = create_engine("whisper", model_name="large-v3-turbo", device="cpu")
     transcript = engine.transcribe("audio.wav", batch_size=4)
@@ -9,9 +9,9 @@ Usage:
 
 from __future__ import annotations
 
-from src.transcriber.config.logging_config import get_logger
-from src.transcriber.core.exceptions import EngineError
-from src.transcriber.engines.base import TranscriptionEngine
+from src.audiobench.config.logging_config import get_logger
+from src.audiobench.core.exceptions import EngineError
+from src.audiobench.engines.base import TranscriptionEngine
 
 logger = get_logger("engines.factory")
 
@@ -28,14 +28,14 @@ def register_engine(name: str, engine_class: type[TranscriptionEngine]) -> None:
 def _ensure_registered() -> None:
     """Lazy-register built-in engines on first use."""
     if "whisper" not in _ENGINE_REGISTRY:
-        from src.transcriber.engines.whisper_engine import WhisperEngine
+        from src.audiobench.engines.whisper_engine import WhisperEngine
 
         register_engine("whisper", WhisperEngine)
 
     # Vosk is optional — only register if available
     if "vosk" not in _ENGINE_REGISTRY:
         try:
-            from src.transcriber.engines.vosk_engine import VoskEngine
+            from src.audiobench.engines.vosk_engine import VoskEngine
 
             register_engine("vosk", VoskEngine)
         except ImportError:

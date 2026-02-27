@@ -1,7 +1,7 @@
-"""Custom exceptions for the audio transcriber.
+"""Custom exceptions for the AudioBench.
 
 Exception hierarchy:
-    TranscriberError
+    AudioBenchError
     ├── AudioLoadError       — Failed to load/convert audio file
     ├── UnsupportedFormatError — Audio format not supported
     ├── EngineError          — Transcription engine failure
@@ -14,8 +14,8 @@ Exception hierarchy:
 """
 
 
-class TranscriberError(Exception):
-    """Base exception for all transcriber errors."""
+class AudioBenchError(Exception):
+    """Base exception for all AudioBench errors."""
 
     def __init__(self, message: str, details: str | None = None) -> None:
         self.message = message
@@ -31,7 +31,7 @@ class TranscriberError(Exception):
 # --- Audio Loading ---
 
 
-class AudioLoadError(TranscriberError):
+class AudioLoadError(AudioBenchError):
     """Failed to load or convert an audio file."""
 
     def __init__(self, file_path: str, reason: str) -> None:
@@ -42,7 +42,7 @@ class AudioLoadError(TranscriberError):
         )
 
 
-class UnsupportedFormatError(TranscriberError):
+class UnsupportedFormatError(AudioBenchError):
     """Audio format is not supported."""
 
     def __init__(self, file_path: str, format_ext: str) -> None:
@@ -58,7 +58,7 @@ class UnsupportedFormatError(TranscriberError):
 # --- Engine ---
 
 
-class EngineError(TranscriberError):
+class EngineError(AudioBenchError):
     """Transcription engine failure."""
 
 
@@ -87,28 +87,28 @@ class ModelLoadError(EngineError):
 # --- Storage ---
 
 
-class StorageError(TranscriberError):
+class StorageError(AudioBenchError):
     """Database or persistence layer failure."""
 
 
 # --- Streaming ---
 
 
-class StreamingError(TranscriberError):
+class StreamingError(AudioBenchError):
     """Real-time audio streaming failure."""
 
 
 # --- Diarization ---
 
 
-class DiarizationError(TranscriberError):
+class DiarizationError(AudioBenchError):
     """Speaker diarization failure."""
 
 
 # --- Output ---
 
 
-class OutputFormatError(TranscriberError):
+class OutputFormatError(AudioBenchError):
     """Failed to format transcription output."""
 
     def __init__(self, format_name: str, reason: str) -> None:

@@ -1,5 +1,5 @@
-site_name: Audio Transcriber
-site_description: Professional-grade offline audio transcription
+site_name: AudioBench
+site_description: offline audio workbench
 site_author: de3f4ault
 
 theme:

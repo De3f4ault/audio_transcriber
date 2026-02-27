@@ -8,7 +8,7 @@ Replaces pydub with direct ffmpeg calls for:
 System requirements: ffmpeg and ffprobe on PATH.
 
 Usage:
-    from src.transcriber.core.ffmpeg import AudioLoader
+    from src.audiobench.core.ffmpeg import AudioLoader
 
     with AudioLoader() as loader:
         wav_path, metadata = loader.load("/path/to/meeting.m4a")
@@ -36,9 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
-from src.transcriber.config.logging_config import get_logger
-from src.transcriber.core.exceptions import AudioLoadError, UnsupportedFormatError
-from src.transcriber.core.models import AudioMetadata
+from src.audiobench.config.logging_config import get_logger
+from src.audiobench.core.exceptions import AudioLoadError, UnsupportedFormatError
+from src.audiobench.core.models import AudioMetadata
 
 logger = get_logger("core.ffmpeg")
 
@@ -415,7 +415,7 @@ class AudioLoader:
         import wave
 
         fd, wav_path = tempfile.mkstemp(
-            prefix=f"transcriber_{stem}_",
+            prefix=f"audiobench_{stem}_",
             suffix=".wav",
             dir=self._temp_dir,
         )

@@ -5,7 +5,7 @@
 VENV := venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
-CLI := $(VENV)/bin/transcriber
+CLI := $(VENV)/bin/audiobench
 
 # ── Help ─────────────────────────────────────────────────────
 
@@ -46,10 +46,40 @@ info: ## Show system info and settings
 download: ## Download a model (make download MODEL=large-v3-turbo)
 	$(CLI) download $(or $(MODEL),large-v3-turbo)
 
+# ── New Features ─────────────────────────────────────────────
+.PHONY: translate subtitle listen speak download-voice summarize ask diarize
+
+translate: ## Translate audio to English (make translate FILE=audio.m4a)
+	$(CLI) transcribe --translate $(FILE)
+
+subtitle: ## Add subtitles to video (make subtitle FILE=video.mp4)
+	$(CLI) subtitle $(FILE)
+
+subtitle-hard: ## Burn subtitles into video (make subtitle-hard FILE=video.mp4)
+	$(CLI) subtitle --hard $(FILE)
+
+listen: ## Live microphone transcription
+	$(CLI) listen
+
+speak: ## Speak text aloud (make speak TEXT="Hello world")
+	$(CLI) speak "$(TEXT)"
+
+download-voice: ## Download a TTS voice (make download-voice VOICE=en_US-amy-medium)
+	$(CLI) download-voice $(or $(VOICE),en_US-amy-medium)
+
+summarize: ## AI-summarize a transcript (make summarize ID=3)
+	$(CLI) summarize $(ID)
+
+ask: ## Ask AI about a transcript (make ask ID=3 Q="What decisions?")
+	$(CLI) ask $(ID) "$(Q)"
+
+diarize: ## Transcribe with speaker identification (make diarize FILE=meeting.m4a)
+	$(CLI) transcribe --diarize $(FILE)
+
 # ── Development ──────────────────────────────────────────────
 
 test: ## Run test suite with coverage
-	$(PYTHON) -m pytest tests/ -v --cov=src/transcriber --cov-report=term-missing
+	$(PYTHON) -m pytest tests/ -v --cov=src/audiobench --cov-report=term-missing
 
 test-unit: ## Run unit tests only
 	$(PYTHON) -m pytest tests/unit/ -v
