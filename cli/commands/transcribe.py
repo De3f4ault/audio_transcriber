@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from cli.helpers import PhaseTracker, resolve_output
+from cli.helpers import PhaseTracker, collect_files, resolve_output
 from cli.theme import (
     ACCENT,
     APP_NAME,
@@ -31,7 +31,7 @@ from src.audiobench.config.settings import get_settings
 
 
 @click.command()
-@click.argument("files", nargs=-1, type=click.Path(exists=True), required=True)
+@click.argument("files", nargs=-1, type=click.Path(), required=False)
 @click.option(
     "-f",
     "--format",
@@ -84,6 +84,30 @@ from src.audiobench.config.settings import get_settings
     is_flag=True,
     help="Identify speakers (requires pyannote.audio + HF token)",
 )
+@click.option(
+    "-R",
+    "--recursive",
+    is_flag=True,
+    help="Recurse into subdirectories when input is a directory",
+)
+@click.option(
+    "--ext",
+    "extensions",
+    default=None,
+    help="Filter by extension (e.g., --ext mp3,m4a). Default: all supported",
+)
+@click.option(
+    "--from-file",
+    "from_file",
+    default=None,
+    type=click.Path(exists=True),
+    help="Read input paths from a manifest file (one per line)",
+)
+@click.option(
+    "--exclude",
+    default=None,
+    help='Exclude files matching glob patterns (e.g., --exclude "*_draft*,temp_*")',
+)
 def transcribe(
     files: tuple[str, ...],
     output_format: str | None,
@@ -100,6 +124,10 @@ def transcribe(
     initial_prompt: str | None,
     translate: bool,
     diarize: bool,
+    recursive: bool,
+    extensions: str | None,
+    from_file: str | None,
+    exclude: str | None,
 ) -> None:
     """Transcribe audio/video files.
 
@@ -113,8 +141,44 @@ def transcribe(
       audiobench transcribe --translate audio_sw.m4a      Translate to English
       audiobench transcribe --diarize meeting.m4a         Identify speakers
       audiobench transcribe -q meeting.m4a | grep word   Pipe-friendly
+
+    \b
+    Directory & batch input:
+      audiobench transcribe ./audiobooks/                Walk a directory
+      audiobench transcribe ./audiobooks/ -R             Recurse into subdirs
+      audiobench transcribe ./recordings/ --ext mp3,m4a  Filter by extension
+      audiobench transcribe --from-file list.txt         Read paths from file
+      find . -name '*.m4a' | audiobench transcribe -     Read from stdin
+      audiobench transcribe . --exclude '*_draft*'       Exclude patterns
     """
     from src.audiobench.core.pipeline import TranscriptionPipeline
+
+    # ── Resolve input files ──
+    if not files and not from_file:
+        console.print(
+            error_panel(
+                "No input", "Provide files, directories, --from-file, or pipe paths via stdin (-)"
+            )
+        )
+        return
+
+    resolved_files = collect_files(
+        files,
+        recursive=recursive,
+        extensions=extensions,
+        from_file=from_file,
+        exclude=exclude,
+    )
+
+    if not resolved_files:
+        console.print(
+            error_panel("No files found", "No supported audio/video files matched the input.")
+        )
+        return
+
+    if not quiet and len(resolved_files) != len(files or ()):
+        # Show discovery summary when directory/glob expanded the input
+        console.print(f"  [{DIM}]Found {len(resolved_files)} file(s) to process[/]")
 
     settings = get_settings()
     if model:
@@ -133,9 +197,9 @@ def transcribe(
     if check:
         from src.audiobench.core.ffmpeg import probe
 
-        for file_path in files:
-            input_p = Path(file_path)
-            info = probe(file_path)
+        for file_path in resolved_files:
+            input_p = Path(str(file_path))
+            info = probe(str(file_path))
             table = make_table(
                 f"File: {input_p.name}",
                 [
@@ -163,13 +227,13 @@ def transcribe(
     pipeline = TranscriptionPipeline()
     results: list[dict] = []
 
-    for file_path in files:
-        input_p = Path(file_path)
+    for file_path in resolved_files:
+        input_p = Path(str(file_path))
         file_size = input_p.stat().st_size
 
         # Resolve output path and format
         resolved_output, resolved_format = resolve_output(
-            file_path,
+            str(file_path),
             output_path,
             output_format,
             settings.output_format,
@@ -203,7 +267,7 @@ def transcribe(
             signum: int,
             frame: object,
             _tracker: PhaseTracker = tracker,
-            _file_path: str = file_path,
+            _file_path: str = str(file_path),
             _original: object = original_handler,
         ) -> None:
             partial_path = _tracker.save_partial(_file_path)
@@ -220,7 +284,7 @@ def transcribe(
 
         try:
             transcript = pipeline.transcribe_file(
-                file_path=file_path,
+                file_path=str(file_path),
                 language=language,
                 output_format=resolved_format,
                 output_path=resolved_output,
