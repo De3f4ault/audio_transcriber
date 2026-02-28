@@ -53,7 +53,7 @@ docs = ["zensical>=0.0.23"]
 all = ["audiobench[streaming,diarization,tts,ai,vosk,dev,docs]"]
 
 [project.scripts]
-audiobench = "cli.main:cli"
+audiobench = "cli.app:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]
