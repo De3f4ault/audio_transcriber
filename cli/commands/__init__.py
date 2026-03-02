@@ -20,8 +20,11 @@ def register_all(cli: click.Group) -> None:
     from cli.commands.speak import download_voice, speak
     from cli.commands.summarize import summarize
     from cli.commands.chat import ask, chat
-    from cli.commands.history import delete, export, history, search
-    from cli.commands.system import download, info
+    from cli.commands.history import delete, export, history, search, show
+    from cli.commands.config_cmd import install_completion, preset
+    from cli.commands.analyze import vocab
+    from cli.commands.system import cleanup, doctor, download, info, status
+    from cli.repl import repl
 
     # ── Core workflow ──
     cli.add_command(transcribe)
@@ -38,9 +41,28 @@ def register_all(cli: click.Group) -> None:
     # ── Data management ──
     cli.add_command(history)
     cli.add_command(search)
+    cli.add_command(show)
     cli.add_command(export)
     cli.add_command(delete)
+
+    # ── Configuration ──
+    cli.add_command(preset)
+    cli.add_command(install_completion, "install-completion")
+
+    # ── Analytics ──
+    cli.add_command(vocab)
+
+    # ── Interactive ──
+    cli.add_command(repl)
 
     # ── System ──
     cli.add_command(download)
     cli.add_command(info)
+    cli.add_command(doctor)
+    cli.add_command(status)
+    cli.add_command(cleanup)
+
+    # ── User plugins ──
+    from cli.plugins import register_plugins
+
+    register_plugins(cli)

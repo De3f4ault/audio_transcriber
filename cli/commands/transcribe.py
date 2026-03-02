@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from cli.helpers import PhaseTracker, collect_files, resolve_output
+from cli.helpers import PhaseTracker, collect_files, parse_formats, resolve_output
 from cli.theme import (
     ACCENT,
     APP_NAME,
@@ -37,8 +37,7 @@ from src.audiobench.config.settings import get_settings
     "--format",
     "output_format",
     default=None,
-    type=click.Choice(["txt", "srt", "vtt", "json"]),
-    help="Output format",
+    help="Output format: txt, srt, vtt, json (or comma-separated: srt,json  or 'all')",
 )
 @click.option("-o", "--output", "output_path", default=None, help="Output path (file or directory)")
 @click.option(
@@ -108,6 +107,34 @@ from src.audiobench.config.settings import get_settings
     default=None,
     help='Exclude files matching glob patterns (e.g., --exclude "*_draft*,temp_*")',
 )
+@click.option(
+    "--collision",
+    type=click.Choice(["overwrite", "skip", "rename"]),
+    default="overwrite",
+    show_default=True,
+    help="Strategy when output file already exists",
+)
+@click.option(
+    "--mirror",
+    is_flag=True,
+    help="Preserve directory structure in output (dir→dir mirror mode)",
+)
+@click.option(
+    "--preset",
+    "preset_name",
+    default=None,
+    help="Load a saved preset (e.g., --preset meeting)",
+)
+@click.option(
+    "--id-only",
+    is_flag=True,
+    help="Output only transcription IDs (for piping to other commands)",
+)
+@click.option(
+    "--notify",
+    is_flag=True,
+    help="Send desktop notification when transcription completes",
+)
 def transcribe(
     files: tuple[str, ...],
     output_format: str | None,
@@ -128,6 +155,11 @@ def transcribe(
     extensions: str | None,
     from_file: str | None,
     exclude: str | None,
+    collision: str,
+    mirror: bool,
+    preset_name: str | None,
+    id_only: bool,
+    notify: bool,
 ) -> None:
     """Transcribe audio/video files.
 
@@ -150,8 +182,58 @@ def transcribe(
       audiobench transcribe --from-file list.txt         Read paths from file
       find . -name '*.m4a' | audiobench transcribe -     Read from stdin
       audiobench transcribe . --exclude '*_draft*'       Exclude patterns
+
+    \b
+    Output control:
+      audiobench transcribe dir/ -o out/ --mirror        Preserve dir structure
+      audiobench transcribe dir/ --collision skip        Skip existing outputs
+      audiobench transcribe dir/ --collision rename      Auto-rename conflicts
+      audiobench transcribe file.m4a -f srt,json         Export to both formats
+      audiobench transcribe file.m4a -f all              Export to all 4 formats
+
+    \b
+    Presets & automation:
+      audiobench preset create meeting --model large-v3 --speed accurate
+      audiobench transcribe file.m4a --preset meeting    Use saved preset
+      audiobench transcribe dir/ --id-only               Output IDs only (piping)
     """
     from src.audiobench.core.pipeline import TranscriptionPipeline
+
+    # E1: Load preset defaults (CLI flags override)
+    if preset_name:
+        from cli.commands.config_cmd import _load_preset
+
+        preset_data = _load_preset(preset_name)
+        if not preset_data:
+            console.print(error_panel(f"Preset '{preset_name}' not found"))
+            return
+
+        # Apply preset values only where CLI didn't specify
+        if not model and "model" in preset_data:
+            model = preset_data["model"]
+        if speed_preset == "balanced" and "speed" in preset_data:
+            speed_preset = preset_data["speed"]
+        if not language and "language" in preset_data:
+            language = preset_data["language"]
+        if not output_format and "format" in preset_data:
+            output_format = preset_data["format"]
+        if not enhance and preset_data.get("enhance"):
+            enhance = True
+        if not translate and preset_data.get("translate"):
+            translate = True
+        if not diarize and preset_data.get("diarize"):
+            diarize = True
+        if not audio_filter and "filter" in preset_data:
+            audio_filter = preset_data["filter"]
+        if not initial_prompt and "prompt" in preset_data:
+            initial_prompt = preset_data["prompt"]
+
+        if not quiet:
+            console.print(f"  [{DIM}]Using preset: {preset_name}[/]")
+
+    # E2: --id-only implies quiet
+    if id_only:
+        quiet = True
 
     # ── Resolve input files ──
     if not files and not from_file:
@@ -224,6 +306,21 @@ def transcribe(
     preset_icons = {"fast": "fast", "balanced": "balanced", "accurate": "accurate"}
     preset_label = preset_icons.get(speed_preset, speed_preset)
 
+    # C1: Determine base directory for mirror mode
+    input_base_dir: str | None = None
+    if mirror and files:
+        # Use the first directory argument as the base
+        for p in files:
+            if Path(p).is_dir():
+                input_base_dir = p
+                break
+
+    # C3: Parse multi-format string
+    multi_formats = parse_formats(output_format)
+    # If parse_formats returns formats, use the first as primary
+    primary_format = multi_formats[0] if multi_formats else None
+    extra_formats = multi_formats[1:] if len(multi_formats) > 1 else []
+
     pipeline = TranscriptionPipeline()
     results: list[dict] = []
 
@@ -235,9 +332,17 @@ def transcribe(
         resolved_output, resolved_format = resolve_output(
             str(file_path),
             output_path,
-            output_format,
+            primary_format,
             settings.output_format,
+            input_base_dir=input_base_dir,
+            collision=collision,
         )
+
+        # C2: collision=skip → resolve_output returns None path
+        if resolved_output is None and (output_path or primary_format) and collision == "skip":
+            if not quiet:
+                console.print(f"  [{DIM}]Skipped (exists): {input_p.name}[/]")
+            continue
 
         # ── Header ──
         if not quiet:
@@ -254,6 +359,8 @@ def transcribe(
                 console.print(f"    Filters: [{DIM}]{', '.join(filters)}[/]")
             if resolved_output:
                 console.print(f"    Output:  [{DIM}]{resolved_output}[/]")
+            if extra_formats:
+                console.print(f"    Formats: [{DIM}]{', '.join(multi_formats)}[/]")
             console.print(f"  [{DIM}]{'─' * 44}[/]")
 
         start_time = time.perf_counter()
@@ -311,13 +418,9 @@ def transcribe(
                 formatter = get_formatter(resolved_format)
                 stdout.print(formatter.format(transcript), highlight=False)
             else:
-                # Print transcript to terminal if no file output
-                if not resolved_output:
-                    from src.audiobench.output.base import get_formatter
-
-                    formatter = get_formatter(resolved_format)
-                    console.print()
-                    console.print(formatter.format(transcript))
+                # Transcript text was already displayed progressively
+                # during transcription via on_segment callbacks.
+                # Just show the summary panel below.
 
                 # ── Summary ──
                 console.print()
@@ -339,6 +442,30 @@ def transcribe(
 
                 if resolved_output:
                     console.print(f"  [{DIM}]Saved → {resolved_output}[/]")
+
+            # C3: Multi-format — save additional formats
+            if extra_formats and transcript:
+                from src.audiobench.output.base import get_formatter as get_fmt
+
+                for extra_fmt in extra_formats:
+                    extra_out, _ = resolve_output(
+                        str(file_path),
+                        output_path,
+                        extra_fmt,
+                        extra_fmt,
+                        input_base_dir=input_base_dir,
+                        collision=collision,
+                    )
+                    if extra_out is None:
+                        if not quiet:
+                            console.print(f"  [{DIM}]Skipped {extra_fmt} (exists)[/]")
+                        continue
+                    fmt_obj = get_fmt(extra_fmt)
+                    content = fmt_obj.format(transcript)
+                    Path(extra_out).parent.mkdir(parents=True, exist_ok=True)
+                    Path(extra_out).write_text(content, encoding="utf-8")
+                    if not quiet:
+                        console.print(f"  [{DIM}]Saved → {extra_out}[/]")
 
             results.append(
                 {
@@ -380,6 +507,51 @@ def transcribe(
                 f"{r['speed']:.1f}x",
             )
         console.print(table)
+
+    # ── Desktop notification ──
+    if notify and results:
+        _send_notification(results)
+
+
+def _send_notification(results: list[dict]) -> None:
+    """Send a desktop notification on transcription completion."""
+    import subprocess
+
+    total_words = sum(r["words"] for r in results)
+    total_dur = sum(r["duration"] for r in results)
+    n_files = len(results)
+
+    title = "AudioBench — Transcription Complete"
+    if n_files == 1:
+        body = f"{results[0]['file']}: {total_words:,} words, {format_duration(total_dur)}"
+    else:
+        body = (
+            f"{n_files} files: "
+            f"{total_words:,} total words, "
+            f"{format_duration(total_dur)} total audio"
+        )
+
+    try:
+        import sys as _sys
+
+        if _sys.platform == "darwin":
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'display notification "{body}" with title "{title}"',
+                ],
+                check=False,
+            )
+        elif _sys.platform == "win32":
+            pass  # Windows toast not implemented
+        else:
+            subprocess.run(
+                ["notify-send", title, body, "-i", "audio-x-generic"],
+                check=False,
+            )
+    except FileNotFoundError:
+        pass  # notify-send not installed — silently skip
 
 
 # ── Subtitle Command ────────────────────────────────────────

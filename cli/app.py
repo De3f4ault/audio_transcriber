@@ -16,9 +16,15 @@ from src.audiobench.config.logging_config import setup_logging
 @click.group(cls=DefaultGroup, default_command="transcribe", invoke_without_command=True)
 @click.option("-v", "--verbose", is_flag=True, help="Show detailed log output")
 @click.option("--debug", is_flag=True, help="Debug logging")
+@click.option(
+    "--json",
+    "json_mode",
+    is_flag=True,
+    help="Machine-readable JSON output (where supported)",
+)
 @click.version_option(version=APP_VERSION, prog_name="audiobench")
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool, debug: bool) -> None:
+def cli(ctx: click.Context, verbose: bool, debug: bool, json_mode: bool) -> None:
     """AudioBench — offline audio workbench.
 
     \b
@@ -47,6 +53,7 @@ def cli(ctx: click.Context, verbose: bool, debug: bool) -> None:
         log_level = "WARNING"
     setup_logging(log_level)
     ctx.ensure_object(dict)
+    ctx.obj["json_mode"] = json_mode
 
 
 # ── Register all commands ───────────────────────────────────
