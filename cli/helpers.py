@@ -297,15 +297,16 @@ def parse_formats(format_str: str | None) -> list[str]:
 class PhaseTracker:
     """Renders phased progress using Rich Live display.
 
-    Uses Rich's Live context to render a single persistent block
-    that updates in-place — no flickering, no ANSI cursor hacks.
+    Uses a two-mode approach:
+    1. **Live mode** — During loading/converting, a Rich Live display
+       shows animated spinners and progress. Uses transient=True so
+       the frame vanishes when stopped.
+    2. **Streaming mode** — When the first transcript segment arrives,
+       Live stops, completed phases print statically at the top, and
+       each new segment prints below. Text grows downward in real-time.
 
-    Features:
-    - Completed phases show ✓ with elapsed time
-    - Active phase shows a spinner + progress bar (for transcription)
-    - Future phases show · (dimmed)
-    - Transcript text streams above the progress bar in real-time
-    - Supports SIGINT graceful partial save
+    The result: phases stay at the top, transcript builds below,
+    summary appears at the very bottom when done.
     """
 
     PHASES = ["loading", "converting", "transcribing", "saving"]
@@ -328,6 +329,8 @@ class PhaseTracker:
         self.segments: list = []
         # Rich Live display — handles smooth in-place terminal updates
         self._live: Live | None = None
+        # Whether we've switched to streaming mode
+        self._streaming: bool = False
 
     def start(self) -> None:
         """Start the Rich Live display. Call before first update."""
@@ -336,22 +339,57 @@ class PhaseTracker:
                 self,
                 console=console,
                 refresh_per_second=10,
+                transient=True,  # Frame vanishes when stopped
             )
             self._live.start()
+
+    def _enter_streaming(self) -> None:
+        """Transition from Live mode to streaming mode.
+
+        Stops the Live display (frame vanishes due to transient=True),
+        then prints completed phases as static text. After this,
+        segments print below via regular console.print().
+        """
+        if self._streaming:
+            return
+        self._streaming = True
+
+        # Stop Live — transient=True means the frame disappears cleanly
+        if self._live:
+            self._live.stop()
+            self._live = None
+
+        # Print phases statically at the top
+        for phase in self.PHASES:
+            label = self.LABELS.get(phase, phase)
+            if phase in self.phase_times:
+                elapsed_str = format_duration(self.phase_times[phase])
+                console.print(f"  [{SUCCESS}]✓[/]  {label:<24} [{DIM}]{elapsed_str}[/]")
+            elif phase == self._current_phase:
+                console.print(f"  [{ACCENT}]◐[/]  {label}...")
+            else:
+                console.print(f"  [{DIM}]·  {label}[/]")
+
+        # Blank line separating phases from transcript text
+        console.print()
 
     def on_segment(self, segment: object) -> None:
         """Called after each segment is transcribed.
 
-        Prints the segment text permanently above the Live progress
-        display, so the transcript grows in real-time while the
-        progress bar stays at the bottom.
+        On first call, switches to streaming mode (phases at top).
+        Then prints each segment below, growing the transcript.
         """
         self.segments.append(segment)
         if self.quiet:
             return
+
+        # First segment → switch to streaming mode
+        if not self._streaming:
+            self._enter_streaming()
+
         text = getattr(segment, "text", "").strip()
-        if text and self._live:
-            self._live.console.print(text, highlight=False)
+        if text:
+            console.print(text, highlight=False)
 
     def update(self, phase: str, message: str, progress: float | None) -> None:
         """Called by the pipeline on phase transitions."""
@@ -371,7 +409,7 @@ class PhaseTracker:
             self._last_progress = progress
 
     def _build_display(self) -> Text:
-        """Build the current display as a Rich Text object."""
+        """Build the Live display (loading/converting phases only)."""
 
         self._spin_idx = (self._spin_idx + 1) % len(self.SPINNERS)
         spinner = self.SPINNERS[self._spin_idx]
@@ -390,22 +428,9 @@ class PhaseTracker:
             elif phase == self._current_phase:
                 # ⠼ Active with spinner
                 display.append(f"  {spinner}", style=ACCENT)
-                if phase == "transcribing" and self._last_progress > 0:
-                    pct = self._last_progress
-                    elapsed_str = format_duration(time.perf_counter() - self._phase_start)
-                    display.append(f"  {label:<16}", style="")
-                    # Progress bar
-                    filled = int(28 * pct / 100)
-                    remaining = 28 - filled
-                    display.append("━" * filled, style=ACCENT)
-                    display.append("━" * remaining, style=DIM)
-                    display.append(f"  {pct:.0f}%", style="bold")
-                    display.append(f"  {elapsed_str}", style=DIM)
-                    display.append("\n")
-                else:
-                    display.append(f"  {label}", style="")
-                    display.append("...", style=DIM)
-                    display.append("\n")
+                display.append(f"  {label}", style="")
+                display.append("...", style=DIM)
+                display.append("\n")
             else:
                 # · Pending
                 display.append("  ·", style=DIM)
@@ -419,7 +444,7 @@ class PhaseTracker:
         yield self._build_display()
 
     def finalize(self) -> None:
-        """Record final timing and stop the Live display."""
+        """Record final timing and print completion summary."""
         if self.quiet:
             return
 
@@ -427,11 +452,20 @@ class PhaseTracker:
             elapsed = time.perf_counter() - self._phase_start
             self.phase_times[self._current_phase] = elapsed
 
-        # Force one final refresh then stop Live
-        if self._live:
-            self._live.refresh()
-            self._live.stop()
-            self._live = None
+        if self._streaming:
+            # Already in streaming mode — print final phase times below text
+            console.print()
+            for phase in self.PHASES:
+                label = self.LABELS.get(phase, phase)
+                if phase in self.phase_times:
+                    elapsed_str = format_duration(self.phase_times[phase])
+                    console.print(f"  [{SUCCESS}]✓[/]  {label:<24} [{DIM}]{elapsed_str}[/]")
+        else:
+            # Still in Live mode (no segments came) — stop normally
+            if self._live:
+                self._live.refresh()
+                self._live.stop()
+                self._live = None
 
     def save_partial(self, input_path: str) -> str | None:
         """Save accumulated segments to a .partial.txt file."""
