@@ -453,13 +453,8 @@ class PhaseTracker:
             self.phase_times[self._current_phase] = elapsed
 
         if self._streaming:
-            # Already in streaming mode — print final phase times below text
-            console.print()
-            for phase in self.PHASES:
-                label = self.LABELS.get(phase, phase)
-                if phase in self.phase_times:
-                    elapsed_str = format_duration(self.phase_times[phase])
-                    console.print(f"  [{SUCCESS}]✓[/]  {label:<24} [{DIM}]{elapsed_str}[/]")
+            # Phases already printed at top — nothing more to do
+            pass
         else:
             # Still in Live mode (no segments came) — stop normally
             if self._live:
