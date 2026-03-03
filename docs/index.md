@@ -84,11 +84,14 @@ audiobench transcribe --fast lecture.mp3
 # Accurate preset (slower, best quality)
 audiobench transcribe --accurate interview.wav
 
+# Enhance + trim silence + denoise in one pass
+audiobench transcribe --enhance --trim --denoise meeting.m4a
+
 # Pipe-friendly raw output
 audiobench transcribe -q meeting.m4a | grep "keyword"
 
-# Inspect file metadata without transcribing
-audiobench transcribe --check recording.m4a
+# Inspect file metadata and filter chain without transcribing
+audiobench transcribe --check --enhance --denoise recording.m4a
 ```
 
 #### Options
@@ -103,12 +106,118 @@ audiobench transcribe --check recording.m4a
 | `--balanced` | |  Balanced preset: beam=3, batch=4 (default) |
 | `--accurate` | |  Accurate preset: beam=5, sequential |
 | `--prompt` | | Guide model with context (e.g. `"Conversation in Swahili and English"`) |
-| `--enhance` | | Apply noise reduction + normalization filters |
+| `--enhance` | | Spectral noise reduction (highpass + afftdn) + EBU R128 loudness normalization |
+| `--trim` | | Remove leading/trailing silence before transcription |
+| `--denoise` | | AI noise reduction via RNNoise neural network (downloads model on first use) |
 | `--filter` | | Custom ffmpeg audio filter graph |
 | `--no-cache` | | Re-transcribe even if cached |
 | `--no-timestamps` | | Disable word-level timestamps |
 | `--quiet` | `-q` | Raw output only (for piping) |
-| `--check` | | Show file metadata only, no transcription |
+| `--check` | | Show file metadata and filter chain, no transcription |
+
+> **Smart filter chain**: When `--denoise` is active, it supersedes the spectral denoiser in `--enhance` (no double denoising). Filters are always applied in the optimal order: `highpass → denoise → trim → loudnorm`. Use `--check` to preview the exact filter chain before processing.
+
+> **First-run note**: `--denoise` downloads the RNNoise model (~293 KB) on first use from GitHub to `~/.audiobench/models/rnnoise/`. Subsequent runs use the cached model.
+
+---
+
+### `repl` — Interactive Shell
+
+Drop into a context-aware interactive session with dot-commands, history navigation, and full access to all CLI commands.
+
+```bash
+audiobench repl
+```
+
+Inside the REPL:
+
+```
+audiobench> history                    # List transcriptions
+audiobench> show 3                     # View transcript #3 → sets context
+audiobench [#3 meeting.m4a]> .stats    # Quick stats (context-aware)
+audiobench [#3 meeting.m4a]> .segments # Show timestamped segments
+audiobench [#3 meeting.m4a]> .find "keyword" # Search within transcript
+audiobench [#3 meeting.m4a]> .play     # Play source audio
+audiobench [#3 meeting.m4a]> .edit     # Open in $EDITOR
+audiobench [#3 meeting.m4a]> .next     # Jump to next transcript
+audiobench [#3 meeting.m4a]> .close    # Clear context
+audiobench> .help                      # Show all dot-commands
+```
+
+#### Dot-Commands
+
+| Command | Description |
+|---------|-------------|
+| `.stats` | Word count, duration, language, model |
+| `.show` | Full transcript text |
+| `.segments` | Timestamped segments |
+| `.info` | Detailed metadata (codec, bitrate, model settings) |
+| `.find "text"` | Search within the active transcript |
+| `.play` | Play audio (`ffplay`) |
+| `.play 01:25` | Play from timestamp |
+| `.edit` | Edit transcript in `$EDITOR`, saves to DB |
+| `.path` | Show source audio file path |
+| `.open` | Open audio in system default player |
+| `.next` / `.prev` | Navigate between transcripts |
+| `.recent` | Show 5 most recent transcriptions |
+| `.search "text"` | Global search across all transcripts |
+| `.close` | Clear current context |
+| `.help` | List all dot-commands |
+
+---
+
+### `listen` — Real-Time Transcription (Live STT)
+
+Transcribe microphone input in real-time. Audio is processed continuously using voice activity detection (VAD). Results are automatically saved to your history database.
+
+```bash
+# Basic live transcription
+audiobench listen
+
+# Force a specific language (faster & more accurate if known)
+audiobench listen --language en
+
+# Use the fastest model (lower accuracy)
+audiobench listen --model tiny
+
+# Also save transcript to a text file
+audiobench listen --save meeting.txt
+```
+
+#### Live STT Tuning
+
+- **Cadence**: Text appears every ~4 seconds of continuous speech or after a 0.4s pause.
+- **Model**: Defaults to `base` (tuned with 4 CPU threads for ~0.5x real-time speed).
+- **History**: Live sessions appear in `audiobench history` as "🎤 Live session" and can be searched or spoken via TTS.
+
+---
+
+### `speak` — Text-to-Speech (TTS)
+
+Speak text, files, or past transcripts aloud using the offline Piper TTS engine. High-quality voices are downloaded on-demand.
+
+```bash
+# Speak text directly
+audiobench speak "Hello world"
+
+# Speak a text file
+audiobench speak notes.txt
+
+# Speak a previous transcript from history
+audiobench speak --id 3
+
+# Save TTS output to a WAV file instead of playing
+audiobench speak "Hello" -o greeting.wav
+
+# Use a specific high-quality voice
+audiobench speak --voice en_US-lessac-high "Hello world"
+```
+
+#### Recommended High-Quality Voices
+
+- `en_US-lessac-high` (Female, Clear & Natural)
+- `en_US-ryan-high` (Male, Clear & Articulate)
+- `en_US-ljspeech-high` (Female, Audiobook style)
 
 ---
 
@@ -133,6 +242,12 @@ audiobench export 3 -f vtt           # Export ID #3 as VTT
 audiobench export 3 -f srt -o sub/   # Save to sub/ directory
 ```
 
+### `show` — View a Transcription
+
+```bash
+audiobench show 3              # View transcript #3 with metadata
+```
+
 ### `delete` — Remove from History
 
 ```bash
@@ -154,6 +269,134 @@ audiobench info
 ```
 
 Shows: Python version, device (CPU/CUDA), model, compute type, storage paths, database size, and all configuration values.
+
+### `chat` — AI Chat with Transcript Context
+
+```bash
+audiobench chat                # Start AI chat session
+audiobench chat 3              # Chat with transcript #3 as context
+```
+
+Full-featured AI chat with readline history, multi-line input, `/export`, `/retry`, and markdown rendering.
+
+### `vocab` — Word Frequency Analysis
+
+```bash
+audiobench vocab 3                      # Top 30 words from transcript #3
+audiobench vocab 3 --top 50             # Top 50 words
+audiobench vocab 3 --min-length 5       # Only words ≥5 chars
+audiobench vocab 3 --format json        # JSON output
+audiobench vocab 3 --format csv         # CSV for spreadsheets
+```
+
+### `preset` — Named Configuration Presets
+
+Save and reuse transcription settings:
+
+```bash
+audiobench preset create meeting --model large-v3 --speed accurate --enhance
+audiobench preset create podcast --language en --format srt
+audiobench preset list
+audiobench preset show meeting
+audiobench preset delete meeting
+
+# Use a preset when transcribing
+audiobench transcribe file.m4a --preset meeting
+```
+
+### `doctor` — System Health Check
+
+```bash
+audiobench doctor
+```
+
+Checks: ffmpeg, ffprobe, faster-whisper, piper-tts, ollama, CUDA availability, disk space, and database connectivity.
+
+### `status` — Usage Statistics
+
+```bash
+audiobench status
+```
+
+Shows database size, transcription count, total hours processed, model cache size, and voice cache size.
+
+### `cleanup` — Clean Old Data
+
+```bash
+audiobench cleanup --older-than 30d        # Delete old transcriptions
+audiobench cleanup --cache                  # Remove model cache
+audiobench cleanup --temp                   # Remove temp files
+audiobench cleanup --older-than 7d --dry-run # Preview what would be deleted
+```
+
+### `install-completion` — Shell Tab Completions
+
+```bash
+audiobench install-completion bash
+audiobench install-completion zsh
+audiobench install-completion fish
+```
+
+---
+
+### `analyze` — Audio Intelligence Report
+
+Inspect loudness, silence, and quality characteristics of any audio file.
+
+```bash
+audiobench analyze meeting.m4a
+```
+
+Shows integrated LUFS, loudness range, true peak, silence regions, and recommends which flags to use (`--trim`, `--enhance`, `--denoise`).
+
+### `convert` — Audio Format Conversion
+
+```bash
+audiobench convert recording.m4a -o recording.mp3
+audiobench convert recording.wav -o recording.opus --bitrate 48k
+audiobench convert lecture.mp3 -o fast.mp3 --speed 1.5      # Rubberband time-stretch
+```
+
+Smart codec defaults: MP3 192kbps, Opus 64kbps, OGG q5, FLAC lossless.
+
+### `merge` — Concatenate Audio Files
+
+```bash
+audiobench merge part1.wav part2.wav -o full.wav
+```
+
+### `inspect` — Visual Analysis
+
+```bash
+audiobench inspect recording.m4a                    # Waveform + spectrogram
+audiobench inspect recording.m4a --waveform         # Waveform only
+audiobench inspect recording.m4a --spectrum          # Spectrogram only
+audiobench inspect recording.m4a -o ./images/        # Save to directory
+```
+
+Generates PNG images of the audio waveform and/or spectrogram.
+
+---
+
+## Plugin System
+
+Extend AudioBench with custom commands by placing Python files in `~/.audiobench/plugins/`.
+
+```python
+# ~/.audiobench/plugins/my_tool.py
+import click
+
+@click.command()
+@click.argument("text")
+def shout(text):
+    """Shout some text."""
+    click.echo(text.upper())
+
+def register(cli):
+    cli.add_command(shout)
+```
+
+Plugins are loaded automatically on startup. If no `register()` function is defined, Click commands at the module level are auto-registered.
 
 ---
 
@@ -213,12 +456,16 @@ cp .env.example .env
 
 ```
 ~/.audiobench/              ← App data directory
-├── models/                  ← Downloaded Whisper models (~1.5 GB each)
-│   └── models--Systran--faster-whisper-large-v3-turbo/
-└── (future: cache, exports)
+├── models/
+│   ├── models--Systran--faster-whisper-large-v3-turbo/  ← Whisper (~1.5 GB)
+│   └── rnnoise/
+│       └── bd.rnnn          ← RNNoise neural denoise model (~293 KB, auto-downloaded)
+├── presets/                 ← Named configuration presets (TOML)
+├── plugins/                 ← User plugins (Python files)
+├── repl_history             ← REPL command history
+└── transcriptions.db        ← SQLite database (history, search)
 
 ./                           ← Project root
-├── transcriptions.db        ← SQLite database (history, search)
 ├── .env                     ← Your configuration (gitignored)
 └── .env.example             ← Configuration template
 ```
@@ -230,7 +477,20 @@ cp .env.example .env
 ```
 audiobench/
 ├── cli/                     ← Command-line interface
-│   ├── main.py              ← CLI commands (transcribe, history, search, etc.)
+│   ├── commands/
+│   │   ├── __init__.py      ← Command registry (29 commands)
+│   │   ├── transcribe.py    ← transcribe, subtitle
+│   │   ├── audio.py         ← analyze, convert, merge
+│   │   ├── chat.py          ← chat, ask (AI conversation)
+│   │   ├── config_cmd.py    ← preset, install-completion
+│   │   ├── analyze.py       ← vocab (word frequency)
+│   │   ├── system.py        ← info, download, doctor, status, cleanup
+│   │   ├── history.py       ← history, search, show, export, delete
+│   │   └── inspect.py       ← inspect (waveform/spectrogram)
+│   ├── repl.py              ← Interactive shell with dot-commands
+│   ├── plugins.py           ← User plugin loader (~/.audiobench/plugins/)
+│   ├── helpers.py           ← PhaseTracker (progress display), file helpers
+│   ├── custom_group.py      ← Fuzzy command matching + suggestions
 │   └── theme.py             ← Rich console styling, colors, panels
 ├── src/audiobench/
 │   ├── config/
@@ -238,7 +498,7 @@ audiobench/
 │   │   └── logging_config.py
 │   ├── core/
 │   │   ├── pipeline.py      ← Orchestrates: load → convert → transcribe → save
-│   │   ├── ffmpeg.py        ← FFmpeg integration (conversion, probing, filters)
+│   │   ├── ffmpeg.py        ← FFmpeg integration (filters, analysis, conversion)
 │   │   ├── filters.py       ← Text quality filters (repetition, broken words)
 │   │   └── models.py        ← Pydantic data models (Segment, Transcript, Word)
 │   ├── engines/
@@ -270,10 +530,16 @@ make format            # Auto-format with black + ruff
 make clean             # Remove build artifacts
 make transcribe FILE=audio.m4a           # Quick transcribe
 make transcribe-srt FILE=audio.m4a       # Transcribe → SRT
+make translate FILE=audio.m4a            # Translate to English
 make history           # View transcription history
 make search Q="word"   # Search transcriptions
 make info              # Show system info
 make download MODEL=large-v3-turbo       # Download model
+make listen            # Live microphone transcription
+make speak TEXT="Hello"                   # Text-to-speech
+make repl              # Launch interactive shell
+make doctor            # System health check
+make status            # Usage statistics
 ```
 
 ---

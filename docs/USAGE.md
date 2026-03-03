@@ -119,15 +119,60 @@ audiobench transcribe lecture.mp3              # large-v3-turbo (default)
 
 ---
 
-## 5. Audio Enhancement
+## 5. Audio Processing
 
-### Built-in noise reduction
+### Audio enhancement flags
+
+AudioBench has three pre-processing flags that can be combined freely:
 
 ```bash
+# Spectral noise reduction + loudness normalization
 audiobench transcribe noisy_recording.m4a --enhance
+
+# Remove leading/trailing silence
+audiobench transcribe lecture.m4a --trim
+
+# AI neural noise reduction (RNNoise)
+audiobench transcribe interview.m4a --denoise
+
+# All three — maximum quality
+audiobench transcribe meeting.m4a --enhance --trim --denoise
 ```
 
-Applies FFmpeg filters: high-pass at 200Hz, noise gate, and loudness normalization.
+### Processing order (smart filter chain)
+
+Filters are always applied in the optimal order, regardless of how you specify them:
+
+```
+highpass (200Hz) → denoise/enhance → silence trim → loudness normalization
+```
+
+| Flags | Actual Filter Chain |
+|-------|-------------------|
+| `--enhance` | highpass → afftdn → loudnorm |
+| `--denoise` | highpass → arnndn → loudnorm |
+| `--trim` | silenceremove (standalone) |
+| `--enhance --denoise` | highpass → arnndn → loudnorm |
+| `--enhance --trim` | highpass → afftdn → trim → loudnorm |
+| `--denoise --trim` | highpass → arnndn → trim → loudnorm |
+| All three | highpass → arnndn → trim → loudnorm |
+
+> **Key rule**: When `--denoise` is active, it completely replaces the spectral denoiser (`afftdn`) from `--enhance`. This prevents double denoising, which causes metallic artifacts and softened consonants. The `loudnorm` normalization from `--enhance` is still applied.
+
+### When to use each flag
+
+| Situation | Recommended Flags |
+|-----------|------------------|
+| Clean studio recording | None needed |
+| Moderate background noise | `--enhance` |
+| Heavy noise (traffic, HVAC, crowd) | `--denoise` |
+| Long pauses / dead air | `--trim` |
+| Phone recording with noise + silence | `--denoise --trim` |
+| Noisy recording for transcription | `--denoise --trim` |
+
+### First-run model download
+
+The `--denoise` flag uses a neural noise reduction model (RNNoise, ~293 KB). On first use, it is automatically downloaded from GitHub to `~/.audiobench/models/rnnoise/bd.rnnn`. Subsequent runs use the cached model instantly.
 
 ### Custom FFmpeg filters
 
@@ -135,17 +180,52 @@ Applies FFmpeg filters: high-pass at 200Hz, noise gate, and loudness normalizati
 audiobench transcribe recording.m4a --filter "highpass=f=300,lowpass=f=3000"
 ```
 
-### Inspect file before transcribing
+### Preview filter chain before transcribing
 
 ```bash
-audiobench transcribe --check recording.m4a
+audiobench transcribe --check --enhance --denoise recording.m4a
 ```
 
-Shows codec, duration, sample rate, channels, bitrate — without starting transcription.
+Shows codec, duration, sample rate, channels, bitrate, and the exact filter chain — without starting transcription. Use this to verify your processing pipeline.
 
 ---
 
-## 6. History Management
+## 6. Audio Analysis & Utilities
+
+### Analyze audio quality
+
+```bash
+audiobench analyze meeting.m4a
+```
+
+Shows loudness statistics (integrated LUFS, loudness range, true peak), silence regions, and recommends which flags to use.
+
+### Convert between formats
+
+```bash
+audiobench convert recording.m4a -o recording.mp3
+audiobench convert recording.wav -o recording.opus --bitrate 48k
+audiobench convert recording.m4a -o recording.flac        # Lossless
+audiobench convert lecture.mp3 -o fast.mp3 --speed 1.5     # Speed up
+```
+
+### Merge audio files
+
+```bash
+audiobench merge part1.wav part2.wav part3.wav -o full.wav
+```
+
+### Generate waveform / spectrogram images
+
+```bash
+audiobench inspect recording.m4a                    # Both images
+audiobench inspect recording.m4a --waveform         # Waveform only
+audiobench inspect recording.m4a --spectrum          # Spectrogram only
+```
+
+---
+
+## 7. History Management
 
 ### View past transcriptions
 
@@ -181,7 +261,37 @@ audiobench delete --all      # Wipe all history
 
 ---
 
-## 7. Piping & Scripting
+## 8. Interactive REPL
+
+The REPL provides a full interactive environment for working with transcriptions.
+
+### Launch
+
+```bash
+audiobench repl
+```
+
+### Context-aware workflow
+
+```
+audiobench> history                     # List transcriptions
+audiobench> show 3                      # View transcript → sets context
+audiobench [#3 meeting.m4a]> .stats     # Quick stats
+audiobench [#3 meeting.m4a]> .find "deadline"  # Search within transcript
+audiobench [#3 meeting.m4a]> .play      # Play source audio
+audiobench [#3 meeting.m4a]> .play 01:25  # Play from timestamp
+audiobench [#3 meeting.m4a]> .edit      # Edit in $EDITOR, saves to DB
+audiobench [#3 meeting.m4a]> .next      # Jump to next transcript
+audiobench [#3 meeting.m4a]> summarize  # AI summarize (auto-injects ID)
+audiobench [#3 meeting.m4a]> .close     # Clear context
+audiobench> .help                       # Show all dot-commands
+```
+
+All CLI commands work inside the REPL. Context-aware commands (`show`, `ask`, `summarize`, `export`, etc.) auto-inject the active transcript ID.
+
+---
+
+## 9. Piping & Scripting
 
 ### Quiet mode for piping
 
@@ -200,7 +310,7 @@ The `-q` / `--quiet` flag suppresses all UI and prints only the raw transcript.
 
 ---
 
-## 8. Caching
+## 10. Caching
 
 Transcriptions are cached automatically by file hash. Re-transcribing the same file returns instantly:
 
@@ -217,7 +327,7 @@ audiobench transcribe --no-cache meeting.m4a
 
 ---
 
-## 9. Pre-downloading Models
+## 11. Pre-downloading Models
 
 Download models ahead of time for offline use:
 
@@ -230,7 +340,63 @@ Models are stored in `~/.audiobench/models/`.
 
 ---
 
-## 10. Configuration
+## 12. Configuration Presets
+
+Save and reuse named configurations:
+
+```bash
+# Create presets for different use cases
+audiobench preset create meeting --model large-v3 --speed accurate --enhance
+audiobench preset create podcast --language en --format srt
+audiobench preset create quick --speed fast --model base
+
+# Use when transcribing
+audiobench transcribe file.m4a --preset meeting
+
+# Manage presets
+audiobench preset list
+audiobench preset show meeting
+audiobench preset delete meeting
+```
+
+Presets are stored as TOML files in `~/.audiobench/presets/`.
+
+---
+
+## 13. System Maintenance
+
+### Health check
+
+```bash
+audiobench doctor
+```
+
+Checks FFmpeg, faster-whisper, piper-tts, ollama, CUDA, disk space, and database connectivity.
+
+### Usage statistics
+
+```bash
+audiobench status
+```
+
+### Cleanup old data
+
+```bash
+audiobench cleanup --older-than 30d        # Delete old transcriptions
+audiobench cleanup --cache                  # Remove model cache
+audiobench cleanup --temp                   # Remove temp files
+audiobench cleanup --older-than 7d --dry-run # Preview deletions
+```
+
+### Shell completions
+
+```bash
+audiobench install-completion fish     # or bash, zsh
+```
+
+---
+
+## 14. Configuration
 
 ### Using `.env`
 
@@ -259,6 +425,7 @@ audiobench info
 ### "FFmpeg not found"
 
 Install FFmpeg:
+
 ```bash
 sudo pacman -S ffmpeg       # Arch
 sudo apt install ffmpeg     # Ubuntu/Debian
@@ -267,6 +434,7 @@ sudo apt install ffmpeg     # Ubuntu/Debian
 ### First run is slow
 
 The model (~1.5 GB) downloads on first use. Pre-download with:
+
 ```bash
 audiobench download large-v3-turbo
 ```
@@ -275,12 +443,14 @@ audiobench download large-v3-turbo
 
 1. Try `--accurate` preset
 2. Use `--prompt` to provide context
-3. Use `--enhance` for noisy recordings
-4. Try forcing the language with `--language en`
+3. Use `--denoise` for noisy recordings (better than `--enhance` for heavy noise)
+4. Use `--trim` to remove long silences that can cause hallucinations
+5. Try forcing the language with `--language en`
 
 ### Out of memory
 
 Use a smaller model:
+
 ```bash
 audiobench transcribe -m small recording.m4a
 ```

@@ -1,6 +1,8 @@
 .PHONY: install dev test lint format clean help
 .PHONY: transcribe transcribe-srt history search info download
 .PHONY: docs docs-serve docs-stop
+.PHONY: translate subtitle listen speak download-voice summarize ask diarize
+.PHONY: repl chat vocab doctor status cleanup preset
 
 VENV := venv
 PYTHON := $(VENV)/bin/python
@@ -47,7 +49,6 @@ download: ## Download a model (make download MODEL=large-v3-turbo)
 	$(CLI) download $(or $(MODEL),large-v3-turbo)
 
 # ── New Features ─────────────────────────────────────────────
-.PHONY: translate subtitle listen speak download-voice summarize ask diarize
 
 translate: ## Translate audio to English (make translate FILE=audio.m4a)
 	$(CLI) transcribe --translate $(FILE)
@@ -75,6 +76,32 @@ ask: ## Ask AI about a transcript (make ask ID=3 Q="What decisions?")
 
 diarize: ## Transcribe with speaker identification (make diarize FILE=meeting.m4a)
 	$(CLI) transcribe --diarize $(FILE)
+
+repl: ## Launch interactive shell
+	$(CLI) repl
+
+chat: ## Start AI chat (make chat ID=3)
+	$(CLI) chat $(ID)
+
+vocab: ## Word frequency analysis (make vocab ID=3)
+	$(CLI) vocab $(ID)
+
+preset: ## List presets (or: make preset-create NAME=meeting)
+	$(CLI) preset list
+
+preset-create: ## Create a preset (make preset-create NAME=meeting)
+	$(CLI) preset create $(NAME)
+
+# ── System ───────────────────────────────────────────────────
+
+doctor: ## Check system health
+	$(CLI) doctor
+
+status: ## Show usage statistics
+	$(CLI) status
+
+cleanup: ## Clean old data (make cleanup ARGS="--older-than 30d")
+	$(CLI) cleanup $(ARGS)
 
 # ── Development ──────────────────────────────────────────────
 
