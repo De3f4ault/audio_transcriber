@@ -40,11 +40,12 @@ class PhaseTracker:
     summary appears at the very bottom when done.
     """
 
-    PHASES = ["loading", "converting", "uploading", "transcribing", "saving"]
+    PHASES = ["loading", "converting", "uploading", "processing", "transcribing", "saving"]
     LABELS = {
         "loading": "Loading model",
         "converting": "Converting audio",
         "uploading": "Uploading",
+        "processing": "Processing upload",
         "transcribing": "Transcribing",
         "saving": "Saving",
     }
@@ -66,11 +67,14 @@ class PhaseTracker:
 
     @property
     def _visible_phases(self) -> list[str]:
-        """Return phases to display, hiding 'uploading' if never used."""
+        """Return phases to display, hiding 'uploading' and 'processing' if never used."""
+        hidden_unless_used = {"uploading", "processing"}
         return [
             p
             for p in self.PHASES
-            if p != "uploading" or p in self.phase_times or p == self._current_phase
+            if p not in hidden_unless_used
+            or p in self.phase_times
+            or p == self._current_phase
         ]
 
     def start(self) -> None:
