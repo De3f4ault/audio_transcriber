@@ -11,9 +11,17 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from audiobench.core.error_types import EngineError
 from audiobench.core.logger_factory import get_logger
@@ -131,13 +139,17 @@ Rules:
 - Return raw JSON only. No explanation, no markdown fences.
 """
 
-# Maximum inline upload size (20 MB). Larger files use the Files API.
-_INLINE_MAX_BYTES = 20 * 1024 * 1024
+# Default inline upload threshold (20 MB).
+# Overridden at runtime from settings.gemini_inline_max_mb.
+_INLINE_MAX_BYTES_DEFAULT = 20 * 1024 * 1024
 
 # ── Chunking constants ──────────────────────────────────────
 _CHUNK_DURATION = 15 * 60      # 15 minutes per chunk (seconds)
 _CHUNK_OVERLAP = 30            # 30 seconds overlap between chunks
-_CHUNK_THRESHOLD = 20 * 60     # Only chunk files longer than 20 minutes
+# With the Files API handling up to 2 GB per file, we relax the threshold
+# to 45 minutes (from 20 min). Long files still benefit from chunking due
+# to the model's practical output-token limit per request.
+_CHUNK_THRESHOLD_DEFAULT = 45 * 60  # 45 minutes (seconds)
 
 # Map common audio extensions to MIME types.
 _MIME_MAP = {
@@ -159,11 +171,25 @@ def _get_mime(path: Path) -> str:
 
 
 class GeminiEngine(TranscriptionEngine):
-    """Transcription engine backed by Google Gemini API."""
+    """Transcription engine backed by Google Gemini API.
+
+    Upload strategy:
+      - Files ≤ gemini_inline_max_mb  → inline Part.from_bytes (fast, no round-trip)
+      - Files  > gemini_inline_max_mb  → Gemini Files API upload + generate_content(file_ref)
+
+    Rate-limit resilience:
+      - generate_content is wrapped with tenacity exponential-backoff
+        retrying on google.api_core.exceptions.ResourceExhausted (HTTP 429).
+      - On full retry exhaustion, falls back to gemini_upload_fallback_model.
+    """
 
     def __init__(self) -> None:
         self._model_name: str = "gemini-2.5-pro"
-        self._client = None
+        self._fallback_model: str = "gemini-2.0-flash"
+        self._inline_max_bytes: int = _INLINE_MAX_BYTES_DEFAULT
+        self._chunk_threshold: int = _CHUNK_THRESHOLD_DEFAULT
+        self._max_retries: int = 6
+        self._client: Any = None
         self._is_loaded = False
 
     # ── Protocol Implementation ─────────────────────────────
@@ -179,6 +205,8 @@ class GeminiEngine(TranscriptionEngine):
 
         `device` and `compute_type` are ignored (cloud engine).
         `model_name` selects the Gemini model variant.
+        Settings-derived fields (inline threshold, chunk threshold, retries,
+        fallback model) are applied here so they reflect the current .env.
         """
         try:
             from google import genai
@@ -203,9 +231,20 @@ class GeminiEngine(TranscriptionEngine):
             )
 
         self._model_name = model_name
+        self._fallback_model = settings.gemini_upload_fallback_model
+        self._inline_max_bytes = settings.gemini_inline_max_mb * 1024 * 1024
+        self._chunk_threshold = settings.gemini_chunk_threshold_min * 60
+        self._max_retries = settings.gemini_max_retries
         self._client = genai.Client(api_key=api_key)
         self._is_loaded = True
-        logger.info("Gemini engine ready: model=%s", self._model_name)
+        logger.info(
+            "Gemini engine ready: model=%s fallback=%s inline_max=%dMB chunk_threshold=%dmin retries=%d",
+            self._model_name,
+            self._fallback_model,
+            settings.gemini_inline_max_mb,
+            settings.gemini_chunk_threshold_min,
+            self._max_retries,
+        )
 
     def transcribe(
         self,
@@ -269,12 +308,176 @@ class GeminiEngine(TranscriptionEngine):
         except Exception:
             duration = 0.0
 
-        if duration > _CHUNK_THRESHOLD:
+        if duration > self._chunk_threshold:
             return self._transcribe_chunked(
                 audio_path, prompt, on_phase, duration,
             )
 
         return self._transcribe_single(audio_path, prompt, on_phase)
+
+    # ── Retry-wrapped generate call ─────────────────────────
+
+    def _make_generate_caller(self):
+        """Build a tenacity-wrapped generate_content function bound to current retry settings.
+
+        We construct the decorator dynamically so that `_max_retries` (set in
+        `load_model` from settings) is respected at call time rather than at
+        class-definition time.
+        """
+        try:
+            from google.api_core.exceptions import ResourceExhausted
+        except ImportError:
+            # google-api-core not installed; fall back to a bare wrapper
+            # (no retry) so the engine still works without the extra package.
+            def _bare_generate(model_name: str, contents: list) -> Any:
+                return self._client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                )
+            return _bare_generate
+
+        max_retries = self._max_retries
+
+        @retry(
+            retry=retry_if_exception_type(ResourceExhausted),
+            wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
+            stop=stop_after_attempt(max_retries),
+            reraise=True,
+        )
+        def _generate_with_retry(model_name: str, contents: list) -> Any:
+            return self._client.models.generate_content(
+                model=model_name,
+                contents=contents,
+            )
+
+        return _generate_with_retry
+
+    def _call_generate(self, contents: list) -> Any:
+        """Call generate_content with exponential-backoff retry on 429s.
+
+        Falls back to `_fallback_model` if the primary model exhausts all
+        retry attempts (quota fully depleted for the request window).
+        """
+        try:
+            from google.api_core.exceptions import ResourceExhausted
+            _generate = self._make_generate_caller()
+            return _generate(self._model_name, contents)
+        except Exception as exc:
+            # Check if it's a ResourceExhausted (quota) and we have a fallback.
+            try:
+                from google.api_core.exceptions import ResourceExhausted as RE
+                is_quota = isinstance(exc, RE)
+            except ImportError:
+                is_quota = "quota" in str(exc).lower() or "429" in str(exc)
+
+            if is_quota and self._fallback_model != self._model_name:
+                logger.warning(
+                    "Primary model %s quota exhausted after %d retries — "
+                    "switching to fallback model %s",
+                    self._model_name,
+                    self._max_retries,
+                    self._fallback_model,
+                )
+                _generate = self._make_generate_caller()
+                return _generate(self._fallback_model, contents)
+
+            raise EngineError(
+                message="Gemini API call failed",
+                details=str(exc),
+            ) from exc
+
+    # ── Upload via Files API ────────────────────────────────
+
+    def _upload_via_files_api(
+        self,
+        audio_path: Path,
+        mime: str,
+        on_phase: object | None = None,
+    ) -> tuple[str, str]:
+        """Upload audio to the Gemini Files API and wait for it to become ACTIVE.
+
+        Returns:
+            (file_uri, file_name) — URI for use in generate_content,
+            name for deletion after transcription.
+        """
+        from google.genai import types as gtypes
+
+        size_mb = audio_path.stat().st_size / (1024 * 1024)
+
+        if on_phase and callable(on_phase):
+            on_phase(
+                "uploading",
+                f"Uploading {size_mb:.1f} MB to Gemini Files API...",
+                None,
+            )
+
+        logger.info(
+            "Uploading %s (%.1f MB) to Gemini Files API (mime=%s)",
+            audio_path.name, size_mb, mime,
+        )
+
+        try:
+            uploaded = self._client.files.upload(
+                file=str(audio_path),
+                config=gtypes.UploadFileConfig(
+                    mime_type=mime,
+                    display_name=audio_path.name,
+                ),
+            )
+        except Exception as e:
+            raise EngineError(
+                message="Gemini Files API upload failed",
+                details=str(e),
+            ) from e
+
+        logger.info("Upload complete: file_name=%s uri=%s", uploaded.name, uploaded.uri)
+
+        # Poll until the file reaches ACTIVE state (server-side processing).
+        if on_phase and callable(on_phase):
+            on_phase("processing", "Gemini is processing the audio file...", None)
+
+        max_polls = 30          # up to ~60 seconds
+        poll_interval = 2.0     # seconds between polls
+
+        for attempt in range(max_polls):
+            try:
+                file_meta = self._client.files.get(name=uploaded.name)
+            except Exception as e:
+                logger.warning("Files API status poll failed (attempt %d): %s", attempt + 1, e)
+                time.sleep(poll_interval)
+                continue
+
+            state = getattr(file_meta, "state", None)
+            state_name = state.name if hasattr(state, "name") else str(state)
+
+            if state_name == "ACTIVE":
+                logger.info(
+                    "File %s is ACTIVE after %d poll(s)",
+                    uploaded.name, attempt + 1,
+                )
+                return uploaded.uri, uploaded.name
+
+            if state_name == "FAILED":
+                raise EngineError(
+                    message="Gemini file processing failed",
+                    details=f"File {uploaded.name} entered FAILED state: {file_meta}",
+                )
+
+            logger.debug(
+                "File %s state=%s — polling again in %.0fs",
+                uploaded.name, state_name, poll_interval,
+            )
+            time.sleep(poll_interval)
+
+        raise EngineError(
+            message="Gemini file processing timed out",
+            details=(
+                f"File {uploaded.name} did not reach ACTIVE state "
+                f"within {max_polls * poll_interval:.0f}s."
+            ),
+        )
+
+    # ── Single-file transcription (inline or Files API) ─────
 
     def _transcribe_single(
         self,
@@ -282,49 +485,78 @@ class GeminiEngine(TranscriptionEngine):
         prompt: str,
         on_phase: object | None = None,
     ) -> Transcript:
-        """Transcribe a single (non-chunked) audio file."""
+        """Transcribe a single (non-chunked) audio file.
+
+        Routes to the inline path for files ≤ gemini_inline_max_mb, or the
+        Gemini Files API for larger files.  Both paths use `_call_generate`
+        which wraps generate_content with tenacity exponential-backoff retry
+        and an automatic fallback model on quota exhaustion.
+        """
         from google.genai import types
 
         file_size = audio_path.stat().st_size
         mime = _get_mime(audio_path)
+        size_mb = file_size / (1024 * 1024)
 
         logger.info(
-            "Sending to Gemini: file=%s size=%d mime=%s model=%s",
+            "Sending to Gemini: file=%s size=%.1fMB mime=%s model=%s",
             audio_path.name,
-            file_size,
+            size_mb,
             mime,
             self._model_name,
         )
 
+        file_name_to_delete: str | None = None
+
         try:
-            if file_size > _INLINE_MAX_BYTES and on_phase and callable(on_phase):
-                size_mb = file_size / (1024 * 1024)
-                on_phase(
-                    "uploading",
-                    f"Uploading {size_mb:.0f} MB to Gemini...",
-                    None,
-                )
+            if file_size <= self._inline_max_bytes:
+                # ── Inline path (small files) ────────────────────────
+                logger.info("Using inline upload (%.1f MB ≤ %d MB threshold)", size_mb, self._inline_max_bytes // (1024 * 1024))
+                audio_bytes = audio_path.read_bytes()
 
-            audio_bytes = audio_path.read_bytes()
-            logger.info("Sending %d bytes inline to Gemini", len(audio_bytes))
-
-            response = self._client.models.generate_content(
-                model=self._model_name,
-                contents=[
+                contents = [
                     types.Content(
                         parts=[
                             types.Part.from_bytes(data=audio_bytes, mime_type=mime),
                             types.Part.from_text(text=prompt),
                         ]
                     )
-                ],
-            )
+                ]
+            else:
+                # ── Files API path (large files) ─────────────────────
+                logger.info("Using Files API upload (%.1f MB > %d MB threshold)", size_mb, self._inline_max_bytes // (1024 * 1024))
+                file_uri, file_name_to_delete = self._upload_via_files_api(
+                    audio_path, mime, on_phase
+                )
 
-        except Exception as e:
-            raise EngineError(
-                message="Gemini API call failed",
-                details=str(e),
-            ) from e
+                if on_phase and callable(on_phase):
+                    on_phase("transcribing", "Transcribing...", 0.0)
+
+                contents = [
+                    types.Content(
+                        parts=[
+                            types.Part.from_uri(file_uri=file_uri, mime_type=mime),
+                            types.Part.from_text(text=prompt),
+                        ]
+                    )
+                ]
+
+            response = self._call_generate(contents)
+
+        finally:
+            # Clean up the uploaded file immediately to free project storage
+            # quota. Files auto-expire after 48 h anyway, but being explicit
+            # is better hygiene when processing many files.
+            if file_name_to_delete:
+                try:
+                    self._client.files.delete(name=file_name_to_delete)
+                    logger.info("Deleted Files API entry: %s", file_name_to_delete)
+                except Exception as del_exc:
+                    # Non-fatal — the file will expire on its own.
+                    logger.warning(
+                        "Could not delete Files API entry %s: %s",
+                        file_name_to_delete, del_exc,
+                    )
 
         return self._parse_response(response, audio_path)
 

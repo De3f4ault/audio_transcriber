@@ -119,6 +119,10 @@ class AudioBenchSettings(BaseSettings):
         default="qwen3-coder:480b-cloud",
         description="Ollama model for AI bookmark extraction (structured output)",
     )
+    clean_model: str = Field(
+        default="qwen3-next:80b-cloud",
+        description="Ollama model for transcript cleaning (spelling/punctuation correction)",
+    )
 
     # --- Engine Selection ---
     engine: str = Field(
@@ -134,6 +138,39 @@ class AudioBenchSettings(BaseSettings):
     gemini_model: str = Field(
         default="gemini-2.5-pro",
         description="Gemini model to use for transcription",
+    )
+    gemini_inline_max_mb: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Files below this size (MB) are sent inline in the request body. "
+            "Larger files are uploaded via the Gemini Files API."
+        ),
+    )
+    gemini_chunk_threshold_min: int = Field(
+        default=45,
+        ge=1,
+        description=(
+            "Audio longer than this duration (minutes) is split into overlapping chunks "
+            "before transcription. 45 min is safe with the Files API (2 GB / file limit)."
+        ),
+    )
+    gemini_upload_fallback_model: str = Field(
+        default="gemini-2.0-flash",
+        description=(
+            "Fallback Gemini model used when the primary model exhausts its quota "
+            "(all tenacity retries fail with ResourceExhausted)."
+        ),
+    )
+    gemini_max_retries: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description=(
+            "Maximum number of retry attempts on Gemini 429/ResourceExhausted errors. "
+            "Uses exponential backoff with jitter (2s → 60s). "
+            "Applies to both the primary and fallback model calls."
+        ),
     )
 
     # --- Logging ---
