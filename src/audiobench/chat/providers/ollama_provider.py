@@ -261,9 +261,12 @@ class OllamaClient:
             "model": model_name,
             "messages": messages,
             "stream": False,
-            "think": think,
             "options": {"temperature": temperature},
         }
+        # Only inject 'think' when True — cloud-routed endpoints reject the field
+        # entirely (even as False) and return 400.
+        if think:
+            payload["think"] = True
         if num_ctx:
             payload["options"]["num_ctx"] = num_ctx
 
@@ -332,9 +335,12 @@ class OllamaClient:
             "model": model_name,
             "messages": messages,
             "stream": True,
-            "think": think,
             "options": {"temperature": temperature},
         }
+        # Only inject 'think' when True — cloud-routed endpoints reject the field
+        # entirely (even as False) and return 400.
+        if think:
+            payload["think"] = True
         if num_ctx:
             payload["options"]["num_ctx"] = num_ctx
 

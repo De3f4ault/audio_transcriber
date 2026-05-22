@@ -75,6 +75,7 @@ class TranscriptionRecord(Base):
     word_count: Mapped[int] = mapped_column(Integer, default=0)
     segment_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="completed")
+    refined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC), index=True
     )

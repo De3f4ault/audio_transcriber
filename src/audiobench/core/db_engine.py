@@ -109,4 +109,13 @@ def init_db() -> None:
             except Exception as e:
                 logger.warning("Migration m005 failed (non-fatal): %s", e)
 
+            try:
+                from audiobench.storage.migrations.m006_refined_at import (
+                    migrate as migrate_006,
+                )
+
+                migrate_006(db_path)
+            except Exception as e:
+                logger.warning("Migration m006 failed (non-fatal): %s", e)
+
     logger.info("Database tables created")

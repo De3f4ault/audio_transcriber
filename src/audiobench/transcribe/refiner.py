@@ -1,15 +1,25 @@
 """Transcript refinement using LLM post-processing.
 
-Uses a strict auto-corrector prompt to clean up raw Whisper output
-without altering content meaning. Designed to run in the background
-after initial transcription completes.
+Two modes:
+- ``refine_segments(texts)``: batch-numbered-lines protocol — used by both the
+  background auto-clean thread and the ``audiobench clean`` CLI command.
+  Timestamps are never touched; only segment texts change.
+- ``refine(raw_text)``: legacy single-pass full-text mode (kept for potential
+  non-segment use cases but not called by the main pipeline).
+
+Designed for models accessible via OllamaClient, including cloud variants
+(e.g. ``qwen3-next:80b-cloud``).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from audiobench.core.logger_factory import get_logger
 
 logger = get_logger(__name__)
+
+# ── Prompts ────────────────────────────────────────────────────────────────
 
 REFINE_SYSTEM_PROMPT = """You are a transcript auto-corrector. Your ONLY job is to:
 1. Fix spacing errors (e.g. "a like" → "alike", "to morrow" → "tomorrow")
@@ -24,9 +34,28 @@ STRICT RULES:
 - Output ONLY the corrected transcript text, nothing else
 """
 
+SEGMENT_SYSTEM_PROMPT = """You are a careful transcript editor for spoken audio recordings.
+
+Your task is to lightly clean each numbered speech segment:
+- Fix obvious word-boundary errors ("builda" → "build a", "toa" → "to a", "isa" → "is a")
+- Fix clear capitalization ("jesus" → "Jesus", "god" → "God", "lord" → "Lord")
+- Add natural punctuation (periods, commas, question marks) where clearly missing
+- Fix obvious homophones only when the context makes the correction unambiguous
+
+What you must NOT do:
+- Do not rewrite, paraphrase, or summarize any content
+- Do not add words that were not spoken
+- Do not remove words or merge sentences
+- Do not change proper nouns, names, places, or religious terms you are unsure about
+- Do not "correct" code-switching, accents, or non-standard phrasing that is intentional
+
+Return the SAME number of numbered lines as the input — one line per input segment.
+Each line must start with its original number and a period (e.g. "1. text here").
+"""
+
 
 class TranscriptRefiner:
-    """Background transcript refinement using an LLM."""
+    """Segment-aware transcript refinement using an LLM."""
 
     def __init__(self, client, model: str | None = None):
         """Initialize refiner.
@@ -38,8 +67,133 @@ class TranscriptRefiner:
         self._client = client
         self._model = model
 
+    # ── Segment-batch mode (primary path) ─────────────────────────────────
+
+    def refine_segments(
+        self,
+        segment_texts: list[str],
+        batch_size: int = 20,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_token: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        """Clean segment texts in numbered batches via streaming.
+
+        Sends batches of up to ``batch_size`` segments as numbered lines to the
+        LLM using a streaming call (avoids read-timeout on large cloud models).
+        The LLM must return the same number of numbered lines.  If it doesn't
+        (sanity check), the original batch is kept unchanged.
+
+        Args:
+            segment_texts: Raw segment texts in order.
+            batch_size: Max segments per LLM call (default 20).
+            on_progress: Optional callback(batch_num, total_batches) called
+                after each batch completes.
+            on_token: Optional callback(token_str) called for each streaming
+                token received. Useful for showing live activity dots.
+
+        Returns:
+            List of cleaned segment texts, same length as input.
+        """
+        if not segment_texts:
+            return segment_texts
+
+        result: list[str] = []
+        total = len(segment_texts)
+        total_batches = (total + batch_size - 1) // batch_size
+        batch_num = 0
+
+        for batch_start in range(0, total, batch_size):
+            batch = segment_texts[batch_start : batch_start + batch_size]
+            cleaned = self._refine_batch(batch, batch_start, on_token=on_token)
+            result.extend(cleaned)
+            batch_num += 1
+            if on_progress:
+                on_progress(batch_num, total_batches)
+
+        return result
+
+    def _refine_batch(
+        self,
+        batch: list[str],
+        offset: int,
+        on_token: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        """Send one numbered batch to the LLM via streaming and return cleaned texts.
+
+        Uses chat_stream() with think=True so Qwen3 reasons before answering.
+        The on_token callback fires for each content token received, enabling
+        real-time activity display in the CLI.
+        On any failure or line-count mismatch, returns the original batch.
+        """
+        numbered_input = "\n".join(
+            f"{i + 1}. {text.strip()}" for i, text in enumerate(batch)
+        )
+
+        try:
+            # think=True: Qwen3 uses its reasoning chain first then returns clean segments
+            # chat_stream: 300s read timeout (vs 120s for non-streaming)
+            chunks = self._client.chat_stream(
+                messages=[
+                    {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": numbered_input},
+                ],
+                model=self._model,
+                temperature=0.1,
+                think=True,
+            )
+            raw_output = ""
+            for chunk in chunks:
+                token = chunk.get("content", "")
+                if token:
+                    raw_output += token
+                    if on_token:
+                        on_token(token)
+            raw_output = raw_output.strip()
+            parsed = self._parse_numbered_lines(raw_output)
+
+            if len(parsed) != len(batch):
+                logger.warning(
+                    "Segment refiner: batch at offset %d — line count mismatch "
+                    "(%d returned vs %d sent). Keeping originals.",
+                    offset,
+                    len(parsed),
+                    len(batch),
+                )
+                return batch
+
+            return parsed
+
+        except Exception as e:
+            logger.warning(
+                "Segment refiner: batch at offset %d failed (%s). Keeping originals.", offset, e
+            )
+            return batch
+
+    @staticmethod
+    def _parse_numbered_lines(text: str) -> list[str]:
+        """Extract text content from numbered lines (e.g. '1. text' → 'text')."""
+        lines = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Strip leading "N." or "N) " prefix
+            if line and line[0].isdigit():
+                dot_pos = line.find(".")
+                paren_pos = line.find(")")
+                sep = min(
+                    p for p in (dot_pos, paren_pos) if p > 0
+                ) if any(p > 0 for p in (dot_pos, paren_pos)) else -1
+                if sep > 0:
+                    lines.append(line[sep + 1 :].strip())
+                    continue
+            lines.append(line)
+        return lines
+
+    # ── Legacy full-text mode ──────────────────────────────────────────────
+
     def refine(self, raw_text: str) -> str:
-        """Send raw transcript to LLM for cleanup.
+        """Send raw transcript to LLM for cleanup (single-pass full-text mode).
 
         Args:
             raw_text: Original Whisper transcription output.
@@ -57,12 +211,11 @@ class TranscriptRefiner:
                     {"role": "user", "content": raw_text},
                 ],
                 model=self._model,
-                temperature=0.1,  # Low creativity for faithful correction
-                think=False,  # No thinking needed for correction
+                temperature=0.1,
+                think=False,
             )
             refined = result.get("content", "").strip()
             if refined and len(refined) > len(raw_text) * 0.5:
-                # Sanity check: refined text shouldn't be drastically shorter
                 return refined
             logger.warning(
                 "Refinement produced suspicious output (len %d vs raw %d), "

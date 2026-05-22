@@ -131,6 +131,7 @@ def history(
             ("Words", {"justify": "right", "width": 6}),
             ("Duration", {"justify": "right", "width": 10}),
             ("Date", {"style": DIM, "width": 10}),
+            ("✓", {"width": 2, "justify": "center"}),
             ("Preview", {"max_width": 35}),
         ],
     )
@@ -138,6 +139,7 @@ def history(
     for rec in records:
         dur = format_duration(rec["duration"]) if rec["duration"] else "–"
         date = rec["created_at"][:10] if rec["created_at"] else "–"
+        refined_badge = f"[{SUCCESS}]✓[/]" if rec.get("refined_at") else f"[{DIM}]·[/]"
         table.add_row(
             str(rec["id"]),
             rec["file_name"],
@@ -146,6 +148,7 @@ def history(
             str(rec["word_count"]),
             dur,
             date,
+            refined_badge,
             (rec["text_preview"] or "")[:35],
         )
 
@@ -301,12 +304,19 @@ def search(
     is_flag=True,
     help="Raw output without pager (for piping)",
 )
+@click.option(
+    "--show-raw-whisper",
+    "show_raw_whisper",
+    is_flag=True,
+    help="Display original Whisper output instead of refined text",
+)
 def show(
     transcription_id: int,
     timestamps: bool,
     speakers: bool,
     output_format: str,
     raw: bool,
+    show_raw_whisper: bool,
 ) -> None:
     """View a past transcription with timestamps.
 
@@ -335,7 +345,19 @@ def show(
     elif output_format == "srt":
         content = _format_as_srt(data.get("segments", []))
     else:
-        content = _format_as_text(data, timestamps=timestamps, speakers=speakers)
+        # --show-raw-whisper: display the original pre-refinement Whisper text
+        if show_raw_whisper:
+            raw_whisper = data.get("raw_text") or data.get("full_text", "")
+            content = raw_whisper if raw_whisper else "(no raw Whisper text stored)"
+        else:
+            content = _format_as_text(data, timestamps=timestamps, speakers=speakers)
+
+    # Refined status badge
+    refined_at = data.get("refined_at")
+    if refined_at:
+        badge = f"[{SUCCESS}]✓ refined {refined_at[:10]}[/]"
+    else:
+        badge = f"[{DIM}]raw[/]"
 
     if raw:
         print(content)
@@ -347,7 +369,8 @@ def show(
         f"[{ACCENT}]{data['file_name']}[/]  "
         f"[{DIM}]{data.get('language', '?')} • "
         f"{data.get('model', '?')} • "
-        f"{format_duration(data.get('duration', 0))}[/]"
+        f"{format_duration(data.get('duration', 0))}[/]  "
+        f"{badge}"
     )
     console.print(header)
     console.print(f"[{DIM}]{'─' * 50}[/]")

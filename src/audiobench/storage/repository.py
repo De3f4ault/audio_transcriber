@@ -8,6 +8,8 @@ Provides a clean interface over SQLAlchemy for:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from sqlalchemy import desc
 
 from audiobench.core.db_session import get_session
@@ -193,6 +195,7 @@ class TranscriptionRepository:
                         "duration": rec.duration_seconds,
                         "status": rec.status,
                         "audio_file_id": rec.audio_file_id,
+                        "refined_at": rec.refined_at.isoformat() if rec.refined_at else None,
                         "created_at": rec.created_at.isoformat() if rec.created_at else "",
                         "text_preview": rec.full_text[:100] + "..."
                         if len(rec.full_text) > 100
@@ -253,6 +256,7 @@ class TranscriptionRepository:
                 "audio_file_id": rec.audio_file_id,
                 "source": rec.source,
                 "full_text": rec.full_text,
+                "raw_text": rec.raw_text or "",
                 "language": rec.language,
                 "language_probability": rec.language_probability,
                 "engine": rec.engine,
@@ -261,6 +265,7 @@ class TranscriptionRepository:
                 "word_count": rec.word_count,
                 "segment_count": rec.segment_count,
                 "status": rec.status,
+                "refined_at": rec.refined_at.isoformat() if rec.refined_at else None,
                 "created_at": rec.created_at.isoformat() if rec.created_at else "",
                 "segments": [
                     {
@@ -297,6 +302,9 @@ class TranscriptionRepository:
     ) -> bool:
         """Update transcript with LLM-refined text, preserving the raw version.
 
+        If raw_text is currently empty (pre-existing transcription), seeds it
+        from the current full_text before overwriting. Stamps refined_at.
+
         Args:
             transcription_id: The transcription to update.
             refined_text: LLM-cleaned transcript text.
@@ -309,9 +317,12 @@ class TranscriptionRepository:
             rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
             if rec is None:
                 return False
-            rec.raw_text = raw_text
+            # Seed raw_text for pre-existing transcriptions that weren't yet cleaned
+            if not rec.raw_text:
+                rec.raw_text = raw_text
             rec.full_text = refined_text
             rec.word_count = len(refined_text.split())
+            rec.refined_at = datetime.now(UTC)
             session.commit()
             logger.info(
                 "Refined transcript #%d (%d → %d chars)",
@@ -320,6 +331,66 @@ class TranscriptionRepository:
                 len(refined_text),
             )
             return True
+
+    def update_segments(
+        self,
+        transcription_id: int,
+        cleaned_texts: list[str],
+    ) -> bool:
+        """Bulk-update segment texts for a transcription (timestamps unchanged).
+
+        Args:
+            transcription_id: The transcription whose segments to update.
+            cleaned_texts: New text for each segment, in segment_index order.
+
+        Returns:
+            True if all segments were updated, False if count mismatch or not found.
+        """
+        with get_session() as session:
+            segments = (
+                session.query(SegmentRecord)
+                .filter_by(transcription_id=transcription_id)
+                .order_by(SegmentRecord.segment_index)
+                .all()
+            )
+            if not segments:
+                return False
+            if len(segments) != len(cleaned_texts):
+                logger.warning(
+                    "update_segments: segment count mismatch for #%d (%d vs %d)",
+                    transcription_id,
+                    len(segments),
+                    len(cleaned_texts),
+                )
+                return False
+            for seg, new_text in zip(segments, cleaned_texts, strict=True):
+                seg.text = new_text
+            session.commit()
+            logger.info(
+                "Updated %d segments for transcription #%d",
+                len(segments),
+                transcription_id,
+            )
+            return True
+
+    def get_refinement_status(self, transcription_id: int) -> dict | None:
+        """Return refinement status for a transcription.
+
+        Returns:
+            Dict with keys: is_refined, refined_at, raw_text, full_text.
+            None if not found.
+        """
+        with get_session() as session:
+            rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
+            if rec is None:
+                return None
+            return {
+                "id": rec.id,
+                "is_refined": rec.refined_at is not None,
+                "refined_at": rec.refined_at.isoformat() if rec.refined_at else None,
+                "raw_text": rec.raw_text or "",
+                "full_text": rec.full_text or "",
+            }
 
     def delete_by_id(self, transcription_id: int) -> bool:
         """Delete a transcription by ID.

@@ -29,6 +29,7 @@ COMMANDS = [
     "show",
     "export",
     "delete",
+    "clean",
     "preset",
     "install-completion",
     "download",

@@ -215,9 +215,13 @@ class TranscriptionPipeline:
             tx_id = self._repository.save_transcription(transcript, metadata)
             logger.info("Pipeline: saved as transcription #%d", tx_id)
 
-            # Step 3.5: Background refinement (non-blocking)
-            if transcript.text and len(transcript.text.strip()) > 20:
-                self._spawn_refinement(tx_id, transcript.text)
+            # Step 3.5: Background segment refinement (non-blocking)
+            if transcript.segments:
+                self._spawn_refinement(
+                    tx_id,
+                    raw_text=transcript.text,
+                    segments=transcript.segments,
+                )
 
             # Step 4: Format & output
             if output_path:
@@ -240,11 +244,13 @@ class TranscriptionPipeline:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-    def _spawn_refinement(self, tx_id: int, raw_text: str) -> None:
-        """Spawn a background thread to refine transcript text using an LLM.
+    def _spawn_refinement(self, tx_id: int, raw_text: str, segments: list) -> None:
+        """Spawn a background thread to refine transcript segments using an LLM.
 
-        The user sees results immediately — refinement updates the DB
-        in the background.
+        Cleans at the segment level (text only, timestamps untouched) so that
+        all downstream features — play, lyric mode, export, chat — automatically
+        receive the cleaned text. Updates the segments table, then full_text and
+        raw_text, and stamps refined_at.
         """
         import threading
 
@@ -255,19 +261,34 @@ class TranscriptionPipeline:
 
                 client = OllamaClient(
                     base_url=self._settings.ollama_base_url,
-                    model=self._settings.ollama_model,
+                    model=self._settings.clean_model,
                 )
                 if not client.is_available():
                     logger.info("Ollama not available, skipping refinement for #%d", tx_id)
                     return
 
-                refiner = TranscriptRefiner(client)
-                refined = refiner.refine(raw_text)
+                refiner = TranscriptRefiner(client, model=self._settings.clean_model)
 
-                if refined and refined != raw_text:
-                    self._repository.update_full_text(tx_id, refined, raw_text)
-                else:
+                # ── Segment-level cleaning ───────────────────────────────
+                seg_texts = [seg.text for seg in segments]
+                cleaned_texts = refiner.refine_segments(seg_texts)
+
+                if cleaned_texts == seg_texts:
                     logger.info("Refinement produced no changes for #%d", tx_id)
+                    return
+
+                # Update segments (timestamps unchanged, only text)
+                ok = self._repository.update_segments(tx_id, cleaned_texts)
+                if not ok:
+                    logger.warning("update_segments failed for #%d — aborting", tx_id)
+                    return
+
+                # Derive clean full_text from joined segments
+                refined_full = " ".join(t.strip() for t in cleaned_texts if t.strip())
+                self._repository.update_full_text(tx_id, refined_full, raw_text)
+
+                logger.info("Segment refinement complete for #%d", tx_id)
+
             except Exception as e:
                 logger.warning("Background refinement failed for #%d: %s", tx_id, e)
 
