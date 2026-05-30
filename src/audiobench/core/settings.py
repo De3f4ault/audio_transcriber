@@ -20,6 +20,14 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from audiobench.core.constants import (
+    COMPUTE_DEVICES,
+    COMPUTE_TYPES,
+    OUTPUT_FORMATS,
+    SPEED_PRESETS,
+    WHISPER_MODELS,
+)
+
 # Project root — computed from this file's location:
 # core/settings.py → core/ → audiobench/ → src/ → project_root/
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -203,43 +211,50 @@ class AudioBenchSettings(BaseSettings):
     @field_validator("model_name")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
-        valid = {"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"}
-        if v not in valid:
-            raise ValueError(f"Invalid model: {v}. Choose from: {', '.join(sorted(valid))}")
+        if v not in WHISPER_MODELS:
+            raise ValueError(f"Invalid model: {v}. Choose from: {', '.join(sorted(WHISPER_MODELS))}")
         return v
 
     @field_validator("device")
     @classmethod
     def validate_device(cls, v: str) -> str:
-        if v not in {"auto", "cpu", "cuda"}:
-            raise ValueError(f"Invalid device: {v}. Choose from: auto, cpu, cuda")
+        if v not in COMPUTE_DEVICES:
+            raise ValueError(f"Invalid device: {v}. Choose from: {', '.join(sorted(COMPUTE_DEVICES))}")
         return v
 
     @field_validator("compute_type")
     @classmethod
     def validate_compute_type(cls, v: str) -> str:
-        if v not in {"int8", "float16", "float32"}:
-            raise ValueError(f"Invalid compute_type: {v}. Choose from: int8, float16, float32")
+        if v not in COMPUTE_TYPES:
+            raise ValueError(f"Invalid compute_type: {v}. Choose from: {', '.join(sorted(COMPUTE_TYPES))}")
         return v
 
     @field_validator("output_format")
     @classmethod
     def validate_output_format(cls, v: str) -> str:
-        if v not in {"txt", "srt", "vtt", "json"}:
-            raise ValueError(f"Invalid output_format: {v}. Choose from: txt, srt, vtt, json")
+        if v not in OUTPUT_FORMATS:
+            raise ValueError(f"Invalid output_format: {v}. Choose from: {', '.join(sorted(OUTPUT_FORMATS))}")
         return v
 
     @field_validator("speed_preset")
     @classmethod
     def validate_speed_preset(cls, v: str) -> str:
-        if v not in {"fast", "balanced", "accurate"}:
-            raise ValueError(f"Invalid speed_preset: {v}. Choose from: fast, balanced, accurate")
+        if v not in SPEED_PRESETS:
+            raise ValueError(f"Invalid speed_preset: {v}. Choose from: {', '.join(sorted(SPEED_PRESETS))}")
         return v
 
     def ensure_dirs(self) -> None:
         """Create data and model directories if they don't exist."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self) -> None:
+        """Save current settings to settings.json in the data directory."""
+        self.ensure_dirs()
+        json_path = self.data_dir / "settings.json"
+        # We write using Pydantic's model_dump_json for clean serialization
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(self.model_dump_json(indent=2))
 
     def resolve_device(self) -> str:
         """Resolve 'auto' device to actual device (cpu or cuda)."""
@@ -304,5 +319,18 @@ class AudioBenchSettings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> AudioBenchSettings:
-    """Get cached application settings (singleton)."""
-    return AudioBenchSettings()
+    """Get cached application settings (singleton), loading from settings.json if present."""
+    import json
+    
+    json_path = _DATA_DIR / "settings.json"
+    json_data = {}
+    
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+        except Exception as e:
+            # Fallback to default loading if JSON is corrupted
+            print(f"Warning: Could not parse settings.json: {e}")
+            
+    return AudioBenchSettings(**json_data)

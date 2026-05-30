@@ -29,8 +29,7 @@ from audiobench.transcribe.transcription_result import Segment, Transcript, Word
 
 logger = get_logger("engines.whisper")
 
-VALID_MODELS = {"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"}
-
+from audiobench.core.constants import WHISPER_MODELS
 
 class WhisperEngine(TranscriptionEngine):
     """Transcription engine using faster-whisper (CTranslate2).
@@ -64,7 +63,7 @@ class WhisperEngine(TranscriptionEngine):
             compute_type: 'int8' (CPU), 'float16' (CUDA), 'float32'.
             cpu_threads: Number of CPU threads for CTranslate2.
         """
-        if model_name not in VALID_MODELS:
+        if model_name not in WHISPER_MODELS:
             raise ModelNotFoundError(model_name)
 
         logger.info(

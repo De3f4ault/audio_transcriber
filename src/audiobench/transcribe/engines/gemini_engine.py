@@ -30,114 +30,12 @@ from audiobench.transcribe.transcription_result import Segment, Transcript, Word
 
 logger = get_logger("engines.gemini")
 
-# Prompt that instructs Gemini to return structured transcription JSON.
-_TRANSCRIPTION_PROMPT = """\
-Transcribe the following audio accurately and completely.
-
-Return ONLY a valid JSON object with this exact structure (no markdown, no fences):
-{
-  "language": "<ISO 639-1 code>",
-  "segments": [
-    {
-      "id": 0,
-      "start": 0.0,
-      "end": 5.2,
-      "text": "The transcribed text for this segment.",
-      "words": [
-        {"word": "The", "start": 0.0, "end": 0.3},
-        {"word": "transcribed", "start": 0.35, "end": 0.9}
-      ]
-    }
-  ]
-}
-
-Rules:
-- Split into natural segments (sentences or clauses, ~5-15 seconds each).
-- Include word-level timestamps if possible.
-- Detect the spoken language automatically.
-- Preserve the original language — do NOT translate unless asked.
-- Return raw JSON only. No explanation, no markdown fences.
-"""
-
-_DIARIZATION_PROMPT = """\
-Transcribe the following audio accurately and completely, identifying each speaker.
-
-Return ONLY a valid JSON object with this exact structure (no markdown, no fences):
-{
-  "language": "<ISO 639-1 code>",
-  "segments": [
-    {
-      "id": 0,
-      "start": 0.0,
-      "end": 5.2,
-      "text": "The transcribed text for this segment.",
-      "speaker": "Speaker 1",
-      "words": [
-        {"word": "The", "start": 0.0, "end": 0.3},
-        {"word": "transcribed", "start": 0.35, "end": 0.9}
-      ]
-    }
-  ]
-}
-
-Rules:
-- Identify each distinct speaker and label them consistently (Speaker 1, Speaker 2, etc.).
-- Start a new segment when the speaker changes OR at natural sentence boundaries.
-- Split into natural segments (sentences or clauses, ~5-15 seconds each).
-- Include word-level timestamps if possible.
-- Detect the spoken language automatically.
-- Preserve the original language — do NOT translate unless asked.
-- Return raw JSON only. No explanation, no markdown fences.
-"""
-
-_TRANSLATE_PROMPT = """\
-Transcribe the following audio and translate everything to English.
-
-Return ONLY a valid JSON object with this exact structure (no markdown, no fences):
-{
-  "language": "en",
-  "segments": [
-    {
-      "id": 0,
-      "start": 0.0,
-      "end": 5.2,
-      "text": "The translated English text for this segment.",
-      "words": []
-    }
-  ]
-}
-
-Rules:
-- Translate ALL speech to English.
-- Split into natural segments (sentences or clauses).
-- Return raw JSON only. No explanation, no markdown fences.
-"""
-
-_DIARIZATION_TRANSLATE_PROMPT = """\
-Transcribe the following audio, translate everything to English, and identify each speaker.
-
-Return ONLY a valid JSON object with this exact structure (no markdown, no fences):
-{
-  "language": "en",
-  "segments": [
-    {
-      "id": 0,
-      "start": 0.0,
-      "end": 5.2,
-      "text": "The translated English text for this segment.",
-      "speaker": "Speaker 1",
-      "words": []
-    }
-  ]
-}
-
-Rules:
-- Identify each distinct speaker and label them consistently (Speaker 1, Speaker 2, etc.).
-- Start a new segment when the speaker changes OR at natural sentence boundaries.
-- Translate ALL speech to English.
-- Split into natural segments (sentences or clauses).
-- Return raw JSON only. No explanation, no markdown fences.
-"""
+from audiobench.core.prompts import (
+    GEMINI_DIARIZATION_PROMPT,
+    GEMINI_DIARIZATION_TRANSLATE_PROMPT,
+    GEMINI_TRANSCRIPTION_PROMPT,
+    GEMINI_TRANSLATE_PROMPT,
+)
 
 # Default inline upload threshold (20 MB).
 # Overridden at runtime from settings.gemini_inline_max_mb.
@@ -151,23 +49,7 @@ _CHUNK_OVERLAP = 30            # 30 seconds overlap between chunks
 # to the model's practical output-token limit per request.
 _CHUNK_THRESHOLD_DEFAULT = 45 * 60  # 45 minutes (seconds)
 
-# Map common audio extensions to MIME types.
-_MIME_MAP = {
-    ".wav": "audio/wav",
-    ".mp3": "audio/mpeg",
-    ".m4a": "audio/mp4",
-    ".flac": "audio/flac",
-    ".ogg": "audio/ogg",
-    ".opus": "audio/ogg",
-    ".aac": "audio/aac",
-    ".wma": "audio/x-ms-wma",
-    ".webm": "audio/webm",
-}
-
-
-def _get_mime(path: Path) -> str:
-    """Resolve MIME type from file extension."""
-    return _MIME_MAP.get(path.suffix.lower(), "audio/mpeg")
+from audiobench.core.constants import get_mime
 
 
 class GeminiEngine(TranscriptionEngine):
@@ -288,13 +170,13 @@ class GeminiEngine(TranscriptionEngine):
         # Choose prompt based on task and diarization.
         diarize = kwargs.get("diarize", False)
         if diarize and task == "translate":
-            prompt = _DIARIZATION_TRANSLATE_PROMPT
+            prompt = GEMINI_DIARIZATION_TRANSLATE_PROMPT
         elif diarize:
-            prompt = _DIARIZATION_PROMPT
+            prompt = GEMINI_DIARIZATION_PROMPT
         elif task == "translate":
-            prompt = _TRANSLATE_PROMPT
+            prompt = GEMINI_TRANSLATE_PROMPT
         else:
-            prompt = _TRANSCRIPTION_PROMPT
+            prompt = GEMINI_TRANSCRIPTION_PROMPT
 
         if language and task != "translate":
             prompt += f"\nThe audio is spoken in language code: {language}\n"
@@ -495,7 +377,7 @@ class GeminiEngine(TranscriptionEngine):
         from google.genai import types
 
         file_size = audio_path.stat().st_size
-        mime = _get_mime(audio_path)
+        mime = get_mime(audio_path.suffix)
         size_mb = file_size / (1024 * 1024)
 
         logger.info(

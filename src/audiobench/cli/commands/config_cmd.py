@@ -81,6 +81,48 @@ def preset() -> None:
       audiobench transcribe file.m4a --preset meeting
     """
 
+# ── Config Group ────────────────────────────────────────────
+
+@click.group()
+def config() -> None:
+    """Manage global application settings.
+    
+    \b
+    Examples:
+      audiobench config set gemini_model gemini-2.0-flash
+      audiobench config set speed_preset fast
+    """
+
+@config.command("set")
+@click.argument("key")
+@click.argument("value")
+def config_set(key: str, value: str) -> None:
+    """Set a global configuration value and save to settings.json."""
+    from audiobench.core.settings import get_settings, AudioBenchSettings
+    
+    current_settings = get_settings()
+    
+    if not hasattr(current_settings, key):
+        console.print(error_panel("Unknown setting", f"'{key}' is not a valid configuration key."))
+        return
+        
+    # Get current data, update the key, and re-validate by creating a new instance
+    data = current_settings.model_dump()
+    data[key] = value
+    
+    try:
+        # Re-instantiate to trigger Pydantic validation and type coercion
+        updated_settings = AudioBenchSettings(**data)
+        updated_settings.save()
+        
+        # Update the singleton in-place so subsequent code in this run sees it
+        setattr(current_settings, key, getattr(updated_settings, key))
+        
+        console.print(f"  [{SUCCESS}]✓[/] Configuration updated")
+        console.print(f"    [{DIM}]{key} = {getattr(updated_settings, key)}[/]")
+    except Exception as e:
+        console.print(error_panel(f"Failed to update '{key}'", str(e)))
+
 
 @preset.command("create")
 @click.argument("name")

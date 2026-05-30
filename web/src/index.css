@@ -1,0 +1,213 @@
+/* 
+  Claude Design System Implementation
+  Based on docs/claude-design-system.md
+*/
+
+:root {
+  /* Core Surfaces */
+  --color-bg-primary: #f5f4ed;
+  --color-bg-elevated: #faf9f5;
+  --color-bg-white: #ffffff;
+  --color-bg-dark: #141413;
+  --color-bg-dark-elevated: #30302e;
+
+  /* Text */
+  --color-text-primary: #141413;
+  --color-text-secondary: #5e5d59;
+  --color-text-tertiary: #87867f;
+  --color-text-button-muted: #4d4c48;
+  --color-text-dark-primary: #faf9f5;
+  --color-text-dark-secondary: #b0aea5;
+
+  /* Brand & Accent */
+  --color-brand: #c96442;
+  --color-accent: #d97757;
+  --color-accent-blue: #6a9bcc;
+  --color-accent-green: #788c5d;
+  --color-focus: #3898ec;
+  --color-error: #b53333;
+
+  /* Borders & Rings */
+  --color-border-subtle: #f0eee6;
+  --color-border-strong: #e8e6dc;
+  --color-border-dark: #30302e;
+  --color-ring-default: #d1cfc5;
+  --color-ring-subtle: #dedc01;
+  --color-ring-deep: #c2c0b6;
+
+  /* Interactive Surfaces */
+  --color-surface-sand: #e8e6dc;
+
+  /* Typography */
+  --font-serif: Georgia, ui-serif, serif;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+[data-theme='dark'] {
+  --color-bg-primary: var(--color-bg-dark);
+  --color-bg-elevated: var(--color-bg-dark-elevated);
+  --color-text-primary: var(--color-text-dark-primary);
+  --color-text-secondary: var(--color-text-dark-secondary);
+  --color-border-subtle: var(--color-border-dark);
+  --color-border-strong: var(--color-border-dark);
+}
+
+/* Base Styles */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.4s ease-out, color 0.4s ease-out;
+}
+
+/* Typography Classes */
+h1, h2, h3, h4, h5, h6, .font-serif {
+  font-family: var(--font-serif);
+  font-weight: 500;
+}
+
+h1 {
+  font-size: 64px;
+  line-height: 1.1;
+}
+
+h2 {
+  font-size: 52px;
+  line-height: 1.2;
+}
+
+h3 {
+  font-size: 32px;
+  line-height: 1.1;
+}
+
+/* Standard Components (Utility Classes) */
+.card {
+  background-color: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 8px;
+  padding: 24px;
+  transition: transform 0.2s ease-out, box-shadow 0.2s ease-out;
+}
+
+.card-elevated {
+  box-shadow: rgba(0, 0, 0, 0.05) 0 4px 24px;
+}
+
+/* Buttons */
+.btn {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.15s ease-out;
+  text-decoration: none;
+}
+
+.btn:focus-visible {
+  outline: none;
+  border-color: var(--color-focus);
+  box-shadow: 0 0 0 3px rgba(56, 152, 236, 0.15);
+}
+
+.btn:active {
+  transform: scale(0.98);
+}
+
+.btn-primary {
+  background: var(--color-brand);
+  color: var(--color-bg-elevated);
+  border-radius: 12px;
+  padding: 10px 18px;
+  box-shadow: var(--color-brand) 0 0 0 0, var(--color-brand) 0 0 0 1px;
+}
+
+.btn-primary:hover {
+  background: #d86d49;
+  box-shadow: var(--color-brand) 0 0 0 0, var(--color-brand) 0 0 0 2px;
+}
+
+.btn-secondary {
+  background: var(--color-surface-sand);
+  color: var(--color-text-button-muted);
+  border-radius: 8px;
+  padding: 8px 16px;
+  box-shadow: var(--color-surface-sand) 0 0 0 0, var(--color-ring-default) 0 0 0 1px;
+}
+
+.btn-secondary:hover {
+  background: #f0eee6;
+  box-shadow: var(--color-surface-sand) 0 0 0 0, var(--color-ring-deep) 0 0 0 1px;
+}
+
+/* Inputs */
+.input-field {
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg-elevated);
+  transition: border-color 0.2s ease-out, box-shadow 0.2s ease-out;
+  outline: none;
+  width: 100%;
+}
+
+.input-field:focus {
+  border-color: var(--color-focus);
+  box-shadow: 0 0 0 3px rgba(56, 152, 236, 0.15);
+}
+
+.input-field:disabled {
+  background: var(--color-border-subtle);
+  color: var(--color-text-tertiary);
+  cursor: not-allowed;
+}
+
+/* Layout Utilities */
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.flex { display: flex; }
+.flex-col { display: flex; flex-direction: column; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.justify-center { justify-content: center; }
+.gap-2 { gap: 8px; }
+.gap-4 { gap: 16px; }
+.gap-6 { gap: 24px; }
+.gap-8 { gap: 32px; }
+
+/* Text Utilities */
+.text-secondary { color: var(--color-text-secondary); }
+.text-tertiary { color: var(--color-text-tertiary); }
+.text-brand { color: var(--color-brand); }
+.text-error { color: var(--color-error); }
+
+.text-sm { font-size: 14px; }
+.text-xs { font-size: 12px; letter-spacing: 0.12px; }
+.text-overline { font-size: 10px; letter-spacing: 0.5px; text-transform: uppercase; }
+
+/* Motion respects preferences */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+  }
+}
