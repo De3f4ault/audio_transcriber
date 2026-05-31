@@ -134,7 +134,7 @@ def parse_formats(format_str: str | None) -> list[str]:
     Returns a list of format strings. If None, returns empty list
     (caller should use default_format).
     """
-    valid_formats = {"txt", "srt", "vtt", "json"}
+    valid_formats = {"txt", "srt", "vtt", "json", "pdf"}
 
     if not format_str:
         return []

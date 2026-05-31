@@ -9,6 +9,7 @@ Provides a clean interface over SQLAlchemy for:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 
 from sqlalchemy import desc
 
@@ -23,10 +24,72 @@ logger = get_logger("storage.repository")
 class TranscriptionRepository:
     """CRUD operations for transcription persistence."""
 
+    def _import_to_library(self, original_path: str, move: bool = True) -> str:
+        """Import an audio file into the managed data/library directory.
+
+        If ``move=True`` (default) the original file is moved, not copied,
+        making the library the single source of truth. If the move succeeds
+        but a later step raises, the file is moved back before re-raising so
+        the caller never loses the original.
+
+        Also moves any .cue / .srt / .vtt sidecars alongside the audio file.
+        """
+        from pathlib import Path
+        import shutil
+        import hashlib
+        from audiobench.core.settings import get_settings
+
+        settings = get_settings()
+        library_dir = settings.data_dir / "library"
+        library_dir.mkdir(parents=True, exist_ok=True)
+
+        orig = Path(original_path).absolute()
+        if library_dir in orig.parents or not orig.exists():
+            return str(orig)
+
+        file_id_hash = hashlib.md5(str(orig).encode()).hexdigest()[:8]
+        target_name = f"{file_id_hash}_{orig.name}"
+        target_path = library_dir / target_name
+
+        moved_pairs: list[tuple] = []  # (dest, src) for rollback
+
+        try:
+            if not target_path.exists():
+                if move:
+                    shutil.move(str(orig), str(target_path))
+                    moved_pairs.append((target_path, orig))
+                else:
+                    shutil.copy2(str(orig), str(target_path))
+
+            # Move sidecars alongside the audio file
+            for ext in (".cue", ".srt", ".vtt"):
+                sidecar = orig.with_suffix(ext)
+                if sidecar.exists():
+                    sidecar_target = target_path.with_suffix(ext)
+                    if not sidecar_target.exists():
+                        if move:
+                            shutil.move(str(sidecar), str(sidecar_target))
+                            moved_pairs.append((sidecar_target, sidecar))
+                        else:
+                            shutil.copy2(str(sidecar), str(sidecar_target))
+
+            return str(target_path)
+
+        except Exception:
+            # Roll back: move each already-moved file back to its origin
+            for dest, src in reversed(moved_pairs):
+                try:
+                    if Path(dest).exists():
+                        shutil.move(str(dest), str(src))
+                except Exception as rb_err:
+                    logger.error("Rollback failed for %s → %s: %s", dest, src, rb_err)
+            raise
+
     def save_transcription(
         self,
         transcript: Transcript,
         audio_metadata: AudioMetadata | None = None,
+        chapter_id: int | None = None,
     ) -> int:
         """Save a transcription result to the database.
 
@@ -36,6 +99,7 @@ class TranscriptionRepository:
         Args:
             transcript: The transcription result.
             audio_metadata: Source audio metadata (for dedup by hash).
+            chapter_id: Optional chapter ID if this is a chapter transcription.
 
         Returns:
             The transcription record ID.
@@ -43,16 +107,26 @@ class TranscriptionRepository:
         with get_session() as session:
             # Find or create audio file record
             audio_record = None
-            if audio_metadata and audio_metadata.file_hash:
+            chapter_record = None
+            
+            if chapter_id:
+                from audiobench.storage.models import ChapterRecord
+                chapter_record = session.query(ChapterRecord).get(chapter_id)
+                if chapter_record:
+                    audio_record = session.query(AudioFileRecord).get(chapter_record.audio_file_id)
+            elif audio_metadata and audio_metadata.file_hash:
                 audio_record = (
                     session.query(AudioFileRecord)
                     .filter_by(file_hash=audio_metadata.file_hash)
                     .first()
                 )
 
-            if audio_record is None and audio_metadata:
+            if audio_record is None and audio_metadata and not chapter_id:
+                # Import file to library
+                new_path = self._import_to_library(audio_metadata.file_path)
+                
                 audio_record = AudioFileRecord(
-                    file_path=audio_metadata.file_path,
+                    file_path=new_path,
                     file_name=audio_metadata.file_name,
                     file_size_bytes=audio_metadata.file_size_bytes,
                     format=audio_metadata.format,
@@ -63,6 +137,38 @@ class TranscriptionRepository:
                 )
                 session.add(audio_record)
                 session.flush()  # Get the ID
+
+                # Auto-detect chapters
+                from audiobench.chapters.detector import ChapterDetector
+                from pathlib import Path
+                
+                try:
+                    detector = ChapterDetector()
+                    chapters_info = detector.detect(Path(new_path))
+                    if chapters_info:
+                        chap_dicts = [
+                            {
+                                "index": c.index,
+                                "title": c.title,
+                                "start_time": c.start_time,
+                                "end_time": c.end_time,
+                                "is_ghost": c.is_ghost,
+                            }
+                            for c in chapters_info
+                        ]
+                        # ChapterRepository manages its own session, but we are inside one.
+                        # Wait, ChapterRepository.save_chapters opens its own `with get_session()`.
+                        # Since we are already in a transaction, it might block if using sqlite with WAL,
+                        # but get_session() typically handles nested or new connections.
+                        # However, AudioFileRecord might not be committed yet!
+                        # We must commit first so ChapterRepository can see the audio_file_id.
+                        session.commit()
+
+                        from audiobench.storage.chapter_repository import get_chapter_repo
+                        get_chapter_repo().save_chapters(audio_record.id, chap_dicts)
+                        logger.info("Auto-detected and saved %d chapters for %s", len(chapters_info), audio_record.file_name)
+                except Exception as e:
+                    logger.warning("Failed to auto-detect chapters for %s: %s", audio_record.file_name, e)
 
             # Create transcription record
             tx_record = TranscriptionRecord(
@@ -78,6 +184,7 @@ class TranscriptionRepository:
                 word_count=transcript.word_count,
                 segment_count=transcript.segment_count,
                 status="completed",
+                speaker_map=json.dumps(transcript.speaker_map),
             )
             session.add(tx_record)
             session.flush()
@@ -91,8 +198,13 @@ class TranscriptionRepository:
                     start_time=seg.start,
                     end_time=seg.end,
                     speaker=seg.speaker,
+                    chapter_id=chapter_id,
                 )
                 session.add(seg_record)
+                
+            if chapter_record:
+                chapter_record.transcription_id = tx_record.id
+                chapter_record.transcription_status = "completed"
 
             session.commit()
             logger.info(
@@ -160,16 +272,23 @@ class TranscriptionRepository:
                 .first()
             )
 
-    def get_history(self, limit: int = 20, offset: int = 0) -> list[dict]:
+    def get_history(self, limit: int = 20, offset: int = 0, chapter_mode: bool | None = None) -> list[dict]:
         """Get recent transcription history.
 
+        Args:
+            chapter_mode: If True, returns only chapter transcripts. If False, returns only master transcripts. If None, returns all.
         Returns:
             List of dicts with transcription + audio metadata.
         """
         with get_session() as session:
+            query = session.query(TranscriptionRecord)
+            if chapter_mode is True:
+                query = query.filter(TranscriptionRecord.chapter_id.isnot(None))
+            elif chapter_mode is False:
+                query = query.filter(TranscriptionRecord.chapter_id.is_(None))
+
             records = (
-                session.query(TranscriptionRecord)
-                .order_by(desc(TranscriptionRecord.created_at))
+                query.order_by(desc(TranscriptionRecord.created_at))
                 .offset(offset)
                 .limit(limit)
                 .all()
@@ -195,6 +314,7 @@ class TranscriptionRepository:
                         "duration": rec.duration_seconds,
                         "status": rec.status,
                         "audio_file_id": rec.audio_file_id,
+                        "chapter_id": getattr(rec, "chapter_id", None),
                         "refined_at": rec.refined_at.isoformat() if rec.refined_at else None,
                         "created_at": rec.created_at.isoformat() if rec.created_at else "",
                         "text_preview": rec.full_text[:100] + "..."
@@ -204,6 +324,85 @@ class TranscriptionRepository:
                 )
 
             return results
+
+    def get_file_by_path(self, file_path: str) -> dict | None:
+        """Find an audio file record by its absolute path."""
+        from pathlib import Path
+        abs_path = str(Path(file_path).absolute())
+        with get_session() as session:
+            rec = session.query(AudioFileRecord).filter_by(file_path=abs_path).first()
+            if not rec:
+                return None
+            return {
+                "id": rec.id,
+                "file_path": rec.file_path,
+                "file_name": rec.file_name,
+                "duration_seconds": rec.duration_seconds,
+                "format": rec.format,
+                "file_size_bytes": rec.file_size_bytes,
+                "created_at": rec.created_at.isoformat() if rec.created_at else "",
+            }
+
+    def get_audio_file(self, audio_file_id: int) -> dict | None:
+        """Find an audio file record by its DB ID."""
+        with get_session() as session:
+            rec = session.query(AudioFileRecord).filter_by(id=audio_file_id).first()
+            if not rec:
+                return None
+            
+            # Count transcriptions
+            tx_count = session.query(TranscriptionRecord).filter_by(audio_file_id=audio_file_id).count()
+            
+            return {
+                "id": rec.id,
+                "file_path": rec.file_path,
+                "file_name": rec.file_name,
+                "duration_seconds": rec.duration_seconds,
+                "format": rec.format,
+                "file_size_bytes": rec.file_size_bytes,
+                "created_at": rec.created_at.isoformat() if rec.created_at else "",
+                "transcript_count": tx_count,
+            }
+
+    def get_or_create_file(self, file_path: str) -> int:
+        """Find an audio file record by path, or create a stub if it doesn't exist."""
+        from pathlib import Path
+        import os
+        
+        # Import to library first
+        abs_path = self._import_to_library(file_path)
+        
+        with get_session() as session:
+            rec = session.query(AudioFileRecord).filter_by(file_path=abs_path).first()
+            if rec:
+                return rec.id
+                
+            # Create a stub record. It will be filled in properly when transcribed.
+            path_obj = Path(abs_path)
+            file_size = os.path.getsize(abs_path) if path_obj.exists() else 0
+            
+            new_rec = AudioFileRecord(
+                file_path=abs_path,
+                file_name=path_obj.name,
+                file_size_bytes=file_size,
+                format=path_obj.suffix.lstrip("."),
+            )
+            session.add(new_rec)
+            session.commit()
+            return new_rec.id
+
+    def get_latest_transcript_for_file(self, audio_file_id: int) -> dict | None:
+        """Find the most recent completed transcription for a file."""
+        with get_session() as session:
+            rec = (
+                session.query(TranscriptionRecord)
+                .filter_by(audio_file_id=audio_file_id, status="completed")
+                .order_by(desc(TranscriptionRecord.created_at))
+                .first()
+            )
+            if not rec:
+                return None
+            return self.get_by_id(rec.id)
 
     def search(self, query: str, limit: int = 10) -> list[dict]:
         """Search transcriptions by text content.
@@ -244,7 +443,7 @@ class TranscriptionRepository:
             if rec is None:
                 return None
 
-            return {
+            data = {
                 "id": rec.id,
                 "file_name": rec.file_name
                 or (
@@ -274,10 +473,21 @@ class TranscriptionRepository:
                         "start": seg.start_time,
                         "end": seg.end_time,
                         "speaker": seg.speaker,
+                        "chapter_id": seg.chapter_id,
                     }
                     for seg in sorted(rec.segments, key=lambda s: s.segment_index)
                 ],
+                "speaker_map": json.loads(rec.speaker_map) if rec.speaker_map else {},
+                "chapters": [],
             }
+
+            # Fetch chapters if we have an audio file ID
+            if rec.audio_file_id:
+                from audiobench.storage.chapter_repository import get_chapter_repo
+                chapter_records = get_chapter_repo().get_chapters(rec.audio_file_id)
+                data["chapters"] = [c.to_dict() for c in chapter_records]
+
+            return data
 
     def update_text(self, transcription_id: int, new_text: str) -> bool:
         """Update the full text of a transcription (used by REPL .edit).

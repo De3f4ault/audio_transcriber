@@ -100,23 +100,81 @@ def _parse_time_or_range(time_str: str) -> tuple[float, float | None]:
 # ── Bookmark Group ──────────────────────────────────────────
 
 
-@click.group()
-def bookmark() -> None:
+@click.group(invoke_without_command=True)
+@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Launch interactive bookmark wizard")
+@click.pass_context
+def bookmark(ctx: click.Context, interactive_mode: bool) -> None:
     """Manage audio bookmarks and region markers.
 
     \b
     Examples:
+      audiobench bookmark --interactive
       audiobench bookmark list                          All bookmarks
-      audiobench bookmark list meeting.m4a              For specific file
       audiobench bookmark add 66 12:35                  Add at timestamp
-      audiobench bookmark add 66 12:35-14:20            Add region
-      audiobench bookmark rename 1 "Key Insight"        Rename
       audiobench bookmark rm 1                          Delete
-      audiobench bookmark export 66 -o marks.json       Export to JSON
     """
     from audiobench.core.db_engine import init_db
 
     init_db()
+
+    if interactive_mode or ctx.invoked_subcommand is None:
+        from audiobench.cli.wizard import prompt_transcription, prompt_menu, prompt_string
+        from audiobench.storage.bookmark_repository import BookmarkRepository
+        
+        try:
+            target_id = prompt_transcription("Select a transcription to manage bookmarks")
+            repo = BookmarkRepository()
+            
+            while True:
+                from audiobench.storage.models import TranscriptionRecord
+                from audiobench.core.db_session import get_session
+                
+                audio_id = None
+                with get_session() as session:
+                    rec = session.query(TranscriptionRecord).filter_by(id=target_id).first()
+                    if rec:
+                        audio_id = rec.audio_file_id
+                        
+                if not audio_id:
+                    console.print(error_panel("No linked audio found"))
+                    break
+                    
+                bms = repo.list_for_file(audio_id)
+                options = [
+                    ("list", f"List bookmarks ({len(bms)})", "list"),
+                    ("add", "Add new bookmark", "add"),
+                    ("auto", "AI Auto-Bookmark", "auto"),
+                    ("back", "Exit", "back"),
+                ]
+                
+                action = prompt_menu(f"\nBookmark Menu (Transcript #{target_id})", options)
+                
+                if action == "back":
+                    break
+                elif action == "list":
+                    if not bms:
+                        console.print(f"  [{DIM}]No bookmarks found.[/]")
+                    else:
+                        for b in bms:
+                            time_str = _format_timestamp(b["timestamp"])
+                            if b["is_region"]: time_str += f"-{_format_timestamp(b['end_timestamp'])}"
+                            console.print(f"  [{ACCENT}]#{b['id']}[/] {time_str} - {b['name']}")
+                elif action == "add":
+                    time_str = prompt_string("Timestamp (MM:SS) or Region (MM:SS-MM:SS)")
+                    if not time_str: continue
+                    name = prompt_string("Name", default=f"Bookmark @ {time_str}")
+                    start, end = _parse_time_or_range(time_str)
+                    if end is not None:
+                        repo.add_region(audio_id, start, end, name=name)
+                    else:
+                        repo.add(audio_id, start, name=name)
+                    console.print(f"  [{SUCCESS}]✓ Added bookmark '{name}'[/]")
+                elif action == "auto":
+                    focus = prompt_string("Focus (e.g. 'action items', leave empty for general)")
+                    ctx.invoke(auto_cmd, target=str(target_id), model=None, focus=focus if focus else None, dry_run=False)
+                    
+        except KeyboardInterrupt:
+            sys.exit(0)
 
 
 # ── List ────────────────────────────────────────────────────
@@ -173,6 +231,18 @@ def list_cmd(
             print(b["id"])
         return
 
+    # Fetch chapters if any
+    from audiobench.storage.chapter_repository import get_chapter_repo
+    chap_repo = get_chapter_repo()
+    file_chapters = {}
+    if target and audio_id:
+        file_chapters[audio_id] = chap_repo.list_for_file(audio_id)
+    else:
+        # Load all chapters for all unique audio_ids in bookmarks
+        unique_audio_ids = {b.get("audio_file_id") for b in bookmarks if b.get("audio_file_id")}
+        for aid in unique_audio_ids:
+            file_chapters[aid] = chap_repo.list_for_file(aid)
+
     # Table output
     table = make_table(
         f"Bookmarks — {file_label}",
@@ -180,6 +250,7 @@ def list_cmd(
             ("#", {"style": DIM, "width": 4}),
             ("Type", {"width": 4}),
             ("Time", {"width": 12}),
+            ("Chapter", {"style": DIM, "max_width": 20}),
             ("Name", {"style": ACCENT, "max_width": 45}),
             ("Notes", {"style": DIM, "max_width": 25}),
             ("Date", {"style": DIM, "width": 10}),
@@ -199,10 +270,21 @@ def list_cmd(
         notes_preview = (b["notes"] or "")[:25]
         date = b["created_at"][:10] if b["created_at"] else "–"
 
+        chapter_title = ""
+        aid = b.get("audio_file_id")
+        if aid and file_chapters.get(aid):
+            # Find chapter containing this bookmark's timestamp
+            for ch in file_chapters[aid]:
+                end = ch.end_time if ch.end_time else float('inf')
+                if ch.start_time <= float(b["timestamp"]) <= end:
+                    chapter_title = ch.title[:20]
+                    break
+
         table.add_row(
             str(b["id"]),
             emoji,
             time_str,
+            chapter_title,
             b["name"][:45],
             notes_preview,
             date,
@@ -216,7 +298,7 @@ def list_cmd(
 
 @bookmark.command()
 @click.argument("target")
-@click.argument("time_str")
+@click.argument("time_str", required=False, default=None)
 @click.argument("name", required=False, default=None)
 @click.option(
     "--type", "bookmark_type", default="bookmark",
@@ -224,12 +306,14 @@ def list_cmd(
     help="Bookmark type",
 )
 @click.option("--notes", default=None, help="Optional notes")
+@click.option("--chapter", type=int, default=None, help="Bookmark a specific chapter")
 def add(
     target: str,
-    time_str: str,
+    time_str: str | None,
     name: str | None,
     bookmark_type: str,
     notes: str | None,
+    chapter: int | None,
 ) -> None:
     """Add a bookmark at a timestamp (e.g. 12:35) or region (12:35-14:20)."""
     from audiobench.storage.bookmark_repository import BookmarkRepository
@@ -241,12 +325,25 @@ def add(
         )
         sys.exit(1)
 
-    start, end = _parse_time_or_range(time_str)
-    if start == 0.0 and end is None and time_str != "00:00":
-        console.print(
-            error_panel("Invalid time", f"'{time_str}' — expected MM:SS or MM:SS-MM:SS")
-        )
-        sys.exit(1)
+    if chapter is not None:
+        from audiobench.storage.chapter_repository import get_chapter_repo
+        chap = get_chapter_repo().get_chapter_by_index(audio_id, chapter)
+        if not chap:
+            console.print(error_panel("Chapter Not Found", f"Chapter {chapter} does not exist for this file."))
+            sys.exit(1)
+        start = chap.start_time
+        end = chap.end_time if chap.end_time else None
+        name = name or chap.title
+    else:
+        if not time_str:
+            console.print(error_panel("Missing Argument", "You must provide either a time_str or --chapter"))
+            sys.exit(1)
+        start, end = _parse_time_or_range(time_str)
+        if start == 0.0 and end is None and time_str != "00:00":
+            console.print(
+                error_panel("Invalid time", f"'{time_str}' — expected MM:SS or MM:SS-MM:SS")
+            )
+            sys.exit(1)
 
     repo = BookmarkRepository()
     default_name = name or f"Bookmark @ {_format_timestamp(start)}"

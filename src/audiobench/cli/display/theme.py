@@ -58,7 +58,7 @@ PHASE_ERROR = f"[{ERROR}]  ✗[/]"
 
 # ── App branding ───────────────────────────────────────────
 APP_NAME = "AudioBench"
-APP_VERSION = "0.1.0"
+APP_VERSION = "2.0.0"
 
 
 def app_header(subtitle: str = "") -> Panel:
@@ -146,6 +146,7 @@ EXT_TO_FORMAT = {
     ".srt": "srt",
     ".vtt": "vtt",
     ".json": "json",
+    ".pdf": "pdf",
 }
 
 FORMAT_TO_EXT = {v: k for k, v in EXT_TO_FORMAT.items()}

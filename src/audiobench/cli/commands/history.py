@@ -53,12 +53,19 @@ from audiobench.cli.display.theme import (
     show_default=True,
     help="Output format",
 )
+@click.option(
+    "--chapters",
+    "show_chapters",
+    is_flag=True,
+    help="List chapter-level transcriptions instead of master files",
+)
 def history(
     limit: int,
     tail_n: int | None,
     since: str | None,
     sort_by: str,
     output_format: str,
+    show_chapters: bool,
 ) -> None:
     """View transcription history.
 
@@ -78,7 +85,7 @@ def history(
     repo = TranscriptionRepository()
 
     effective_limit = tail_n if tail_n is not None else limit
-    records = repo.get_history(limit=effective_limit)
+    records = repo.get_history(limit=effective_limit, chapter_mode=True if show_chapters else False)
 
     # D1: --since filtering
     if since and records:
@@ -135,6 +142,22 @@ def history(
             ("Preview", {"max_width": 35}),
         ],
     )
+
+    # Optionally add chapter counts if not in chapter mode
+    if not show_chapters:
+        from audiobench.storage.chapter_repository import get_chapter_repo
+        chap_repo = get_chapter_repo()
+        file_chapter_counts = {}
+        unique_audio_ids = {r.get("audio_file_id") for r in records if r.get("audio_file_id")}
+        for aid in unique_audio_ids:
+            chapters = chap_repo.list_for_file(aid)
+            if chapters:
+                file_chapter_counts[aid] = len(chapters)
+                
+        for rec in records:
+            aid = rec.get("audio_file_id")
+            if aid and file_chapter_counts.get(aid):
+                rec["file_name"] += f" [{DIM}]({file_chapter_counts[aid]} chs)[/]"
 
     for rec in records:
         dur = format_duration(rec["duration"]) if rec["duration"] else "–"
@@ -429,13 +452,13 @@ def _srt_time(seconds: float) -> str:
 
 
 @click.command()
-@click.argument("transcription_id", type=int)
+@click.argument("transcription_id", type=int, required=False)
 @click.option(
     "-f",
     "--format",
     "output_format",
-    required=True,
-    type=click.Choice(["txt", "srt", "vtt", "json"]),
+    required=False,
+    type=click.Choice(["txt", "srt", "vtt", "json", "pdf", "all"]),
     help="Output format",
 )
 @click.option("-o", "--output", "output_path", default=None, help="Output file path")
@@ -445,17 +468,57 @@ def _srt_time(seconds: float) -> str:
     is_flag=True,
     help="Open the exported file in the default viewer",
 )
+@click.option(
+    "-i",
+    "--interactive",
+    "interactive_mode",
+    is_flag=True,
+    help="Interactive wizard to guide you through export",
+)
 def export(
-    transcription_id: int,
-    output_format: str,
+    transcription_id: int | None,
+    output_format: str | None,
     output_path: str | None,
     open_after: bool = False,
+    interactive_mode: bool = False,
 ) -> None:
     """Re-export a past transcription to a different format."""
     from audiobench.core.db_engine import init_db
     from audiobench.output.base import get_formatter
     from audiobench.storage.repository import TranscriptionRepository
     from audiobench.transcribe.transcription_result import Segment, Transcript
+
+    # ── Interactive wizard ──────────────────────────────────
+    if interactive_mode:
+        from audiobench.cli.wizard import prompt_transcription, prompt_menu, prompt_string, prompt_bool
+        
+        try:
+            transcription_id = prompt_transcription("Select a transcription to export")
+            output_format = prompt_menu(
+                "Select Output Format",
+                [
+                    ("PDF", "Professional Document", "pdf"),
+                    ("SRT", "Subtitles", "srt"),
+                    ("TXT", "Raw text", "txt"),
+                    ("VTT", "Web Video Text Tracks", "vtt"),
+                    ("JSON", "Raw JSON dump", "json"),
+                    ("All", "Export all formats", "all"),
+                ]
+            )
+            
+            output_path = prompt_string("Output path (leave empty for default)", default="")
+            if not output_path:
+                output_path = None
+                
+            open_after = prompt_bool("Open file after export?", default=True)
+            
+        except KeyboardInterrupt:
+            sys.exit(0)
+            
+    if not transcription_id or not output_format:
+        from audiobench.cli.display.theme import console, error_panel
+        console.print(error_panel("Usage: audiobench export [TRANSCRIPTION_ID] -f [FORMAT]\nOr use --interactive"))
+        sys.exit(1)
 
     init_db()
     repo = TranscriptionRepository()
@@ -472,6 +535,7 @@ def export(
             start=s["start"],
             end=s["end"],
             speaker=s.get("speaker"),
+            chapter_id=s.get("chapter_id"),
         )
         for s in data.get("segments", [])
     ]
@@ -483,12 +547,50 @@ def export(
         duration_seconds=data.get("duration", 0.0),
         engine=data.get("engine", "faster-whisper"),
         model_name=data.get("model", "unknown"),
+        chapters=data.get("chapters", []),
     )
 
-    formatter = get_formatter(output_format)
+    if output_format in ("pdf", "all"):
+        if not output_path:
+            from audiobench.core.settings import get_settings
+            settings = get_settings()
+            exports_dir = settings.data_dir / "exports"
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            # Generate a sensible default filename for PDF
+            base_name = Path(data.get("file_name", f"transcript_{transcription_id}")).stem
+            output_path = str(exports_dir / f"{base_name}.pdf")
+        
+        from audiobench.export.pdf import PDFExporter
+        exporter = PDFExporter()
+        
+        try:
+            exporter.export_transcript(data, output_path)
+            console.print(
+                f"  [{SUCCESS}]✓[/] Exported #{transcription_id} as "
+                f"PDF → [{ACCENT}]{output_path}[/]"
+            )
+            if open_after:
+                _open_file(output_path)
+        except Exception as e:
+            console.print(f"  [{WARNING}]PDF Export failed:[/] {e}")
+        
+        if output_format == "pdf":
+            return
+
+    # Handle text-based formats
+    formatter = get_formatter(output_format if output_format != "all" else "txt")
     content = formatter.format(transcript)
 
-    if output_path:
+    if not output_path and output_format != "pdf":
+        # Default to exports directory instead of stdout if not explicitly provided
+        from audiobench.core.settings import get_settings
+        settings = get_settings()
+        exports_dir = settings.data_dir / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        base_name = Path(data.get("file_name", f"transcript_{transcription_id}")).stem
+        output_path = str(exports_dir / f"{base_name}.{output_format}")
+
+    if output_path and output_format != "pdf":
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -498,7 +600,7 @@ def export(
         )
         if open_after:
             _open_file(output_path)
-    else:
+    elif output_format != "pdf":
         stdout.print(content, highlight=False)
 
 

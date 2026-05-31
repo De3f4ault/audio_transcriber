@@ -73,15 +73,37 @@ def try_capture_last_id(session: ReplSession) -> None:
 
 def print_context_summary(session: ReplSession) -> None:
     """Print a compact summary when context changes."""
-    rec = session.context_record
-    if not rec:
+    if not session.focus:
         return
-    duration = rec.get("duration", 0) or 0
-    dur_str = format_duration(duration)
-    console.print(
-        f"  [{SUCCESS}]✓[/] Context: "
-        f"[{ACCENT}]#{session.last_id}[/] — "
-        f"{rec.get('file_name', '?')} "
-        f"[{DIM}]({rec.get('word_count', 0):,} words, "
-        f"{dur_str})[/]"
-    )
+        
+    repo = session._get_repo()
+    
+    if session.focus.type == "file":
+        audio_file = repo.get_audio_file(session.focus.id)
+        if audio_file:
+            dur_str = format_duration(audio_file.get("duration_seconds", 0) or 0)
+            console.print(
+                f"  [{SUCCESS}]✓[/] Focused on: "
+                f"[{ACCENT}]{audio_file.get('file_name', '?')}[/] "
+                f"[{DIM}]({dur_str})[/]"
+            )
+            
+        # Mention transcript if there is one
+        tx_id = session.last_id
+        if tx_id:
+            rec = repo.get_by_id(tx_id)
+            if rec:
+                words = rec.get("word_count", 0) or 0
+                console.print(f"      [{DIM}]↳ Active transcript: #{tx_id} ({words:,} words)[/]")
+                
+    elif session.focus.type == "transcript":
+        rec = repo.get_by_id(session.focus.id)
+        if rec:
+            words = rec.get("word_count", 0) or 0
+            dur_str = format_duration(rec.get("duration", 0) or 0)
+            console.print(
+                f"  [{SUCCESS}]✓[/] Focused on transcript: "
+                f"[{ACCENT}]#{session.focus.id}[/] — "
+                f"{rec.get('file_name', '?')} "
+                f"[{DIM}]({words:,} words, {dur_str})[/]"
+            )

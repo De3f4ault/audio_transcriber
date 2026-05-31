@@ -96,15 +96,41 @@ def repl(transcript_id: int | None) -> None:
         # ── AI shorthand: ? what are the key points? ──
         if user_input.startswith("?"):
             question = user_input[1:].strip()
-            if question and session.last_id is not None:
-                dispatch_command(
-                    session,
-                    ["ask", str(session.last_id), question],
-                )
-            elif question:
-                console.print(f"  [{WARNING}]Set context first (.use <ID>) to use ? shorthand[/]")
-            else:
+            if not question:
                 console.print(f"  [{DIM}]Usage: ? what are the key points?[/]")
+                continue
+
+            tx_id = session.last_id
+            if tx_id is None:
+                # Offer to use the most recent transcript
+                try:
+                    repo = session._get_repo()
+                    records = repo.get_history(limit=1)
+                    if records:
+                        recent = records[0]
+                        recent_id = recent["id"]
+                        recent_name = recent.get("file_name", f"#{recent_id}")
+                        console.print(
+                            f"  [{WARNING}]No context set.[/] "
+                            f"Use most recent [{ACCENT}]#{recent_id}[/] ({recent_name})? "
+                            f"[{DIM}][y/N][/]"
+                        )
+                        confirm = input("  → ").strip().lower()
+                        if confirm in ("y", "yes"):
+                            session.set_context(recent_id)
+                            tx_id = session.last_id
+                        else:
+                            console.print(f"  [{DIM}]Set context with[/] [{ACCENT}]work <file>[/] [{DIM}]or[/] [{ACCENT}].use <ID>[/]")
+                            continue
+                    else:
+                        console.print(f"  [{DIM}]No transcriptions yet. Transcribe a file first.[/]")
+                        continue
+                except Exception:
+                    console.print(f"  [{WARNING}]Set context first ([/][{ACCENT}]work <file>[/][{WARNING}]) to use ? shorthand[/]")
+                    continue
+
+            if tx_id is not None:
+                dispatch_command(session, ["ask", str(tx_id), question])
             continue
 
         # Shell escape: !command
@@ -151,6 +177,30 @@ def repl(transcript_id: int | None) -> None:
         if not args:
             continue
 
+        # Check for background execution syntax '&'
+        if args[-1] == "&":
+            from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
+            if not SUPPORTS_BACKGROUND_JOBS:
+                console.print(f"  [{WARNING}]Background jobs are only supported on Linux/macOS.[/]")
+                continue
+
+            from audiobench.jobs.runner import submit_job
+            
+            args = args[:-1]
+            if not args:
+                continue
+            
+            # Auto-expand vars before submitting so context is resolved
+            args = session.expand_vars(args)
+            args = session.auto_inject_id(args)
+            
+            job_id = submit_job(args)
+            cmd_str = " ".join(args)
+            if len(cmd_str) > 40:
+                cmd_str = cmd_str[:37] + "..."
+            console.print(f"  [{ACCENT}][{job_id}][/] Job submitted — {cmd_str}")
+            continue
+
         # Strip 'audiobench' prefix if user types it out of habit
         cmd_name = args[0]
         if cmd_name == "audiobench" and len(args) > 1:
@@ -160,6 +210,26 @@ def repl(transcript_id: int | None) -> None:
         # Block nested REPL
         if cmd_name == "repl":
             console.print(f"  [{DIM}]Already in REPL. Type help for usage or /exit to quit.[/]")
+            continue
+
+        # File focus command
+        if cmd_name == "work":
+            if len(args) < 2:
+                console.print(f"  [{WARNING}]Usage: work <file_path>[/]")
+                continue
+            file_path = args[1]
+            from audiobench.storage.repository import TranscriptionRepository
+            from audiobench.core.focused_entity import FocusedEntity
+            from pathlib import Path
+            
+            repo = TranscriptionRepository()
+            file_id = repo.get_or_create_file(file_path)
+            
+            session.focus = FocusedEntity(
+                type="file",
+                id=file_id,
+                label=Path(file_path).name
+            )
             continue
 
         # Check if it's a known command

@@ -44,6 +44,7 @@ from audiobench.cli.display.theme import (
     help="Preview changes without writing to the database",
 )
 @click.option("-q", "--quiet", is_flag=True, help="Quiet mode (no progress output)")
+@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Interactive wizard")
 def clean(
     ids: tuple[int, ...],
     clean_all: bool,
@@ -51,6 +52,7 @@ def clean(
     model_override: str | None,
     dry_run: bool,
     quiet: bool,
+    interactive_mode: bool = False,
 ) -> None:
     """Clean transcript text using an LLM (fixes spelling, spacing, punctuation).
 
@@ -74,8 +76,19 @@ def clean(
     from audiobench.storage.repository import TranscriptionRepository
     from audiobench.transcribe.refiner import TranscriptRefiner
 
+    if interactive_mode:
+        from audiobench.cli.wizard import prompt_transcription, prompt_bool
+        try:
+            target_id = prompt_transcription("Select a transcription to clean")
+            ids = (target_id,)
+            clean_all = False
+            force = prompt_bool("Re-clean even if already refined?", default=False)
+            dry_run = prompt_bool("Preview changes only (dry-run)?", default=False)
+        except KeyboardInterrupt:
+            sys.exit(0)
+
     if not ids and not clean_all:
-        console.print(error_panel("No input", "Provide transcription ID(s) or use --all"))
+        console.print(error_panel("No input", "Provide transcription ID(s) or use --all\nOr use --interactive"))
         sys.exit(1)
 
     init_db()

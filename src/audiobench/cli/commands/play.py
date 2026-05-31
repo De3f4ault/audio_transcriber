@@ -670,6 +670,12 @@ def _play_with_subtitles(
     is_flag=True,
     help="List bookmarks for this file before playing",
 )
+@click.option(
+    "--chapter",
+    type=int,
+    default=None,
+    help="Start playback from a specific chapter",
+)
 def play(
     target: str,
     seek_to: str | None,
@@ -680,6 +686,7 @@ def play(
     resume: bool,
     from_bookmark: str | None,
     show_bookmarks: bool,
+    chapter: int | None,
 ) -> None:
     """Play an audio file or a transcript's source audio.
 
@@ -762,9 +769,25 @@ def play(
                 lyrics = False
                 watch = False
 
-    # ── Parse seek timestamp ──
+    # ── Parse seek timestamp or chapter ──
     start_seconds = 0.0
-    if seek_to:
+    if chapter is not None:
+        if record:
+            audio_id = record.get("audio_file_id")
+            if audio_id:
+                from audiobench.storage.chapter_repository import get_chapter_repo
+                chap = get_chapter_repo().get_chapter_by_index(audio_id, chapter)
+                if chap:
+                    start_seconds = chap.start_time
+                    if not quiet:
+                        console.print(f"  [{DIM}]Starting from Chapter {chapter}: {chap.title}[/]")
+                else:
+                    console.print(error_panel("Not found", f"Chapter {chapter} does not exist for this file."))
+                    sys.exit(1)
+        else:
+            console.print(error_panel("No Record", "Cannot use --chapter without a database record."))
+            sys.exit(1)
+    elif seek_to:
         parsed = _parse_timestamp(seek_to)
         if parsed is not None:
             start_seconds = parsed

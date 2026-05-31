@@ -7,9 +7,9 @@ import os
 from audiobench.api.routes import transcribe, settings, history, chat
 
 app = FastAPI(
-    title="AudioBench Web UI API",
-    version="0.2.0",
-    description="Backend API for AudioBench Web UI"
+    title="AudioBench API",
+    version="2.0.0",
+    description="Offline AI audio toolkit — REST API"
 )
 
 # Allow CORS for Vite frontend during development

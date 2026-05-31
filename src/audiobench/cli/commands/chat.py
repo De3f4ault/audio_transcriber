@@ -286,10 +286,12 @@ def _handle_slash_command(
 
 
 @click.command()
-@click.argument("transcript_id", type=int)
-@click.argument("question")
+@click.argument("transcript_id", type=int, required=False)
+@click.argument("question", required=False)
 @click.option("--model", default=None, help="Ollama model (default: from settings)")
-def ask(transcript_id: int, question: str, model: str | None) -> None:
+@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Interactive wizard")
+@click.option("--chapter", type=int, default=None, help="Ask about a specific chapter")
+def ask(transcript_id: int | None, question: str | None, model: str | None, interactive_mode: bool = False, chapter: int | None = None) -> None:
     """Ask a question about a transcript using AI.
 
     \b
@@ -306,6 +308,21 @@ def ask(transcript_id: int, question: str, model: str | None) -> None:
     settings = get_settings()
     model_name = model or settings.ollama_model
 
+    if interactive_mode:
+        from audiobench.cli.wizard import prompt_transcription, prompt_string
+        import sys
+        try:
+            if not transcript_id:
+                transcript_id = prompt_transcription("Select a transcript to query")
+            if not question:
+                question = prompt_string("What is your question?")
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+    if not transcript_id or not question:
+        console.print(error_panel("Usage: audiobench ask [ID] [QUESTION]\nOr use --interactive"))
+        sys.exit(1)
+
     # Fetch transcript
     init_db()
     repo = TranscriptionRepository()
@@ -313,6 +330,28 @@ def ask(transcript_id: int, question: str, model: str | None) -> None:
     if not record:
         console.print(error_panel("Not found", f"Transcript #{transcript_id} not found"))
         return
+        
+    if chapter is not None:
+        from audiobench.storage.chapter_repository import get_chapter_repo
+        from audiobench.storage.models import ChapterRecord
+        from audiobench.core.db_session import get_session
+        audio_file_id = record.get("audio_file_id")
+        if audio_file_id:
+            chap = get_chapter_repo().get_chapter_by_index(audio_file_id, chapter)
+            if chap and chap.id:
+                with get_session() as db:
+                    db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
+                    tx_id = db_chap.transcription_id if db_chap else None
+                if tx_id:
+                    chap_record = repo.get_by_id(tx_id)
+                    if chap_record:
+                        record = chap_record
+                    else:
+                        console.print(error_panel("Chapter Not Found", f"Chapter {chapter} transcript is missing."))
+                    return
+            else:
+                console.print(error_panel("Chapter Not Ready", f"Chapter {chapter} is missing or not transcribed."))
+                return
 
     console.print()
     console.print(f"  [{BOLD} {ACCENT}]{APP_NAME}[/] — AI Q&A")
@@ -403,6 +442,12 @@ def ask(transcript_id: int, question: str, model: str | None) -> None:
     default=True,
     help="Show/hide model chain-of-thought",
 )
+@click.option(
+    "--chapter",
+    type=int,
+    default=None,
+    help="Chat with a specific chapter",
+)
 def chat(
     transcript_ids: tuple[int, ...],
     model: str | None,
@@ -413,6 +458,7 @@ def chat(
     list_chats: bool,
     delete_id: int | None,
     think: bool,
+    chapter: int | None,
 ) -> None:
     """Interactive AI chat with transcript context.
 
@@ -518,6 +564,29 @@ def chat(
     for tid in transcript_ids:
         record = tx_repo.get_by_id(tid)
         if record:
+            if chapter is not None:
+                from audiobench.storage.chapter_repository import get_chapter_repo
+                from audiobench.storage.models import ChapterRecord
+                from audiobench.core.db_session import get_session
+                audio_file_id = record.get("audio_file_id")
+                if audio_file_id:
+                    chap = get_chapter_repo().get_chapter_by_index(audio_file_id, chapter)
+                    if chap and chap.id:
+                        with get_session() as db:
+                            db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
+                            tx_id = db_chap.transcription_id if db_chap else None
+                        if tx_id:
+                            chap_record = tx_repo.get_by_id(tx_id)
+                            if chap_record:
+                                chap_record["file_name"] = f"{record['file_name']} (Chapter {chapter}: {chap.title})"
+                                transcripts_to_load.append(chap_record)
+                                continue
+                            else:
+                                console.print(f"  [{DIM}]Chapter {chapter} transcript not found, skipping[/]")
+                                continue
+                    else:
+                        console.print(f"  [{DIM}]Chapter {chapter} not found or not transcribed, skipping[/]")
+                        continue
             transcripts_to_load.append(record)
         else:
             console.print(f"  [{DIM}]Transcript #{tid} not found, skipping[/]")

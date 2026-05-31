@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ file_name }} - Transcript</title>
+    <!-- Import Inter Font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        /* --- Page Setup --- */
+        @page {
+            size: A4;
+            margin: 1.5cm 1.5cm 1.5cm 1.5cm;
+            
+            @top-left {
+                content: element(runningHeader);
+                border-bottom: 1px solid #E2E8F0;
+            }
+            
+            @bottom-right {
+                content: "PAGE " counter(page) " OF " counter(pages);
+                font-family: 'Inter', system-ui, sans-serif;
+                font-size: 7.5pt;
+                font-weight: 600;
+                letter-spacing: 0.05em;
+                color: #94A3B8;
+            }
+            
+            @bottom-left {
+                content: "AUDIOBENCH INTELLIGENCE";
+                font-family: 'Inter', system-ui, sans-serif;
+                font-size: 7.5pt;
+                font-weight: 700;
+                letter-spacing: 0.05em;
+                color: #CBD5E1;
+            }
+        }
+
+        /* --- Running Elements --- */
+        header.pdf-header {
+            position: running(runningHeader);
+            width: 100%;
+            font-family: 'Inter', system-ui, sans-serif;
+            font-size: 8pt;
+            color: #64748B;
+            padding-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        header.pdf-header .doc-title {
+            float: left;
+            font-weight: 700;
+            color: #0F172A;
+        }
+
+        header.pdf-header .doc-meta {
+            float: right;
+            font-weight: 500;
+        }
+
+        /* --- Global Typography --- */
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            color: #2D2A26;
+            line-height: 1.65;
+            font-size: 10pt;
+            background-color: #F9F6EE; /* Old book canvas */
+        }
+
+        /* --- Cover Page --- */
+        .cover-page {
+            page-break-after: always;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            padding-top: 6cm;
+            position: relative;
+        }
+
+        .cover-accent {
+            position: absolute;
+            top: 2cm;
+            left: 0;
+            width: 40px;
+            height: 8px;
+            background-color: #4F46E5;
+            border-radius: 4px;
+        }
+
+        .cover-page h1 {
+            font-size: 32pt;
+            font-weight: 800;
+            color: #0F172A;
+            margin-top: 0;
+            margin-bottom: 12px;
+            letter-spacing: -0.03em;
+            line-height: 1.1;
+        }
+
+        .cover-page .subtitle {
+            font-size: 14pt;
+            font-weight: 500;
+            color: #64748B;
+            margin-bottom: 2.5cm;
+            letter-spacing: -0.01em;
+        }
+
+        .metadata-grid {
+            display: table;
+            width: 100%;
+            border-top: 1px solid #E2E8F0;
+            padding-top: 1.5cm;
+        }
+
+        .metadata-row {
+            display: table-row;
+        }
+
+        .metadata-label {
+            display: table-cell;
+            font-weight: 600;
+            color: #475569;
+            font-size: 9pt;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 8px 30px 8px 0;
+            width: 150px;
+        }
+
+        .metadata-value {
+            display: table-cell;
+            color: #0F172A;
+            font-size: 10.5pt;
+            font-weight: 500;
+            padding: 8px 0;
+        }
+
+        /* --- AI Summary Block --- */
+        .summary-section {
+            background-color: #F8FAFC;
+            border-left: 4px solid #4F46E5;
+            padding: 1.5cm;
+            border-radius: 0 12px 12px 0;
+            margin-bottom: 2cm;
+            page-break-inside: avoid;
+        }
+
+        .summary-section h2 {
+            color: #312E81;
+            margin-top: 0;
+            font-size: 12pt;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 15px;
+        }
+
+        .summary-section p {
+            font-size: 10.5pt;
+            color: #334155;
+            margin-bottom: 0;
+        }
+
+        /* --- Transcript Two-Column Flow --- */
+        .transcript-flow {
+            margin-top: 1cm;
+        }
+
+        .segment-block {
+            display: table;
+            width: 100%;
+            margin-bottom: 0.8cm;
+            page-break-inside: avoid;
+        }
+
+        .segment-meta {
+            display: table-cell;
+            width: 105px;
+            padding-right: 15px;
+            vertical-align: top;
+            padding-top: 2px;
+        }
+
+        .segment-content {
+            display: table-cell;
+            vertical-align: top;
+        }
+
+        .speaker-badge {
+            display: inline-block;
+            font-weight: 700;
+            font-size: 8.5pt;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #5C554B;
+            margin-bottom: 4px;
+        }
+
+        .timestamp {
+            display: block;
+            font-family: 'Inter', system-ui, sans-serif;
+            font-weight: 500;
+            font-size: 8pt;
+            color: #8C8273;
+        }
+
+        .segment-text {
+            font-size: 10.5pt;
+            color: #2D2A26;
+            margin: 0;
+            line-height: 1.6;
+        }
+
+    </style>
+</head>
+<body>
+
+    <!-- Running Header -->
+    <header class="pdf-header">
+        <span class="doc-title">{{ file_name }}</span>
+        <span class="doc-meta">{{ date_generated }}</span>
+    </header>
+
+    <!-- Cover Page -->
+    <div class="cover-page">
+        <div class="cover-accent"></div>
+        <h1>Audio Transcription Record</h1>
+        <div class="subtitle">{{ file_name }}</div>
+
+        <div class="metadata-grid">
+            {% if date_transcribed %}
+            <div class="metadata-row">
+                <div class="metadata-label">Generated On</div>
+                <div class="metadata-value">{{ date_transcribed }}</div>
+            </div>
+            {% endif %}
+            {% if word_count %}
+            <div class="metadata-row">
+                <div class="metadata-label">Word Count</div>
+                <div class="metadata-value">{{ word_count }}</div>
+            </div>
+            {% endif %}
+            {% if model %}
+            <div class="metadata-row">
+                <div class="metadata-label">Processing Engine</div>
+                <div class="metadata-value">{{ engine | default('whisper') | capitalize }} · {{ model }}</div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- AI Summary Block -->
+    {% if summary %}
+    <div class="summary-section">
+        <h2>AI Synthesis</h2>
+        <div>{{ summary | safe }}</div>
+    </div>
+    {% endif %}
+
+    <!-- Transcript Flow -->
+    <div class="transcript-flow">
+        {% set state = namespace(current_chapter=none) %}
+        {% for seg in segments %}
+        
+        {% if seg.chapter_id and seg.chapter_id != state.current_chapter %}
+            <h2 class="chapter-heading" style="margin-top: 1.5cm; margin-bottom: 0.5cm; color: #1E293B; font-size: 14pt; padding-bottom: 5px; border-bottom: 1px solid #E2E8F0;">
+                {{ chapter_map.get(seg.chapter_id, "Chapter " ~ seg.chapter_id) }}
+            </h2>
+            {% set state.current_chapter = seg.chapter_id %}
+        {% endif %}
+        
+        {% set speaker_label = seg.speaker_name | default(seg.speaker) | default('Audio', true) %}
+        <div class="segment-block">
+            <div class="segment-meta">
+                {% if speaker_label | lower != 'audio' %}
+                <span class="speaker-badge">{{ speaker_label }}</span>
+                {% endif %}
+                <span class="timestamp">{{ seg.start_formatted }} – {{ seg.end_formatted }}</span>
+            </div>
+            <div class="segment-content">
+                <p class="segment-text">{{ seg.text }}</p>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+</body>
+</html>

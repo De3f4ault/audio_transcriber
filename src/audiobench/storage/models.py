@@ -38,8 +38,13 @@ class AudioFileRecord(Base):
     channels: Mapped[int] = mapped_column(Integer, default=0)
     file_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+    tags: Mapped[str] = mapped_column(Text, default="[]")
 
     # Relationships
+    chapters: Mapped[list[ChapterRecord]] = relationship(
+        back_populates="audio_file", cascade="all, delete-orphan",
+        order_by="ChapterRecord.chapter_index"
+    )
     transcriptions: Mapped[list[TranscriptionRecord]] = relationship(
         back_populates="audio_file", cascade="all, delete-orphan"
     )
@@ -47,10 +52,75 @@ class AudioFileRecord(Base):
         back_populates="audio_file", cascade="all, delete-orphan"
     )
 
+    @property
+    def has_chapters(self) -> bool:
+        """True if the audio file has any chapters."""
+        return len(self.chapters) > 0
+
     def __repr__(self) -> str:
         return (
             f"<AudioFile(id={self.id}, name='{self.file_name}', "
             f"duration={self.duration_seconds:.1f}s)>"
+        )
+
+
+class ChapterRecord(Base):
+    """Persisted chapter metadata for an audio file."""
+
+    __tablename__ = "chapters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    audio_file_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("audio_files.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chapter_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(512), default="Untitled", nullable=False)
+    start_time: Mapped[float] = mapped_column(Float, nullable=False)
+    end_time: Mapped[float] = mapped_column(Float, nullable=False)
+    transcription_status: Mapped[str] = mapped_column(String(20), default="pending")
+    transcription_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transcriptions.id", ondelete="SET NULL"), nullable=True
+    )
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags: Mapped[str] = mapped_column(Text, default="[]")
+    is_ghost: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationships
+    audio_file: Mapped[AudioFileRecord] = relationship(back_populates="chapters")
+    transcription: Mapped[TranscriptionRecord | None] = relationship()
+    segments: Mapped[list[SegmentRecord]] = relationship(
+        back_populates="chapter", cascade="all, delete-orphan"
+    )
+    bookmarks: Mapped[list[BookmarkRecord]] = relationship(
+        back_populates="chapter", cascade="all, delete-orphan"
+    )
+    jobs: Mapped[list[JobRecord]] = relationship(
+        back_populates="chapter", cascade="all, delete-orphan"
+    )
+
+    @property
+    def is_real(self) -> bool:
+        """True if this is a real chapter, false if it's a ghost chapter (start == end)."""
+        return not bool(self.is_ghost)
+
+    @property
+    def duration_seconds(self) -> float:
+        return max(0.0, self.end_time - self.start_time)
+
+    @property
+    def tags_list(self) -> list[str]:
+        """Deserialise the JSON tags column to a Python list."""
+        import json as _json
+        try:
+            return _json.loads(self.tags) if self.tags else []
+        except Exception:
+            return []
+
+    def __repr__(self) -> str:
+        return (
+            f"<Chapter(id={self.id}, index={self.chapter_index}, title='{self.title[:30]}', "
+            f"status='{self.transcription_status}')>"
         )
 
 
@@ -75,6 +145,7 @@ class TranscriptionRecord(Base):
     word_count: Mapped[int] = mapped_column(Integer, default=0)
     segment_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="completed")
+    speaker_map: Mapped[str] = mapped_column(Text, default="{}")
     refined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC), index=True
@@ -107,9 +178,13 @@ class SegmentRecord(Base):
     start_time: Mapped[float] = mapped_column(Float, default=0.0)
     end_time: Mapped[float] = mapped_column(Float, default=0.0)
     speaker: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chapter_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("chapters.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     # Relationships
     transcription: Mapped[TranscriptionRecord] = relationship(back_populates="segments")
+    chapter: Mapped[ChapterRecord | None] = relationship(back_populates="segments")
 
     def __repr__(self) -> str:
         return f"<Segment(id={self.id}, idx={self.segment_index}, text='{self.text[:30]}...')>"
@@ -196,6 +271,9 @@ class BookmarkRecord(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     bookmark_type: Mapped[str] = mapped_column(String(16), default="bookmark")
     color: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    chapter_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC),
     )
@@ -203,6 +281,7 @@ class BookmarkRecord(Base):
     # Relationships
     audio_file: Mapped[AudioFileRecord] = relationship(back_populates="bookmarks")
     transcription: Mapped[TranscriptionRecord | None] = relationship()
+    chapter: Mapped[ChapterRecord | None] = relationship(back_populates="bookmarks")
 
     @property
     def is_region(self) -> bool:
@@ -215,3 +294,29 @@ class BookmarkRecord(Base):
             f"<Bookmark(id={self.id}, {kind}, "
             f"t={self.timestamp:.1f}, name='{self.name[:30]}')>"
         )
+
+
+class JobRecord(Base):
+    """Persisted background job state."""
+
+    __tablename__ = "jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="running")  # running, done, failed, cancelled
+    log_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    events_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    audio_file: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    chapter_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Relationships
+    chapter: Mapped[ChapterRecord | None] = relationship(back_populates="jobs")
+
+    def __repr__(self) -> str:
+        return f"<Job(id={self.id}, status='{self.status}', cmd='{self.command[:30]}')>"

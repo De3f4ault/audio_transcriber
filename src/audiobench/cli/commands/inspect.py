@@ -113,6 +113,47 @@ def inspect(
             for p in generated:
                 console.print(f"    [{ACCENT}]{p.name}[/] ({format_size(p.stat().st_size)})")
             console.print()
+            
+            # Print chapters if any
+            from audiobench.core.db_engine import init_db
+            from audiobench.storage.repository import AudioFileRecord
+            from audiobench.storage.chapter_repository import get_chapter_repo
+            from audiobench.storage.utils import get_file_hash
+            from audiobench.core.db_engine import get_session
+            from audiobench.cli.display.theme import make_table, format_duration
+
+            init_db()
+            fhash = get_file_hash(file_path)
+            with get_session() as session:
+                audio = session.query(AudioFileRecord).filter_by(file_hash=fhash).first()
+                if audio:
+                    chapters = get_chapter_repo().get_chapters(audio.id)
+                    if chapters:
+                        # Also query raw DB records for transcription_id (not on ChapterInfo)
+                        from audiobench.storage.models import ChapterRecord
+                        tx_ids = {
+                            r.chapter_index: r.transcription_id
+                            for r in session.query(ChapterRecord).filter_by(audio_file_id=audio.id).all()
+                        }
+                        table = make_table(
+                            f"Chapters for {file_path.name}",
+                            [
+                                ("#", {"style": DIM, "width": 4}),
+                                ("Title", {"style": ACCENT}),
+                                ("Duration", {"width": 10, "justify": "right"}),
+                                ("Status", {"width": 12}),
+                            ],
+                        )
+                        for ch in chapters:
+                            dur_str = format_duration(ch.duration_seconds)
+                            if ch.is_ghost:
+                                status = "[yellow]⚡ Skipped (0s)[/]"
+                            elif tx_ids.get(ch.index):
+                                status = f"[{SUCCESS}]Transcribed[/]"
+                            else:
+                                status = f"[{DIM}]Pending[/]"
+                            table.add_row(str(ch.index), ch.title, dur_str, status)
+                        console.print(table)
 
     except Exception as e:
         console.print(error_panel("Inspection failed", str(e)))

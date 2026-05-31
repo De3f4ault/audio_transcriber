@@ -38,11 +38,21 @@ def register_all(cli: click.Group) -> None:
         module = importlib.import_module(f"audiobench.cli.commands.{module_info.name}")
 
         # Find all Click commands/groups at module level
+        # First, find all groups to collect their subcommands
+        groups = [
+            getattr(module, name) for name in dir(module)
+            if not name.startswith("_") and isinstance(getattr(module, name), _click.Group)
+        ]
+        
+        subcommands = set()
+        for g in groups:
+            subcommands.update(g.commands.values())
+
         for attr_name in dir(module):
             if attr_name.startswith("_"):
                 continue
             attr = getattr(module, attr_name)
-            if isinstance(attr, _click.Command):
+            if isinstance(attr, _click.Command) and attr not in subcommands:
                 cli.add_command(attr)
 
     # ── REPL (lives in cli/repl/, not cli/commands/) ──

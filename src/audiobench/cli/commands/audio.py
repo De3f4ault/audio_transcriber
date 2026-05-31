@@ -180,9 +180,9 @@ def analyze(
 
 
 @click.command()
-@click.argument("input_file", type=click.Path(exists=True))
+@click.argument("input_file", type=click.Path(exists=True), required=False)
 @click.option(
-    "-o", "--output", "output_path", required=True, help="Output path (format from extension)"
+    "-o", "--output", "output_path", required=False, help="Output path (format from extension)"
 )
 @click.option("--bitrate", default=None, help="Override bitrate (e.g., 128k, 320k)")
 @click.option("--sample-rate", default=None, type=int, help="Target sample rate in Hz")
@@ -194,14 +194,16 @@ def analyze(
     help="Playback speed multiplier (e.g., 1.5 for 50%% faster)",
 )
 @click.option("-q", "--quiet", is_flag=True, help="Quiet mode")
+@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Interactive wizard")
 def convert(
-    input_file: str,
-    output_path: str,
+    input_file: str | None,
+    output_path: str | None,
     bitrate: str | None,
     sample_rate: int | None,
     channels: int | None,
     speed: float | None,
     quiet: bool,
+    interactive_mode: bool = False,
 ) -> None:
     """Convert audio between formats with optional processing.
 
@@ -217,6 +219,20 @@ def convert(
     import time
 
     from audiobench.transcribe.audio_converter import convert_audio, probe
+
+    if interactive_mode:
+        from audiobench.cli.wizard import prompt_file, prompt_string
+        try:
+            if not input_file:
+                input_file = prompt_file("Select input file to convert")
+            if not output_path:
+                output_path = prompt_string("Output path (e.g., output.mp3)")
+        except KeyboardInterrupt:
+            sys.exit(0)
+            
+    if not input_file or not output_path:
+        console.print(error_panel("Usage: audiobench convert [INPUT] -o [OUTPUT]\nOr use --interactive"))
+        sys.exit(1)
 
     input_p = Path(input_file).resolve()
     output_p = Path(output_path).resolve()
@@ -266,13 +282,15 @@ def convert(
 
 
 @click.command()
-@click.argument("files", nargs=-1, type=click.Path(exists=True), required=True)
-@click.option("-o", "--output", "output_path", required=True, help="Output file path")
+@click.argument("files", nargs=-1, type=click.Path(exists=True), required=False)
+@click.option("-o", "--output", "output_path", required=False, help="Output file path")
 @click.option("-q", "--quiet", is_flag=True, help="Quiet mode")
+@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Interactive wizard")
 def merge(
     files: tuple[str, ...],
-    output_path: str,
+    output_path: str | None,
     quiet: bool,
+    interactive_mode: bool = False,
 ) -> None:
     """Concatenate multiple audio files into one.
 
@@ -285,8 +303,27 @@ def merge(
 
     from audiobench.transcribe.audio_converter import concat_audio
 
-    if len(files) < 2:
-        console.print(error_panel("Need at least 2 files to merge"))
+    if interactive_mode:
+        from audiobench.cli.wizard import prompt_file, prompt_string
+        file_list = list(files)
+        try:
+            if not file_list:
+                console.print(f"\n  [{BOLD} {ACCENT}]Select files to merge (Ctrl+C to finish selection)[/]")
+                while True:
+                    try:
+                        f = prompt_file(f"File {len(file_list) + 1}")
+                        if f: file_list.append(f)
+                    except KeyboardInterrupt:
+                        if not file_list: sys.exit(0)
+                        break
+            files = tuple(file_list)
+            if not output_path:
+                output_path = prompt_string("Output path (e.g., combined.mp3)")
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+    if len(files) < 2 or not output_path:
+        console.print(error_panel("Usage: audiobench merge [FILE1] [FILE2]... -o [OUTPUT]\nOr use --interactive"))
         sys.exit(1)
 
     if not quiet:

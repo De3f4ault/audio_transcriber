@@ -169,7 +169,7 @@ class TestOutputResolver:
         from audiobench.cli.io.output_resolver import parse_formats
 
         result = parse_formats("all")
-        assert set(result) == {"txt", "srt", "vtt", "json"}
+        assert set(result) == {"txt", "srt", "vtt", "json", "pdf"}
 
     def test_parse_formats_none(self):
         from audiobench.cli.io.output_resolver import parse_formats

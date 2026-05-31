@@ -68,7 +68,8 @@ class SrtFormatter(OutputFormatter):
                 lines.append(str(cue_index))
                 lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
                 if speaker:
-                    text = f"[{speaker}] {text}"
+                    display_speaker = transcript.speaker_map.get(speaker, speaker)
+                    text = f"[{display_speaker}] {text}"
                 lines.append(text)
                 lines.append("")
                 cue_index += 1

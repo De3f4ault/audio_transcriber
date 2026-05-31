@@ -92,6 +92,7 @@ class Segment(BaseModel):
     speaker: str | None = Field(default=None, description="Speaker label from diarization")
     avg_logprob: float = Field(default=0.0, description="Average log probability")
     no_speech_prob: float = Field(default=0.0, description="Probability of no speech")
+    chapter_id: int | None = Field(default=None, description="Associated chapter ID if any")
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -149,7 +150,9 @@ class Transcript(BaseModel):
     duration_seconds: float = Field(default=0.0, ge=0.0, description="Total audio duration")
     engine: str = Field(default="whisper", description="Engine used for transcription")
     model_name: str = Field(default="medium", description="Model used")
+    speaker_map: dict[str, str] = Field(default_factory=dict, description="Map generic speakers to real names")
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    chapters: list[dict] = Field(default_factory=list, description="Associated chapters metadata")
 
     @computed_field  # type: ignore[prop-decorator]
     @property

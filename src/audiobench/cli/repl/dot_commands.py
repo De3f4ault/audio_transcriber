@@ -51,11 +51,23 @@ DOT_COMMANDS = {
     ".use": "Switch context: .use 42",
     ".clear": "Clear context (return to bare prompt)",
     ".next": "Jump to next transcript in history",
-    ".prev": "Jump to previous transcript in history",
-    ".recent": "Show 5 most recent transcriptions",
     ".search": 'Search all transcripts: .search "keyword"',
+    ".diarize": "Interactive speaker diarization wizard",
+    ".clean": "Interactive transcript cleaner",
+    ".config": "Interactive configuration wizard",
+    ".bookmark": "Interactive bookmark manager",
+    ".chapters": "List all chapters for the focused audio file",
+    ".fc": "Focus on a specific chapter: .fc 1",
+    ".ufc": "Clear chapter focus",
     ".help": "Show this dot-command list",
 }
+
+from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
+if SUPPORTS_BACKGROUND_JOBS:
+    DOT_COMMANDS.update({
+        ".jobs": "List background jobs: .jobs",
+        ".watch": "Tail a background job log: .watch <id>",
+    })
 
 
 # ── Typo Correction ─────────────────────────────────────────
@@ -93,13 +105,35 @@ def handle_dot_command(cmd: str, session: ReplSession) -> None:
             console.print(f"  [{DIM}]Usage: .use <transcript_id>[/]")
             return
         session.set_context(int(arg))
-        if session.context_record:
+        if session.focus:
             print_context_summary(session)
         return
 
     if command == ".clear":
-        session.clear_context()
-        console.print(f"  [{SUCCESS}]✓[/] Context cleared")
+        session.focus = None
+        session._history_cursor = -1
+        console.print(f"  [{DIM}]Context cleared.[/]")
+        return
+
+    if command == ".chapters":
+        _dot_chapters(session)
+        return
+        
+    if command in (".fc", ".focus-chapter"):
+        _dot_focus_chapter(session, arg)
+        return
+        
+    if command in (".ufc", ".unfocus-chapter"):
+        session.clear_chapter_focus()
+        console.print(f"  [{DIM}]Chapter focus cleared.[/]")
+        return
+
+    if command == ".config":
+        dispatch_command(session, ["config", "--interactive"])
+        return
+
+    if command == ".bookmark":
+        dispatch_command(session, ["bookmark", "--interactive"])
         return
 
     if command == ".next":
@@ -121,6 +155,20 @@ def handle_dot_command(cmd: str, session: ReplSession) -> None:
         dispatch_command(session, ["search", arg])
         return
 
+    if command in (".jobs", ".watch"):
+        if not SUPPORTS_BACKGROUND_JOBS:
+            console.print(f"  [{WARNING}]Background jobs are only supported on Linux/macOS.[/]")
+            return
+            
+        if command == ".jobs":
+            _dot_jobs()
+        else:
+            if not arg or not arg.isdigit():
+                console.print(f"  [{DIM}]Usage: .watch <job_id>[/]")
+                return
+            _dot_watch(int(arg))
+        return
+
     if command in (".help", ".commands", ".?"):
         print_dot_help()
         return
@@ -132,16 +180,46 @@ def handle_dot_command(cmd: str, session: ReplSession) -> None:
 
     # ── Context-required dot-commands ──
 
-    if session.last_id is None or session.context_record is None:
+    if not session.focus:
         console.print(
-            f"\n  [{WARNING}]No active context.[/] Set one first:\n"
-            f"    [{ACCENT}].use <ID>[/]            Switch to a transcript\n"
-            f"    [{ACCENT}].recent[/]              See recent transcriptions\n"
-            f"    [{ACCENT}]transcribe file.mp3[/]  Transcribe and auto-set\n"
+            f"\n  [{WARNING}]No active focus.[/] Work on a file or transcript first:\n"
+            f"    [{ACCENT}]work file.mp3[/]          Focus on an audio file\n"
+            f"    [{ACCENT}].use <ID>[/]              Switch to a transcript\n"
+            f"    [{ACCENT}].recent[/]                See recent transcriptions\n"
         )
         return
 
-    rec = session.context_record
+    # Commands that only need a File focus
+    if command == ".info":
+        _dot_info(session)
+        return
+    elif command == ".play":
+        _dot_play(session, arg)
+        return
+    elif command == ".path":
+        _dot_path(session)
+        return
+    elif command == ".open":
+        _dot_open(session)
+        return
+    elif command == ".chapters":
+        _dot_chapters(session)
+        return
+    elif command in (".fc", ".focus-chapter"):
+        _dot_focus_chapter(session, arg)
+        return
+    elif command in (".ufc", ".unfocus-chapter"):
+        _dot_unfocus_chapter(session)
+        return
+
+    # Commands that strictly require a Transcript
+    tx_id = session.last_id
+    if not tx_id:
+        console.print(f"  [{WARNING}]No transcript available for this file yet.[/] Run `transcribe` to create one.")
+        return
+
+    repo = session._get_repo()
+    rec = repo.get_by_id(tx_id)
 
     if command == ".stats":
         _dot_stats(rec)
@@ -149,33 +227,37 @@ def handle_dot_command(cmd: str, session: ReplSession) -> None:
         _dot_show(rec)
     elif command == ".segments":
         _dot_segments(rec)
-    elif command == ".info":
-        _dot_info(rec)
+    elif command == ".edit":
+        _dot_edit(session, rec)
     elif command == ".find":
         _dot_find(rec, arg)
     elif command == ".vocab":
         extra = arg.split() if arg else []
-        dispatch_command(session, ["vocab", str(session.last_id)] + extra)
+        dispatch_command(session, ["vocab", str(tx_id)] + extra)
     elif command == ".export":
-        fmt = arg if arg else "srt"
-        dispatch_command(session, ["export", str(session.last_id), "-f", fmt])
+        if not arg:
+            dispatch_command(session, ["export", str(tx_id), "--interactive"])
+            return
+        dispatch_command(session, ["export", str(tx_id), "-f", arg])
     elif command == ".ask":
         if not arg:
-            console.print(f'  [{DIM}]Usage: .ask "question"[/]')
+            dispatch_command(session, ["ask", str(tx_id), "--interactive"])
             return
-        dispatch_command(session, ["ask", str(session.last_id), arg])
+        dispatch_command(session, ["ask", str(tx_id), arg])
     elif command == ".chat":
-        dispatch_command(session, ["chat", str(session.last_id)])
+        if not arg:
+            dispatch_command(session, ["chat", str(tx_id), "--interactive"])
+            return
+        dispatch_command(session, ["chat", str(tx_id)])
     elif command == ".summarize":
-        dispatch_command(session, ["summarize", str(session.last_id)])
-    elif command == ".play":
-        _dot_play(session, arg)
-    elif command == ".edit":
-        _dot_edit(session)
-    elif command == ".path":
-        _dot_path(rec)
-    elif command == ".open":
-        _dot_open(rec)
+        if not arg:
+            dispatch_command(session, ["summarize", str(tx_id), "--interactive"])
+            return
+        dispatch_command(session, ["summarize", str(tx_id)])
+    elif command == ".clean":
+        dispatch_command(session, ["clean", str(tx_id), "--interactive"])
+    elif command == ".diarize":
+        _dot_diarize(session, rec)
     else:
         suggestion = _suggest_dot_command(command)
         if suggestion:
@@ -253,33 +335,54 @@ def _dot_segments(rec: dict) -> None:
     console.print(table)
 
 
-def _dot_info(rec: dict) -> None:
-    table = make_table(
-        f"Metadata — #{rec['id']}",
-        [("Field", {"style": BOLD}), ("Value", {})],
-    )
-    for key in [
-        "id",
-        "file_name",
-        "file_path",
-        "source",
-        "language",
-        "language_probability",
-        "engine",
-        "model",
-        "duration",
-        "word_count",
-        "segment_count",
-        "status",
-        "created_at",
-    ]:
-        val = rec.get(key, "—")
-        if val is None:
-            val = "—"
-        if key == "duration" and val:
-            val = format_duration(val)
-        table.add_row(key, str(val))
-    console.print(table)
+def _dot_info(session: ReplSession) -> None:
+    if not session.focus:
+        return
+        
+    repo = session._get_repo()
+    
+    # Always show File Metadata first if we have a file focus
+    if session.focus.type == "file":
+        audio_file = repo.get_audio_file(session.focus.id)
+        if audio_file:
+            table = make_table(
+                f"File — {audio_file['file_name']}",
+                [("Field", {"style": BOLD}), ("Value", {})],
+            )
+            for key in [
+                "id", "file_path", "format", "duration_seconds", 
+                "file_size_bytes", "transcript_count", "created_at"
+            ]:
+                val = audio_file.get(key, "—")
+                if key == "duration_seconds" and val:
+                    val = format_duration(val)
+                elif key == "file_size_bytes" and val:
+                    val = f"{val / (1024*1024):.1f} MB"
+                table.add_row(key, str(val))
+            console.print(table)
+            
+    # Then show Transcript Metadata if one exists
+    tx_id = session.last_id
+    if tx_id:
+        rec = repo.get_by_id(tx_id)
+        if rec:
+            if session.focus.type == "file":
+                console.print()
+                
+            tx_table = make_table(
+                f"Transcript — #{rec['id']}",
+                [("Field", {"style": BOLD}), ("Value", {})],
+            )
+            for key in [
+                "id", "source", "language", "language_probability",
+                "engine", "model", "duration", "word_count",
+                "segment_count", "status", "created_at"
+            ]:
+                val = rec.get(key, "—")
+                if key == "duration" and val:
+                    val = format_duration(val)
+                tx_table.add_row(key, str(val))
+            console.print(tx_table)
 
 
 def _dot_find(rec: dict, query: str) -> None:
@@ -330,8 +433,22 @@ def _dot_find(rec: dict, query: str) -> None:
 
 def _dot_play(session: ReplSession, arg: str) -> None:
     """Play the source audio file using ffplay."""
-    rec = session.context_record
-    file_path = rec.get("file_path")
+    if not session.focus:
+        return
+        
+    repo = session._get_repo()
+    audio_file = None
+    rec = None
+    
+    if session.focus.type == "file":
+        audio_file = repo.get_audio_file(session.focus.id)
+    if session.last_id:
+        rec = repo.get_by_id(session.last_id)
+        if rec and rec.get("audio_file_id"):
+            audio_file = repo.get_audio_file(rec["audio_file_id"])
+            
+    file_path = audio_file.get("file_path") if audio_file else None
+    
     if not file_path or not Path(file_path).exists():
         console.print(
             f"  [{WARNING}]Source audio file not found[/]\n"
@@ -345,6 +462,9 @@ def _dot_play(session: ReplSession, arg: str) -> None:
         # Handle "segment N" syntax
         seg_match = re.match(r"segment\s+(\d+)", arg, re.IGNORECASE)
         if seg_match:
+            if not rec:
+                console.print(f"  [{WARNING}]No transcript available to play a segment.[/]")
+                return
             seg_idx = int(seg_match.group(1))
             segments = rec.get("segments", [])
             matched = [s for s in segments if s.get("index") == seg_idx]
@@ -390,8 +510,9 @@ def _dot_play(session: ReplSession, arg: str) -> None:
             if duration > 0:
                 cmd.extend(["-t", str(duration)])
 
+    file_name = audio_file.get("file_name", "?") if audio_file else "?"
     console.print(
-        f"  [{ACCENT}]▶[/] Playing: {rec.get('file_name', '?')}"
+        f"  [{ACCENT}]▶[/] Playing: {file_name}"
         + (
             f" from {int(start_seconds // 60):02d}:{int(start_seconds % 60):02d}"
             if start_seconds > 0
@@ -408,9 +529,8 @@ def _dot_play(session: ReplSession, arg: str) -> None:
         console.print(f"  [{DIM}]Playback stopped[/]")
 
 
-def _dot_edit(session: ReplSession) -> None:
+def _dot_edit(session: ReplSession, rec: dict) -> None:
     """Open transcript text in $EDITOR, save changes back to DB."""
-    rec = session.context_record
     full_text = rec.get("full_text", "")
 
     editor = os.environ.get("EDITOR", "nano")
@@ -464,22 +584,60 @@ def _dot_edit(session: ReplSession) -> None:
             os.unlink(tmp_path)
 
 
-def _dot_path(rec: dict) -> None:
+def _dot_path(session: ReplSession) -> None:
     """Show the source audio file path."""
-    file_path = rec.get("file_path")
+    if not session.focus:
+        return
+        
+    repo = session._get_repo()
+    audio_file = None
+    
+    if session.focus.type == "file":
+        audio_file = repo.get_audio_file(session.focus.id)
+    elif session.last_id:
+        rec = repo.get_by_id(session.last_id)
+        if rec and rec.get("audio_file_id"):
+            audio_file = repo.get_audio_file(rec["audio_file_id"])
+            
+    file_path = audio_file.get("file_path") if audio_file else None
+
     if file_path:
         exists = Path(file_path).exists()
         status = f"[{SUCCESS}]exists[/]" if exists else f"[{WARNING}]not found[/]"
         console.print(f"  [{ACCENT}]{file_path}[/]  ({status})")
     else:
-        console.print(f"  [{DIM}]No source file path (live session?)[/]")
+        console.print(f"  [{DIM}]No source file path available[/]")
 
 
-def _dot_open(rec: dict) -> None:
+def _dot_unfocus_chapter(session: ReplSession) -> None:
+    if not session.focus or session.focus.type != "file":
+        console.print(f"  [{WARNING}]Must focus on a file first.[/]")
+        return
+        
+    session.clear_chapter_focus()
+    console.print(f"  [{SUCCESS}]Cleared chapter focus. Now focusing on entire file: {session.focus.label}[/]")
+
+
+# _dot_focus_chapter and _dot_chapters defined below (lines ~755+)
+def _dot_open(session: ReplSession) -> None:
     """Open the source audio file in the default system player."""
-    file_path = rec.get("file_path")
+    if not session.focus:
+        return
+        
+    repo = session._get_repo()
+    audio_file = None
+    
+    if session.focus.type == "file":
+        audio_file = repo.get_audio_file(session.focus.id)
+    elif session.last_id:
+        rec = repo.get_by_id(session.last_id)
+        if rec and rec.get("audio_file_id"):
+            audio_file = repo.get_audio_file(rec["audio_file_id"])
+            
+    file_path = audio_file.get("file_path") if audio_file else None
+
     if not file_path or not Path(file_path).exists():
-        console.print(f"  [{WARNING}]Source audio not found: {file_path or 'unknown'}[/]")
+        console.print(f"  [{WARNING}]Source file not found.[/]")
         return
 
     console.print(f"  [{ACCENT}]Opening:[/] {file_path}")
@@ -496,7 +654,71 @@ def _dot_open(rec: dict) -> None:
                 stderr=subprocess.DEVNULL,
             )
     except Exception as e:
-        console.print(f"  [{WARNING}]{e}[/]")
+        console.print(f"  [{WARNING}]Failed to open file: {e}[/]")
+
+
+def _dot_chapters(session: ReplSession) -> None:
+    """List all chapters for the currently focused audio file."""
+    if not session.focus or session.focus.type != "file":
+        console.print(f"  [{WARNING}]You must focus on an audio file first using 'use <file_name>'.[/]")
+        return
+
+    from audiobench.storage.chapter_repository import get_chapter_repo
+    chapters = get_chapter_repo().get_chapters(session.focus.id)
+
+    if not chapters:
+        console.print(f"  [{DIM}]No chapters found for this audio file.[/]")
+        return
+
+    table = make_table(
+        f"Chapters for {session.focus.label}",
+        [
+            ("Index", {"style": BOLD, "justify": "right"}),
+            ("Title", {}),
+            ("Duration", {"justify": "right"}),
+            ("Status", {}),
+            ("Tags", {"style": DIM}),
+        ],
+    )
+
+    for chap in chapters:
+        status_icon = "⚡ Skipped" if chap.is_ghost else "completed"  # ChapterInfo has no status field; ghost is the flag
+        tags = ", ".join(chap.to_dict().get("tags_list", [])) if hasattr(chap, "to_dict") else ""
+        table.add_row(
+            str(chap.index),
+            chap.title,
+            format_duration(chap.duration_seconds),
+            status_icon,
+            tags,
+        )
+
+    console.print(table)
+
+
+def _dot_focus_chapter(session: ReplSession, arg: str) -> None:
+    """Focus on a specific chapter."""
+    if not session.focus or session.focus.type != "file":
+        console.print(f"  [{WARNING}]You must focus on an audio file first.[/]")
+        return
+
+    if not arg.isdigit():
+        console.print(f"  [{WARNING}]Usage: .fc <index>[/]")
+        return
+
+    index = int(arg)
+    from audiobench.storage.chapter_repository import get_chapter_repo
+    chapter = get_chapter_repo().get_chapter_by_index(session.focus.id, index)
+
+    if not chapter:
+        console.print(f"  [{WARNING}]Chapter {index} not found.[/]")
+        return
+
+    if chapter.is_ghost:
+        console.print(f"  [{WARNING}]Cannot focus on skipped ghost chapter {index}.[/]")
+        return
+
+    session.focus_chapter(index, chapter.title)
+    console.print(f"  [{SUCCESS}]Focused on Chapter {index}: {chapter.title}[/]")
 
 
 def _navigate_context(session: ReplSession, direction: int) -> None:
@@ -544,7 +766,7 @@ def print_dot_help() -> None:
         ],
         "Audio": [".play", ".open", ".path"],
         "AI": [".ask", ".chat", ".summarize"],
-        "Actions": [".export", ".edit"],
+        "Actions": [".export", ".edit", ".diarize"],
         "Navigation": [
             ".use",
             ".clear",
@@ -555,6 +777,9 @@ def print_dot_help() -> None:
         "Search": [".search"],
         "Meta": [".help"],
     }
+    
+    if SUPPORTS_BACKGROUND_JOBS:
+        groups["Background Jobs"] = [".jobs", ".watch"]
 
     console.print(f"\n  [{BOLD}][{ACCENT}]Dot Commands[/][/]")
     console.print(f"  [{DIM}]Operate on the current context transcript[/]\n")
@@ -564,3 +789,180 @@ def print_dot_help() -> None:
             desc = DOT_COMMANDS.get(cmd_name, "")
             console.print(f"    [{ACCENT}]{cmd_name:<14}[/] {desc}")
         console.print()
+
+
+def _dot_jobs() -> None:
+    """Show background jobs table inline inside the REPL."""
+    try:
+        from audiobench.jobs.repository import JobRepository
+        from audiobench.jobs.runner import get_job_phase, startup_recovery
+    except ImportError:
+        console.print(f"  [{WARNING}]Jobs module not available[/]")
+        return
+
+    startup_recovery()
+    repo = JobRepository()
+    all_jobs = repo.get_all_jobs(limit=15)
+
+    if not all_jobs:
+        console.print(f"  [{DIM}]No background jobs[/]")
+        return
+
+    table = make_table(
+        "Background Jobs",
+        [
+            ("ID",      {"width": 4, "justify": "right"}),
+            ("Status",  {"width": 10}),
+            ("Command", {}),
+            ("Phase",   {"width": 18}),
+            ("Started", {"style": DIM}),
+        ],
+    )
+
+    STATUS_COLOR = {
+        "running":   ACCENT,
+        "done":      SUCCESS,
+        "failed":    WARNING,
+        "cancelled": WARNING,
+    }
+
+    for job in all_jobs:
+        job_id = job["id"]
+        status = job.get("status", "unknown")
+        color  = STATUS_COLOR.get(status, DIM)
+        cmd    = (job.get("command") or "").removeprefix("audiobench ")
+        if len(cmd) > 38:
+            cmd = cmd[:35] + "..."
+        started = str(job.get("started_at", ""))[:16]
+        phase   = get_job_phase(job_id) if status == "running" else ""
+
+        table.add_row(
+            f"#{job_id}",
+            f"[{color}]{status}[/]",
+            cmd,
+            phase,
+            started,
+        )
+
+    console.print(table)
+    console.print(
+        f"  [{DIM}]Tip: .watch <id> to tail logs  ·  jobs cancel <id> to stop[/]"
+    )
+
+
+def _dot_diarize(session: ReplSession, rec: dict) -> None:
+    """Interactive wizard to run/re-run speaker diarization on the current transcript."""
+    from audiobench.cli.wizard import prompt_bool, prompt_menu, prompt_string
+
+    file_name = rec.get("file_name", "?")
+    tx_id = rec["id"]
+
+    console.print(
+        f"\n  [{BOLD}][{ACCENT}]Speaker Diarization Wizard[/][/]\n"
+        f"  [{DIM}]Transcript #{tx_id} — {file_name}[/]\n"
+    )
+
+    # Check if already diarized
+    segments = rec.get("segments", [])
+    already_diarized = any(seg.get("speaker") for seg in segments)
+    if already_diarized:
+        console.print(f"  [{WARNING}]This transcript already has speaker labels.[/]")
+        try:
+            rerun = prompt_bool("Re-run diarization anyway?", default=False)
+        except KeyboardInterrupt:
+            console.print()
+            return
+        if not rerun:
+            return
+
+    # Step 1: Diarization model
+    try:
+        diarize_model = prompt_menu(
+            "Diarization model",
+            [
+                ("3.1 (legacy)", "slower, broader support", "speaker-diarization-3.1"),
+                ("3.0 (stable)", "stable general-purpose",  "speaker-diarization-3.0"),
+                ("segmentation-3.0", "fast, segment-only",  "segmentation-3.0"),
+            ],
+            default_idx=0,
+        )
+
+        # Step 2: GPU acceleration
+        use_gpu = prompt_bool("Use GPU acceleration (CUDA)?", default=False)
+
+        # Step 3: Speaker count
+        know_speakers = prompt_bool("Do you know the exact number of speakers?", default=False)
+        num_speakers: int | None = None
+        if know_speakers:
+            raw = prompt_string(
+                "Number of speakers",
+                default="2",
+                validator=lambda s: s.isdigit() and int(s) > 0,
+                validation_msg="Please enter a positive integer.",
+            )
+            num_speakers = int(raw)
+
+        # Step 4: Name mapping
+        map_speakers: str | None = None
+        if num_speakers:
+            want_names = prompt_bool("Map speakers to real names?", default=False)
+            if want_names:
+                console.print(f"  [{DIM}]Format: Speaker 1=Alice, Speaker 2=Bob[/]")
+                mapping = prompt_string("Speaker names", default="")
+                if mapping.strip():
+                    map_speakers = mapping.strip()
+
+    except KeyboardInterrupt:
+        console.print()
+        return
+
+    # Build and show the command
+    repo = session._get_repo()
+    audio_file = None
+    if rec.get("audio_file_id"):
+        audio_file = repo.get_audio_file(rec["audio_file_id"])
+
+    if not audio_file:
+        console.print(f"  [{WARNING}]Cannot find source audio file for transcript #{tx_id}.[/]")
+        return
+
+    file_path = audio_file.get("file_path", "")
+    if not file_path:
+        console.print(f"  [{WARNING}]Source file path is missing.[/]")
+        return
+
+    # Assemble CLI args
+    cmd = ["transcribe", file_path, "--diarize", "--no-cache"]
+    if use_gpu:
+        cmd.append("--gpu")
+    if num_speakers:
+        cmd += ["--speakers", str(num_speakers)]
+    if map_speakers:
+        cmd += ["--map-speakers", map_speakers]
+
+    # Pre-run summary
+    console.print(f"\n  [{BOLD}]Ready to run:[/]")
+    console.print(f"    [{DIM}]Model:[/]    {diarize_model}")
+    console.print(f"    [{DIM}]GPU:[/]      {'yes' if use_gpu else 'no'}")
+    if num_speakers:
+        console.print(f"    [{DIM}]Speakers:[/] {num_speakers}")
+    if map_speakers:
+        console.print(f"    [{DIM}]Names:[/]    {map_speakers}")
+    console.print()
+
+    try:
+        confirm = prompt_bool("Start diarization?", default=True)
+    except KeyboardInterrupt:
+        console.print()
+        return
+
+    if confirm:
+        dispatch_command(session, cmd)
+    else:
+        console.print(f"  [{DIM}]Cancelled.[/]")
+
+
+def _dot_watch(job_id: int) -> None:
+    """Tail a background job's log from inside the REPL."""
+    from audiobench.jobs.runner import watch_job
+    watch_job(job_id)

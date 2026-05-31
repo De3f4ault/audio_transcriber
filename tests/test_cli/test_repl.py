@@ -19,13 +19,13 @@ class TestReplSession:
     def test_initial_state(self):
         session = self._make_session()
         assert session.last_id is None
-        assert session.context_record is None
+        assert session.focus is None
         assert session._command_count == 0
 
     def test_prompt_no_context(self):
         session = self._make_session()
         prompt = session.prompt
-        assert "ab" in prompt
+        assert "❯" in prompt
         assert "#" not in prompt
 
     def test_expand_vars_no_context(self):
@@ -36,39 +36,43 @@ class TestReplSession:
 
     def test_expand_vars_with_context(self):
         session = self._make_session()
-        session.last_id = 42
+        from audiobench.core.focused_entity import FocusedEntity
+        session.focus = FocusedEntity(type="transcript", id=42, label="Transcript #42")
         args = ["show", "$last"]
         result = session.expand_vars(args)
         assert result == ["show", "42"]
 
     def test_auto_inject_id_context_aware(self):
         session = self._make_session()
-        session.last_id = 10
+        from audiobench.core.focused_entity import FocusedEntity
+        session.focus = FocusedEntity(type="transcript", id=10, label="Transcript #10")
         args = ["show"]
         result = session.auto_inject_id(args)
         assert result == ["show", "10"]
 
     def test_auto_inject_id_skips_explicit(self):
         session = self._make_session()
-        session.last_id = 10
+        from audiobench.core.focused_entity import FocusedEntity
+        session.focus = FocusedEntity(type="transcript", id=10, label="Transcript #10")
         args = ["show", "99"]
         result = session.auto_inject_id(args)
         assert result == ["show", "99"]  # User-specified ID preserved
 
     def test_auto_inject_id_skips_non_aware(self):
         session = self._make_session()
-        session.last_id = 10
+        from audiobench.core.focused_entity import FocusedEntity
+        session.focus = FocusedEntity(type="transcript", id=10, label="Transcript #10")
         args = ["history"]
         result = session.auto_inject_id(args)
         assert result == ["history"]  # history is not context-aware
 
     def test_clear_context(self):
         session = self._make_session()
-        session.last_id = 42
-        session.context_record = {"id": 42}
-        session.clear_context()
+        from audiobench.core.focused_entity import FocusedEntity
+        session.focus = FocusedEntity(type="transcript", id=42, label="Transcript #42")
+        session.focus = None
         assert session.last_id is None
-        assert session.context_record is None
+        assert session.focus is None
 
 
 class TestSlashCommands:

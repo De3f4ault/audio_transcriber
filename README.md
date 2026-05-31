@@ -543,13 +543,15 @@ cp .env.example .env
 
 ```
 audiobench/                    ← Project root
-├── data/                      ← Project-local data (gitignored)
-│   ├── transcriptions.db      ← SQLite database (history, search)
-│   ├── plugins/               ← User plugins (Python files)
+├── data/                      ← Managed Workspace (gitignored)
+│   ├── library/               ← Managed audio file collection
+│   ├── exports/               ← Subtitles and transcripts (SRT, VTT, JSON, PDF)
+│   ├── reports/               ← AI summaries and text analysis
+│   ├── logs/                  ← Background job logs
+│   ├── plugins/               ← Custom Python commands
 │   ├── presets/               ← Named configuration presets (TOML)
-│   ├── logs/                  ← Application logs
-│   ├── sessions/              ← Live transcription sessions
-│   └── repl_history           ← REPL command history
+│   ├── transcriptions.db      ← SQLite database (history, search, bookmarks)
+│   └── repl_history           ← Interactive shell history
 ├── .env                       ← Your configuration (gitignored)
 └── .env.example               ← Configuration template
 

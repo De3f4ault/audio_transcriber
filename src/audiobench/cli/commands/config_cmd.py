@@ -83,15 +83,53 @@ def preset() -> None:
 
 # ── Config Group ────────────────────────────────────────────
 
-@click.group()
-def config() -> None:
+@click.group(invoke_without_command=True)
+@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Launch interactive setup wizard")
+@click.pass_context
+def config(ctx: click.Context, interactive_mode: bool) -> None:
     """Manage global application settings.
     
     \b
     Examples:
+      audiobench config --interactive
       audiobench config set gemini_model gemini-2.0-flash
-      audiobench config set speed_preset fast
     """
+    if interactive_mode or ctx.invoked_subcommand is None:
+        from audiobench.cli.wizard import prompt_string, prompt_menu
+        from audiobench.core.settings import get_settings, AudioBenchSettings
+        import sys
+        
+        settings = get_settings()
+        data = settings.model_dump()
+        
+        console.print(f"\n  [{BOLD} {ACCENT}]AudioBench Config Wizard[/]")
+        
+        try:
+            current_hf = data.get("hf_token", "") or ""
+            hf = prompt_string(f"Hugging Face Token (for diarization) [{current_hf}]", default=current_hf)
+            if hf: data["hf_token"] = hf
+            
+            current_gemini = data.get("gemini_model", "gemini-2.0-flash")
+            gemini = prompt_string(f"Gemini Model [{current_gemini}]", default=current_gemini)
+            if gemini: data["gemini_model"] = gemini
+            
+            data["default_model"] = prompt_menu(
+                "Default Whisper Model",
+                [
+                    ("tiny", "Fastest, lowest accuracy", "tiny"),
+                    ("base", "Fast, okay accuracy", "base"),
+                    ("small", "Good balance", "small"),
+                    ("large-v3-turbo", "High accuracy, slower", "large-v3-turbo"),
+                ],
+                default_idx=3
+            )
+            
+            updated = AudioBenchSettings(**data)
+            updated.save()
+            console.print(f"\n  [{SUCCESS}]✓ Configuration saved to {settings.config_file}[/]")
+            
+        except KeyboardInterrupt:
+            sys.exit(0)
 
 @config.command("set")
 @click.argument("key")

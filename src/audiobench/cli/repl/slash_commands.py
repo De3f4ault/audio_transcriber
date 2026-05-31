@@ -77,10 +77,10 @@ def handle_slash_command(cmd: str, session: ReplSession) -> bool:
         console.print(f"\n  [{DIM}]Type <command> --help for details[/]\n")
 
     elif command == "/context":
-        if session.context_record:
+        if session.focus:
             print_context_summary(session)
         else:
-            console.print(f"  [{DIM}]No context set. Use .use <ID> or transcribe a file.[/]")
+            console.print(f"  [{DIM}]No context set. Use work <file> or transcribe a file.[/]")
 
     else:
         console.print(f"  [{DIM}]Unknown: {command} — type /help or help[/]")

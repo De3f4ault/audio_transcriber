@@ -138,6 +138,17 @@ from audiobench.core.settings import get_settings
     help="Output only transcription IDs (for piping to other commands)",
 )
 @click.option(
+    "--map-speakers",
+    "map_speakers",
+    default=None,
+    help="Manually map generic speakers to real names (e.g. 'Speaker 1=Lex, Speaker 2=Bob')",
+)
+@click.option(
+    "--auto-name",
+    is_flag=True,
+    help="Use Gemini to automatically detect and map real names for speakers (requires --diarize)",
+)
+@click.option(
     "--notify",
     is_flag=True,
     help="Send desktop notification when transcription completes",
@@ -148,6 +159,48 @@ from audiobench.core.settings import get_settings
     type=click.Choice(["whisper", "gemini"]),
     default=None,
     help="Transcription engine: whisper (local, default) or gemini (cloud)",
+)
+@click.option(
+    "-b",
+    "--background",
+    is_flag=True,
+    help="Run the transcription in the background",
+)
+@click.option(
+    "--chapters",
+    "target_chapters",
+    default=None,
+    help="Transcribe specific chapters (e.g. '1,3,5' or '1-5')",
+)
+@click.option(
+    "--resume",
+    is_flag=True,
+    help="Skip chapters that are already marked as completed",
+)
+@click.option(
+    "-p",
+    "--parallel",
+    type=int,
+    default=1,
+    help="Number of chapters to transcribe in parallel",
+)
+@click.option(
+    "--skip-ghost/--no-skip-ghost",
+    default=True,
+    help="Skip ghost chapters (chapters with start_time == end_time)",
+)
+@click.option(
+    "--job-id",
+    type=int,
+    default=None,
+    hidden=True,
+    help="Internal: ID of the background job for status reporting",
+)
+@click.option(
+    "--interactive",
+    "interactive_mode",
+    is_flag=True,
+    help="Guided wizard: prompts for engine, model, diarization, and other options",
 )
 def transcribe(
     files: tuple[str, ...],
@@ -177,8 +230,17 @@ def transcribe(
     id_only: bool,
     notify: bool,
     engine_name: str | None,
+    map_speakers: str | None,
+    auto_name: bool,
+    background: bool,
+    job_id: int | None,
+    interactive_mode: bool,
+    target_chapters: str | None,
+    resume: bool,
+    parallel: int,
+    skip_ghost: bool,
 ) -> None:
-    """Transcribe audio/video files.
+    """Transcribe audio or video files to text.
 
     \b
     Examples:
@@ -190,6 +252,7 @@ def transcribe(
       audiobench transcribe --translate audio_sw.m4a      Translate to English
       audiobench transcribe --diarize meeting.m4a         Identify speakers
       audiobench transcribe -q meeting.m4a | grep word   Pipe-friendly
+      audiobench transcribe --interactive meeting.m4a     Guided setup wizard
 
     \b
     Directory & batch input:
@@ -215,6 +278,223 @@ def transcribe(
       audiobench transcribe dir/ --id-only               Output IDs only (piping)
     """
     from audiobench.transcribe.transcriber import TranscriptionPipeline
+    from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
+
+    # ── Interactive wizard ──────────────────────────────────
+    if interactive_mode:
+        from audiobench.cli.wizard import prompt_bool, prompt_menu, prompt_string
+
+        # Resolve file for display (may be set already)
+        display_file = str(files[0]) if files else "<file>"
+        file_size_str = ""
+        try:
+            p = Path(display_file)
+            if p.exists():
+                sz = p.stat().st_size / (1024 * 1024)
+                from audiobench.transcribe.audio_converter import probe
+                info = probe(display_file)
+                file_size_str = f" · {format_duration(info.duration)} · {sz:.0f} MB"
+        except Exception:
+            pass
+
+        console.print(f"""
+  [{BOLD}][{ACCENT}]╭─ AudioBench Transcription Wizard ─╮[/][/]
+  [{BOLD}][{ACCENT}]│  {Path(display_file).name:<32} {file_size_str:<12}│[/][/]
+  [{BOLD}][{ACCENT}]╰────────────────────────────────────────╯[/][/]
+""")
+        
+        try:
+            from audiobench.chapters.detector import ChapterDetector
+            detector = ChapterDetector()
+            detected_chapters = detector.detect(Path(display_file))
+        except Exception:
+            detected_chapters = []
+
+        try:
+            if detected_chapters:
+                chapters_raw = prompt_string(
+                    f"Chapters to transcribe ({len(detected_chapters)} detected) [e.g. 1,3,5 or 1-5 — press Enter for all]",
+                    default="",
+                )
+                if chapters_raw.strip():
+                    target_chapters = chapters_raw.strip()
+                    
+            # Engine
+            chosen_engine = prompt_menu(
+                "Engine",
+                [
+                    ("Whisper",  "local, private, offline", "whisper"),
+                    ("Gemini",   "cloud, faster, smarter",  "gemini"),
+                ],
+                default_idx=0,
+            )
+            engine_name = chosen_engine
+
+            # Model (only shown for Whisper)
+            if chosen_engine == "whisper" and not model:
+                model = prompt_menu(
+                    "Model",
+                    [
+                        ("tiny",           "fastest, lowest quality",   "tiny"),
+                        ("base",           "fast, decent",              "base"),
+                        ("medium",         "balanced",                  "medium"),
+                        ("large-v3",       "slow, best quality",        "large-v3"),
+                        ("large-v3-turbo", "fast, near-large quality",  "large-v3-turbo"),
+                    ],
+                    default_idx=2,
+                )
+
+            # Speed preset (Whisper only)
+            if chosen_engine == "whisper":
+                speed_preset = prompt_menu(
+                    "Speed preset",
+                    [
+                        ("fast",     "beam=1, batch=4",     "fast"),
+                        ("balanced", "beam=3, batch=4",     "balanced"),
+                        ("accurate", "beam=5, sequential",  "accurate"),
+                    ],
+                    default_idx=1,
+                )
+
+            # Language
+            lang_raw = prompt_string(
+                "Language  [auto-detect — press Enter to skip, or type e.g. en, sw, fr]",
+                default="",
+            )
+            if lang_raw.strip():
+                language = lang_raw.strip()
+
+            # Diarization
+            diarize = prompt_bool("Speaker diarization?", default=False)
+            if diarize:
+                prompt_menu(
+                    "Diarization model",
+                    [
+                        ("3.1 (legacy)", "slower, broader support",  "speaker-diarization-3.1"),
+                        ("3.0 (stable)", "stable general-purpose",   "speaker-diarization-3.0"),
+                    ],
+                    default_idx=0,
+                )  # model arg not yet wired into PyannoteDiarizer — stored for future use
+
+            # Output format
+            chosen_fmt = prompt_menu(
+                "Output format",
+                [
+                    ("none",  "print to terminal only",  ""),
+                    ("txt",   "plain text file",          "txt"),
+                    ("srt",   "SRT subtitles",            "srt"),
+                    ("vtt",   "WebVTT subtitles",         "vtt"),
+                    ("json",  "structured JSON",          "json"),
+                    ("all",   "all formats",              "all"),
+                ],
+                default_idx=0,
+            )
+            if chosen_fmt:
+                output_format = chosen_fmt
+
+            # Pre-run summary
+            console.print(f"\n  [{BOLD}]Ready to transcribe:[/]")
+            console.print(f"    [{DIM}]File:[/]    {display_file}")
+            console.print(f"    [{DIM}]Engine:[/]  {engine_name}")
+            if model:
+                console.print(f"    [{DIM}]Model:[/]   {model}")
+            console.print(f"    [{DIM}]Speed:[/]   {speed_preset}")
+            if language:
+                console.print(f"    [{DIM}]Lang:[/]    {language}")
+            console.print(f"    [{DIM}]Diarize:[/] {'yes' if diarize else 'no'}")
+            if output_format:
+                console.print(f"    [{DIM}]Format:[/]  {output_format}")
+            console.print()
+
+            go = prompt_bool("Start transcription?", default=True)
+            if not go:
+                console.print(f"  [{DIM}]Cancelled.[/]")
+                return
+
+        except KeyboardInterrupt:
+            console.print()
+            return
+
+    if background:
+        if not SUPPORTS_BACKGROUND_JOBS:
+            console.print(f"  [{WARNING}]Background jobs are only supported on Linux/macOS. Running in foreground...[/]")
+            background = False
+        else:
+            from audiobench.jobs.runner import submit_job
+
+            # Reconstruct the command from Click's parsed parameters rather than
+            # sys.argv. This works correctly whether called from CLI or the REPL,
+        # where sys.argv would only contain ['repl'] and be useless.
+        ctx = click.get_current_context()
+        clean_args = ["transcribe"]
+
+        # Re-add every flag that was explicitly set by the user
+        params = ctx.params
+        for f in files:
+            clean_args.append(f)
+        if output_format:
+            clean_args += ["-f", output_format]
+        if output_path:
+            clean_args += ["-o", output_path]
+        if language:
+            clean_args += ["--language", language]
+        if model:
+            clean_args += ["--model", model]
+        if speed_preset and speed_preset != "balanced":
+            clean_args += ["--speed", speed_preset]
+        if no_cache:
+            clean_args.append("--no-cache")
+        if no_timestamps:
+            clean_args.append("--no-timestamps")
+        if quiet:
+            clean_args.append("--quiet")
+        if enhance:
+            clean_args.append("--enhance")
+        if trim:
+            clean_args.append("--trim")
+        if denoise:
+            clean_args.append("--denoise")
+        if audio_filter:
+            clean_args += ["--audio-filter", audio_filter]
+        if initial_prompt:
+            clean_args += ["--initial-prompt", initial_prompt]
+        if translate:
+            clean_args.append("--translate")
+        if diarize:
+            clean_args.append("--diarize")
+        if recursive:
+            clean_args.append("--recursive")
+        if extensions:
+            clean_args += ["--extensions", extensions]
+        if from_file:
+            clean_args += ["--from-file", from_file]
+        if exclude:
+            clean_args += ["--exclude", exclude]
+        if collision and collision != "skip":
+            clean_args += ["--collision", collision]
+        if mirror:
+            clean_args.append("--mirror")
+        if preset_name:
+            clean_args += ["--preset", preset_name]
+        if id_only:
+            clean_args.append("--id-only")
+        if engine_name:
+            clean_args += ["--engine", engine_name]
+        if map_speakers:
+            clean_args += ["--map-speakers", map_speakers]
+        if auto_name:
+            clean_args.append("--auto-name")
+        # NOTE: --background is intentionally omitted to avoid infinite loop
+
+        audio_file = None
+        if files:
+            audio_file = str(files[0])
+            if len(files) > 1:
+                audio_file += f" (+{len(files)-1} more)"
+
+        job_id = submit_job(clean_args, audio_file=audio_file)
+        console.print(f"  [{SUCCESS}][{job_id}][/] Background job submitted")
+        return
 
     # E1: Load preset defaults (CLI flags override)
     if preset_name:
@@ -260,6 +540,19 @@ def transcribe(
             )
         )
         return
+
+    parsed_chapters = None
+    if target_chapters:
+        parsed_chapters = []
+        for part in target_chapters.split(","):
+            part = part.strip()
+            if "-" in part:
+                start_str, end_str = part.split("-", 1)
+                parsed_chapters.extend(range(int(start_str), int(end_str) + 1))
+            else:
+                parsed_chapters.append(int(part))
+        parsed_chapters = sorted(list(set(parsed_chapters)))
+
 
     resolved_files = collect_files(
         files,
@@ -421,15 +714,29 @@ def transcribe(
                 initial_prompt=initial_prompt,
                 translate=translate,
                 enable_diarization=diarize,
+                map_speakers=map_speakers,
+                auto_name=auto_name,
                 on_phase=tracker.update,
                 on_segment=tracker.on_segment,
                 filters=filters,
                 engine_name=engine_name,
+                job_id=job_id,
+                target_chapters=parsed_chapters,
+                resume=resume,
+                parallel=parallel,
+                skip_ghost=skip_ghost,
             )
 
+            if job_id:
+                from audiobench.jobs.repository import JobRepository
+                JobRepository().mark_job_done(job_id)
+
             # For non-streaming engines (Gemini), segments aren't emitted
-            # via on_segment during transcription. Push them into the
-            # tracker now so finalize() can print the transcript text.
+            # during generation, so force a final update to show them.
+            if engine_name == "gemini":
+                for seg in transcript.segments:
+                    tracker.on_segment(seg)
+
             if not tracker.segments and transcript.segments:
                 tracker.segments = list(transcript.segments)
 
@@ -440,10 +747,16 @@ def transcribe(
 
             # ── Output ──
             if quiet:
-                from audiobench.output.base import get_formatter
-
-                formatter = get_formatter(resolved_format)
-                stdout.print(formatter.format(transcript), highlight=False)
+                if resolved_format == "pdf":
+                    from audiobench.export.pdf import PDFExporter
+                    # Ensure transcript acts like a dict for PDFExporter
+                    data = transcript.dict()
+                    data["file_name"] = Path(str(file_path)).stem
+                    PDFExporter().export_transcript(data, resolved_output or f"{data['file_name']}.pdf")
+                else:
+                    from audiobench.output.base import get_formatter
+                    formatter = get_formatter(resolved_format)
+                    stdout.print(formatter.format(transcript), highlight=False)
             else:
                 # Transcript text was already displayed progressively
                 # during transcription via on_segment callbacks.
@@ -487,10 +800,16 @@ def transcribe(
                         if not quiet:
                             console.print(f"  [{DIM}]Skipped {extra_fmt} (exists)[/]")
                         continue
-                    fmt_obj = get_fmt(extra_fmt)
-                    content = fmt_obj.format(transcript)
-                    Path(extra_out).parent.mkdir(parents=True, exist_ok=True)
-                    Path(extra_out).write_text(content, encoding="utf-8")
+                    if extra_fmt == "pdf":
+                        from audiobench.export.pdf import PDFExporter
+                        data = transcript.dict()
+                        data["file_name"] = Path(str(file_path)).stem
+                        PDFExporter().export_transcript(data, extra_out)
+                    else:
+                        fmt_obj = get_fmt(extra_fmt)
+                        content = fmt_obj.format(transcript)
+                        Path(extra_out).parent.mkdir(parents=True, exist_ok=True)
+                        Path(extra_out).write_text(content, encoding="utf-8")
                     if not quiet:
                         console.print(f"  [{DIM}]Saved → {extra_out}[/]")
 

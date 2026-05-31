@@ -193,23 +193,35 @@ CODEC_DEFAULTS: dict[str, list[str]] = {
     "wav": ["-c:a", "pcm_s16le"],
     "aac": ["-c:a", "aac", "-b:a", "192k"],
     "m4a": ["-c:a", "aac", "-b:a", "192k"],
+    "m4b": ["-c:a", "aac", "-b:a", "192k"],
 }
 
 # Formats ffmpeg can handle
 SUPPORTED_AUDIO_FORMATS = {
     "m4a",
+    "m4b",
+    "m4r",
     "mp3",
+    "mp2",
     "wav",
     "flac",
+    "alac",
     "ogg",
+    "oga",
     "aac",
     "wma",
     "opus",
+    "weba",
     "aiff",
     "webm",
     "amr",
-    "oga",
     "spx",
+    "ape",
+    "wv",
+    "ac3",
+    "eac3",
+    "dts",
+    "3gp",
 }
 
 SUPPORTED_VIDEO_FORMATS = {
@@ -221,6 +233,17 @@ SUPPORTED_VIDEO_FORMATS = {
     "webm",
     "flv",
     "wmv",
+    "mpg",
+    "mpeg",
+    "mpe",
+    "ts",
+    "m2ts",
+    "mts",
+    "vob",
+    "ogv",
+    "rmvb",
+    "asf",
+    "3g2",
 }
 
 ALL_SUPPORTED_FORMATS = SUPPORTED_AUDIO_FORMATS | SUPPORTED_VIDEO_FORMATS

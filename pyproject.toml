@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiobench"
-version = "0.2.0"
+version = "2.0.0"
 description = "Offline AI audio toolkit — transcribe, search, chat, visualize, and speak"
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,6 +28,8 @@ dependencies = [
     "numpy>=1.24.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    "weasyprint>=63.0",
+    "jinja2>=3.0.0",
     "python-dotenv>=1.0.0",
     "sqlalchemy>=2.0.0",
     "alembic>=1.13.0",

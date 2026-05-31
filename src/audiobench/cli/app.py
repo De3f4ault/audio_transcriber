@@ -13,7 +13,7 @@ from audiobench.cli.plugins.custom_group import DefaultGroup
 from audiobench.core.logger_factory import setup_logging
 
 
-@click.group(cls=DefaultGroup, default_command="transcribe", invoke_without_command=True)
+@click.group(cls=DefaultGroup, default_command="repl", invoke_without_command=True)
 @click.option("-v", "--verbose", is_flag=True, help="Show detailed log output")
 @click.option("--debug", is_flag=True, help="Debug logging")
 @click.option(
@@ -26,24 +26,26 @@ from audiobench.core.logger_factory import setup_logging
 @click.pass_context
 def cli(ctx: click.Context, verbose: bool, debug: bool, json_mode: bool) -> None:
     """AudioBench — offline audio workbench.
+    
+    Launch the interactive REPL (default):
+      audiobench
 
     \b
-    Transcribe files:
-      audiobench transcribe meeting.m4a                 Print to stdout
+    Transcribe & Process:
       audiobench transcribe meeting.m4a -f srt          Save as meeting.srt
-      audiobench transcribe meeting.m4a -o notes.srt    Auto-detect SRT format
       audiobench transcribe *.m4a -o ./out/             Batch to directory
-      audiobench transcribe meeting.m4a --fast          Fast preset
-      audiobench transcribe meeting.m4a -q | grep word  Pipe-friendly
+      audiobench summarize 3 --interactive              AI summary of transcript #3
+      audiobench clean --interactive                    Clean up transcript text
+      audiobench bookmark --interactive                 Manage timestamps & regions
+      audiobench convert meeting.m4a -o meeting.mp3     Format conversion
+      audiobench merge pt1.wav pt2.wav -o full.wav      Merge audio files
 
     \b
     Manage:
+      audiobench config --interactive                   Interactive configuration
       audiobench history                                Past transcriptions
       audiobench search "keyword"                       Search text
-      audiobench export 3 -f vtt                        Re-export as VTT
-      audiobench download large-v3-turbo                Pre-download model
-      audiobench delete 3                               Remove from history
-      audiobench info                                   System info
+      audiobench export 3 --interactive                 Re-export transcript
     """
     import os
     os.environ["HF_HUB_OFFLINE"] = "0"

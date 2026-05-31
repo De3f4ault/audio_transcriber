@@ -15,8 +15,35 @@ class TextFormatter(OutputFormatter):
     def format(self, transcript: Transcript) -> str:
         lines: list[str] = []
         current_speaker: str | None = None
+        current_chapter_id: int | None = None
+
+        # Build chapter map
+        chapter_map = {c["id"]: c["title"] for c in transcript.chapters} if transcript.chapters else {}
+
+        # Insert Markdown TOC if chapters exist
+        if chapter_map:
+            lines.append("# Table of Contents\n")
+            for c in transcript.chapters:
+                # Basic slugification for markdown anchor links
+                slug = c["title"].lower().replace(" ", "-").replace(":", "").replace("'", "")
+                lines.append(f"- [{c['title']}](#{slug})")
+            lines.append("\n---\n")
 
         for seg in transcript.segments:
+            # ── Check for chapter change ──
+            if seg.chapter_id != current_chapter_id and seg.chapter_id is not None:
+                if lines and lines[-1] != "":
+                    lines.append("")
+                if current_chapter_id is not None:
+                    lines.append("\n---\n") # Separator between chapters
+                
+                title = chapter_map.get(seg.chapter_id, f"Chapter {seg.chapter_id}")
+                lines.append(f"## {title}\n")
+                current_chapter_id = seg.chapter_id
+                
+                # Reset speaker to force re-printing speaker badge after a chapter heading
+                current_speaker = None
+
             # Check if any words carry individual speaker labels
             has_word_speakers = any(w.speaker for w in seg.words)
 
@@ -34,7 +61,8 @@ class TextFormatter(OutputFormatter):
                             if chunk_speaker != current_speaker:
                                 if lines:
                                     lines.append("")
-                                lines.append(f"[{chunk_speaker}]")
+                                display_speaker = transcript.speaker_map.get(chunk_speaker, chunk_speaker)
+                                lines.append(f"[{display_speaker}]")
                                 current_speaker = chunk_speaker
                             lines.append(" ".join(current_chunk))
                             current_chunk = []
@@ -47,7 +75,8 @@ class TextFormatter(OutputFormatter):
                     if chunk_speaker and chunk_speaker != current_speaker:
                         if lines:
                             lines.append("")
-                        lines.append(f"[{chunk_speaker}]")
+                        display_speaker = transcript.speaker_map.get(chunk_speaker, chunk_speaker)
+                        lines.append(f"[{display_speaker}]")
                         current_speaker = chunk_speaker
                     lines.append(" ".join(current_chunk))
             else:
@@ -55,7 +84,8 @@ class TextFormatter(OutputFormatter):
                 if seg.speaker and seg.speaker != current_speaker:
                     if lines:
                         lines.append("")
-                    lines.append(f"[{seg.speaker}]")
+                    display_speaker = transcript.speaker_map.get(seg.speaker, seg.speaker)
+                    lines.append(f"[{display_speaker}]")
                     current_speaker = seg.speaker
                 lines.append(seg.text)
 

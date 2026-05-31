@@ -67,3 +67,60 @@ class DefaultGroup(click.Group):
                 raise click.UsageError(hint)
 
         raise click.UsageError(f"Error: No such command '{cmd_name}'.")
+
+    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Format commands into logical groups in the help text."""
+        commands = []
+        for cmd in self.list_commands(ctx):
+            c = self.get_command(ctx, cmd)
+            if c is None or c.hidden:
+                continue
+            commands.append((cmd, c))
+
+        if not commands:
+            return
+
+        groups = {
+            "Core Actions": ["repl", "transcribe", "listen"],
+            "Analysis & Exploration": [
+                "ask", "chat", "summarize", "vocab", "bookmark", "analyze", "inspect", "audio", "play", "speak"
+            ],
+            "Data & Management": ["history", "search", "export", "delete", "show", "clean"],
+            "Configuration & Jobs": ["config", "jobs", "download", "system", "info", "doctor", "cleanup", "preset", "status"]
+        }
+
+        categorized = {k: [] for k in groups}
+        uncategorized = []
+
+        for name, cmd in commands:
+            placed = False
+            for group_name, cmds in groups.items():
+                if name in cmds:
+                    categorized[group_name].append((name, cmd))
+                    placed = True
+                    break
+            if not placed:
+                uncategorized.append((name, cmd))
+
+        for group_name, cmds in categorized.items():
+            if not cmds:
+                continue
+            # Use formatter.write_paragraph to add some space
+            formatter.write(f"\n{group_name}:\n")
+            with formatter.indentation():
+                # We format it manually since formatter.write_dl doesn't support grouping natively
+                # in older click versions cleanly without messing up alignments.
+                rows = []
+                for name, cmd in cmds:
+                    help_text = cmd.get_short_help_str(limit=formatter.width) or ""
+                    rows.append((name, help_text))
+                formatter.write_dl(rows)
+
+        if uncategorized:
+            formatter.write("\nOther Commands:\n")
+            with formatter.indentation():
+                rows = []
+                for name, cmd in uncategorized:
+                    help_text = cmd.get_short_help_str(limit=formatter.width) or ""
+                    rows.append((name, help_text))
+                formatter.write_dl(rows)

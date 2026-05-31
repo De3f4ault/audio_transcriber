@@ -102,8 +102,15 @@ class PyannoteDiarizer:
         try:
             diarization = self._pipeline(str(audio_path))
 
+            # Compatibility check for pyannote.audio 3.3+ / 4.x+
+            # Newer versions return a DiarizeOutput object instead of Annotation
+            if hasattr(diarization, "itertracks"):
+                annotation = diarization
+            else:
+                annotation = diarization.speaker_diarization
+
             turns: list[SpeakerTurn] = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
+            for turn, _, speaker in annotation.itertracks(yield_label=True):
                 turns.append(
                     SpeakerTurn(
                         speaker=speaker,
