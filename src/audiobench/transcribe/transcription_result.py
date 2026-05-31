@@ -66,12 +66,19 @@ class Word(BaseModel):
     start: float = Field(description="Start time in seconds")
     end: float = Field(description="End time in seconds")
     probability: float = Field(default=0.0, ge=0.0, le=1.0, description="Confidence score")
+    speaker: str | None = Field(default=None, description="Speaker label from word-level diarization")
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def duration(self) -> float:
         """Duration of the word in seconds."""
         return round(self.end - self.start, 3)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def midpoint(self) -> float:
+        """Midpoint timestamp — used for word-level speaker assignment."""
+        return round((self.start + self.end) / 2, 3)
 
 
 class Segment(BaseModel):

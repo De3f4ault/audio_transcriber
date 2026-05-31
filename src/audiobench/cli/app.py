@@ -45,6 +45,10 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, json_mode: bool) -> None
       audiobench delete 3                               Remove from history
       audiobench info                                   System info
     """
+    import os
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
     if debug:
         log_level = "DEBUG"
     elif verbose:

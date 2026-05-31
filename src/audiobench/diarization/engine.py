@@ -70,7 +70,7 @@ class PyannoteDiarizer:
         try:
             self._pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                use_auth_token=self._hf_token,
+                token=self._hf_token,
             )
             logger.info("Diarization pipeline loaded")
         except Exception as e:
@@ -129,49 +129,100 @@ class PyannoteDiarizer:
         transcript: Transcript,
         turns: list[SpeakerTurn],
     ) -> Transcript:
-        """Assign speaker labels to transcript segments.
+        """Assign speaker labels to transcript segments at the word level.
 
-        Uses overlap-based matching: each segment gets the speaker
-        label of the turn with the greatest time overlap.
+        Strategy:
+        1. For every word in a segment, find the speaker turn that covers
+           the word's midpoint timestamp (most reliable single-point lookup).
+        2. Each word gets its own speaker label stored in word.speaker.
+        3. The segment's top-level speaker is set to the majority speaker
+           among its words (most words wins). This keeps backwards
+           compatibility with formatters that only read segment.speaker.
+        4. Falls back to segment-overlap matching for segments with no
+           word-level timestamps (e.g. Gemini engine output).
 
         Args:
-            transcript: Transcript with segments to label.
-            turns: Speaker turns from diarization.
+            transcript: Transcript with segments (and ideally word timestamps).
+            turns: Speaker turns from pyannote diarization.
 
         Returns:
-            Transcript with speaker labels filled in.
+            Transcript with speaker labels on both words and segments.
         """
         if not turns:
             return transcript
 
+        # Build a sorted list of turns for efficient lookup
+        sorted_turns = sorted(turns, key=lambda t: t.start)
+
         for segment in transcript.segments:
-            best_speaker = self._find_best_speaker(segment, turns)
-            if best_speaker:
-                segment.speaker = best_speaker
+            if segment.words:
+                # ── Word-level assignment ──────────────────────────────────
+                speaker_votes: dict[str, int] = {}
+                for word in segment.words:
+                    spk = self._speaker_at(word.midpoint, sorted_turns)
+                    if spk:
+                        word.speaker = spk
+                        speaker_votes[spk] = speaker_votes.get(spk, 0) + 1
+
+                # Majority vote → segment label
+                if speaker_votes:
+                    segment.speaker = max(speaker_votes, key=lambda s: speaker_votes[s])
+            else:
+                # ── Fallback: segment-overlap (no word timestamps) ─────────
+                segment.speaker = self._find_best_speaker(segment, sorted_turns)
 
         # Simplify speaker labels (SPEAKER_00 → Speaker 1)
         speakers = sorted({s.speaker for s in transcript.segments if s.speaker})
         speaker_map = {spk: f"Speaker {i + 1}" for i, spk in enumerate(speakers)}
+
         for segment in transcript.segments:
             if segment.speaker and segment.speaker in speaker_map:
                 segment.speaker = speaker_map[segment.speaker]
+            for word in segment.words:
+                if word.speaker and word.speaker in speaker_map:
+                    word.speaker = speaker_map[word.speaker]
 
         logger.info(
-            "Assigned %d unique speakers to %d segments",
+            "Assigned %d unique speakers across %d segments (%d words labeled)",
             len(speaker_map),
             len([s for s in transcript.segments if s.speaker]),
+            sum(1 for s in transcript.segments for w in s.words if w.speaker),
         )
 
         return transcript
 
     @staticmethod
+    def _speaker_at(midpoint: float, sorted_turns: list[SpeakerTurn]) -> str | None:
+        """Find the speaker whose turn covers a given timestamp midpoint.
+
+        Uses the midpoint of a word's time span as the lookup key — this is
+        more reliable than checking the whole word span because a word can
+        straddle a speaker boundary but its midpoint sits cleanly in one turn.
+
+        Args:
+            midpoint: The midpoint timestamp of a word in seconds.
+            sorted_turns: Speaker turns sorted by start time.
+
+        Returns:
+            Speaker label string, or None if no turn covers the midpoint.
+        """
+        for turn in sorted_turns:
+            if turn.start <= midpoint <= turn.end:
+                return turn.speaker
+            if turn.start > midpoint:
+                break  # sorted — no need to keep scanning
+        return None
+
+    @staticmethod
     def _find_best_speaker(segment: Segment, turns: list[SpeakerTurn]) -> str | None:
-        """Find the speaker with the most overlap with a segment."""
+        """Fallback: find the speaker with the most overlap with a segment.
+
+        Used when word-level timestamps are not available.
+        """
         best_speaker = None
         best_overlap = 0.0
 
         for turn in turns:
-            # Calculate overlap between segment and turn
             overlap_start = max(segment.start, turn.start)
             overlap_end = min(segment.end, turn.end)
             overlap = max(0.0, overlap_end - overlap_start)

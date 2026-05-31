@@ -5,19 +5,59 @@ from audiobench.transcribe.transcription_result import Transcript
 
 
 class TextFormatter(OutputFormatter):
-    """Format transcript as plain text, grouped by speaker if available."""
+    """Format transcript as plain text, grouped by speaker if available.
+
+    When word-level speaker labels are present, speaker changes *within*
+    a segment are detected and the text is split at the boundary so that
+    interruptions and overlapping turns are shown correctly.
+    """
 
     def format(self, transcript: Transcript) -> str:
         lines: list[str] = []
-        current_speaker = None
+        current_speaker: str | None = None
 
         for seg in transcript.segments:
-            if seg.speaker and seg.speaker != current_speaker:
-                if lines:
-                    lines.append("")
-                lines.append(f"[{seg.speaker}]")
-                current_speaker = seg.speaker
-            lines.append(seg.text)
+            # Check if any words carry individual speaker labels
+            has_word_speakers = any(w.speaker for w in seg.words)
+
+            if has_word_speakers:
+                # ── Word-level: detect speaker changes within the segment ──
+                current_chunk: list[str] = []
+                chunk_speaker: str | None = None
+
+                for word in seg.words:
+                    spk = word.speaker or seg.speaker  # fall back to segment label
+
+                    if spk != chunk_speaker:
+                        # Flush the previous chunk
+                        if current_chunk and chunk_speaker:
+                            if chunk_speaker != current_speaker:
+                                if lines:
+                                    lines.append("")
+                                lines.append(f"[{chunk_speaker}]")
+                                current_speaker = chunk_speaker
+                            lines.append(" ".join(current_chunk))
+                            current_chunk = []
+                        chunk_speaker = spk
+
+                    current_chunk.append(word.word)
+
+                # Flush the final chunk
+                if current_chunk:
+                    if chunk_speaker and chunk_speaker != current_speaker:
+                        if lines:
+                            lines.append("")
+                        lines.append(f"[{chunk_speaker}]")
+                        current_speaker = chunk_speaker
+                    lines.append(" ".join(current_chunk))
+            else:
+                # ── Segment-level: original behaviour ─────────────────────
+                if seg.speaker and seg.speaker != current_speaker:
+                    if lines:
+                        lines.append("")
+                    lines.append(f"[{seg.speaker}]")
+                    current_speaker = seg.speaker
+                lines.append(seg.text)
 
         return "\n".join(lines) + "\n"
 
