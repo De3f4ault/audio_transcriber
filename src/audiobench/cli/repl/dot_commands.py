@@ -459,6 +459,13 @@ def _dot_play(session: ReplSession, arg: str) -> None:
         )
         return
 
+    show_lyrics = False
+    if arg and any(kw in arg.lower() for kw in ("lyrics", "--lyrics", "-l")):
+        show_lyrics = True
+        for kw in ("--lyrics", "lyrics", "-l"):
+            arg = arg.replace(kw, "")
+        arg = arg.strip()
+
     # Parse optional start time
     start_seconds = 0.0
     if arg:
@@ -499,7 +506,26 @@ def _dot_play(session: ReplSession, arg: str) -> None:
                 return
 
     # Build ffplay command
-    cmd = ["ffplay", "-nodisp", "-autoexit", str(file_path)]
+    if show_lyrics and rec:
+        import tempfile
+        def format_ts(seconds: float) -> str:
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            s = int(seconds % 60)
+            ms = int((seconds % 1) * 1000)
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+            
+        fd, srt_path = tempfile.mkstemp(suffix=".srt", prefix="audiobench_lyrics_", text=True)
+        with open(fd, "w") as f:
+            for i, seg in enumerate(rec.get("segments", []), 1):
+                start = format_ts(seg.get("start", 0) or 0)
+                end = format_ts(seg.get("end", 0) or 0)
+                text = seg.get("text", "").strip()
+                f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+        cmd = ["ffplay", "-autoexit", "-vf", f"subtitles={srt_path}", str(file_path)]
+    else:
+        cmd = ["ffplay", "-nodisp", "-autoexit", str(file_path)]
+
     if start_seconds > 0:
         cmd.extend(["-ss", str(start_seconds)])
 
@@ -532,7 +558,8 @@ def _dot_play(session: ReplSession, arg: str) -> None:
         session._playback_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        console.print(f"  [{DIM}]Playing in background. Use .stop to halt playback.[/]")
+        mode = "with lyrics" if show_lyrics else "in background"
+        console.print(f"  [{DIM}]Playing {mode}. Use .stop to halt playback.[/]")
     except FileNotFoundError:
         console.print(f"  [{WARNING}]ffplay not found. Install ffmpeg to use playback.[/]")
 
