@@ -196,6 +196,9 @@ def handle_dot_command(cmd: str, session: ReplSession) -> None:
     elif command == ".play":
         _dot_play(session, arg)
         return
+    elif command == ".stop":
+        _dot_stop(session)
+        return
     elif command == ".path":
         _dot_path(session)
         return
@@ -519,14 +522,31 @@ def _dot_play(session: ReplSession, arg: str) -> None:
             else ""
         )
     )
-    console.print(f"  [{DIM}]Press 'q' to stop[/]")
+
+    if hasattr(session, "_playback_proc") and session._playback_proc is not None:
+        if session._playback_proc.poll() is None:
+            session._playback_proc.terminate()
+            session._playback_proc = None
 
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        session._playback_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        console.print(f"  [{DIM}]Playing in background. Use .stop to halt playback.[/]")
     except FileNotFoundError:
         console.print(f"  [{WARNING}]ffplay not found. Install ffmpeg to use playback.[/]")
-    except KeyboardInterrupt:
-        console.print(f"  [{DIM}]Playback stopped[/]")
+
+def _dot_stop(session: ReplSession) -> None:
+    """Stop background audio playback."""
+    if hasattr(session, "_playback_proc") and session._playback_proc is not None:
+        if session._playback_proc.poll() is None:
+            session._playback_proc.terminate()
+            console.print(f"  [{SUCCESS}]Playback stopped.[/]")
+        else:
+            console.print(f"  [{DIM}]No audio currently playing.[/]")
+        session._playback_proc = None
+    else:
+        console.print(f"  [{DIM}]No audio currently playing.[/]")
 
 
 def _dot_edit(session: ReplSession, rec: dict) -> None:
@@ -744,11 +764,11 @@ def _navigate_context(session: ReplSession, direction: int) -> None:
     session._history_cursor = new_cursor
     new_id = session._history_ids[new_cursor]
     session.set_context(new_id)
-    if session.context_record:
+    if session.focus:
         pos = f"{new_cursor + 1}/{len(session._history_ids)}"
         console.print(
             f"  [{SUCCESS}]✓[/] [{ACCENT}]#{new_id}[/] — "
-            f"{session.context_record.get('file_name', '?')} "
+            f"{session.focus.label} "
             f"[{DIM}]({pos})[/]"
         )
 
@@ -764,7 +784,7 @@ def print_dot_help() -> None:
             ".info",
             ".find",
         ],
-        "Audio": [".play", ".open", ".path"],
+        "Audio": [".play", ".stop", ".open", ".path"],
         "AI": [".ask", ".chat", ".summarize"],
         "Actions": [".export", ".edit", ".diarize"],
         "Navigation": [

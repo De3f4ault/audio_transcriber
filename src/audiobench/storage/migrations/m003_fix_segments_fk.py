@@ -24,8 +24,9 @@ def _segments_fk_is_broken(cursor: sqlite3.Cursor) -> bool:
     rows = cursor.fetchall()
     # foreign_key_list columns: (id, seq, table, from, to, on_update, on_delete, match)
     for row in rows:
+        from_col = row[3]
         referenced_table = row[2]
-        if referenced_table != "transcriptions":
+        if from_col == "transcription_id" and referenced_table != "transcriptions":
             logger.warning(
                 "segments FK points to '%s' instead of 'transcriptions'",
                 referenced_table,
@@ -56,6 +57,7 @@ def migrate(db_path: str) -> None:
                 start_time       FLOAT  NOT NULL,
                 end_time         FLOAT  NOT NULL,
                 speaker          VARCHAR(64),
+                chapter_id       INTEGER REFERENCES chapters(id) ON DELETE SET NULL,
                 FOREIGN KEY(transcription_id) REFERENCES transcriptions (id)
             )
         """)

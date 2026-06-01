@@ -282,10 +282,12 @@ class TranscriptionRepository:
         """
         with get_session() as session:
             query = session.query(TranscriptionRecord)
+            from audiobench.storage.models import ChapterRecord
+            subquery = session.query(ChapterRecord.transcription_id).filter(ChapterRecord.transcription_id.isnot(None))
             if chapter_mode is True:
-                query = query.filter(TranscriptionRecord.chapter_id.isnot(None))
+                query = query.filter(TranscriptionRecord.id.in_(subquery))
             elif chapter_mode is False:
-                query = query.filter(TranscriptionRecord.chapter_id.is_(None))
+                query = query.filter(~TranscriptionRecord.id.in_(subquery))
 
             records = (
                 query.order_by(desc(TranscriptionRecord.created_at))

@@ -73,7 +73,7 @@ def repl(transcript_id: int | None) -> None:
     # Pre-load context if transcript ID given
     if transcript_id is not None:
         session.set_context(transcript_id)
-        if session.context_record:
+        if session.focus:
             print_context_summary(session)
             console.print()
 
