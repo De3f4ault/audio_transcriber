@@ -163,8 +163,8 @@ class ReplSession:
             if not has_files:
                 repo = self._get_repo()
                 audio_file = repo.get_audio_file(self.focus.id)
-                if audio_file and audio_file.file_path:
-                    injections.append(str(audio_file.file_path))
+                if audio_file and audio_file.get("file_path"):
+                    injections.append(str(audio_file["file_path"]))
                     
             if self.focus.chapter_index is not None and "--chapters" not in rest:
                 injections.extend(["--chapters", str(self.focus.chapter_index)])

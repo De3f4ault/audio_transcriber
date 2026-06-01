@@ -36,9 +36,8 @@ def print_full_help(session: ReplSession) -> None:
     """Print comprehensive REPL help."""
     ctx_label = f"#{session.last_id}" if session.last_id else "none"
     ctx_name = ""
-    if session.context_record:
-        fname = session.context_record.get("file_name", "")
-        ctx_name = f" ({fname})" if fname else ""
+    if session.focus:
+        ctx_name = f" ({session.focus.label})"
 
     console.print(f"""
   [{BOLD}][{ACCENT}]{APP_NAME} REPL — Interactive Shell[/][/]
