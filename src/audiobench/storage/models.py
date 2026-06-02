@@ -198,6 +198,7 @@ class ChatConversation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(256), default="Untitled Chat")
     model_name: Mapped[str] = mapped_column(String(128), default="")
+    session_type: Mapped[str] = mapped_column(String(64), default="chat")
     engine: Mapped[str] = mapped_column(String(64), default="ollama")
     transcript_ids: Mapped[str] = mapped_column(
         String(512), default="[]"
@@ -320,3 +321,144 @@ class JobRecord(Base):
 
     def __repr__(self) -> str:
         return f"<Job(id={self.id}, status='{self.status}', cmd='{self.command[:30]}')>"
+
+
+class ExpressionRecord(Base):
+    """A semantic expression representing a unit of memory."""
+
+    __tablename__ = "expressions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    session_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    session_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    speaker: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    inference_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    inference_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC), index=True)
+
+    # Relationships
+    relations_from: Mapped[list[ExpressionRelation]] = relationship(
+        "ExpressionRelation",
+        foreign_keys="ExpressionRelation.from_expression_id",
+        back_populates="source_expression",
+        cascade="all, delete-orphan",
+    )
+    relations_to: Mapped[list[ExpressionRelation]] = relationship(
+        "ExpressionRelation",
+        foreign_keys="ExpressionRelation.to_expression_id",
+        back_populates="target_expression",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:
+        return f"<ExpressionRecord(id={self.id}, source_type='{self.source_type}', len={len(self.content)})>"
+
+
+class ExpressionRelation(Base):
+    """Directed relation between two semantic expressions."""
+
+    __tablename__ = "expression_relations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    from_expression_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    to_expression_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    relation_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationships
+    source_expression: Mapped[ExpressionRecord] = relationship(
+        "ExpressionRecord", foreign_keys=[from_expression_id], back_populates="relations_from"
+    )
+    target_expression: Mapped[ExpressionRecord] = relationship(
+        "ExpressionRecord", foreign_keys=[to_expression_id], back_populates="relations_to"
+    )
+
+    def __repr__(self) -> str:
+        return f"<ExpressionRelation({self.from_expression_id} -> {self.to_expression_id}, type='{self.relation_type}')>"
+
+
+class AskLog(Base):
+    """Log of questions and answers for a specific audio file."""
+
+    __tablename__ = "ask_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    audio_file_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("audio_files.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    entry_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
+    )
+
+    # Relationships
+    entries: Mapped[list[AskEntry]] = relationship("AskEntry", back_populates="log", cascade="all, delete-orphan")
+    audio_file: Mapped[AudioFileRecord] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<AskLog(id={self.id}, audio_file_id={self.audio_file_id}, entries={self.entry_count})>"
+
+
+class AskEntry(Base):
+    """A single question and answer in an ask log."""
+
+    __tablename__ = "ask_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    log_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ask_logs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    question_expression_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True
+    )
+    answer_expression_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationships
+    log: Mapped[AskLog] = relationship("AskLog", back_populates="entries")
+
+    def __repr__(self) -> str:
+        return f"<AskEntry(id={self.id}, log_id={self.log_id})>"
+
+
+class ConversationSummary(Base):
+    """Semantic summary and insight extraction from a chat conversation."""
+
+    __tablename__ = "conversation_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("chat_conversations.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    narrative: Mapped[str] = mapped_column(Text, nullable=False)
+    drift_phases: Mapped[str] = mapped_column(Text, default="[]")  # JSON
+    key_insights: Mapped[str] = mapped_column(Text, default="[]")  # JSON
+    open_threads: Mapped[str] = mapped_column(Text, default="[]")  # JSON
+    refined_title: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    expression_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True
+    )
+    generated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationships
+    conversation: Mapped[ChatConversation] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<ConversationSummary(id={self.id}, conv_id={self.conversation_id})>"

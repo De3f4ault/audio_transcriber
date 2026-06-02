@@ -99,6 +99,10 @@ class AudioBenchSettings(BaseSettings):
         default=Path.home() / ".audiobench" / "models",
         description="Directory for downloaded models (shared, multi-GB)",
     )
+    offline_mode: bool = Field(
+        default=False,
+        description="Force offline mode (prevents HF/network calls for model loading)",
+    )
     data_dir: Path = Field(
         default=_DATA_DIR,
         description="Base directory for project-local data (db, plugins, presets, logs)",
@@ -116,7 +120,7 @@ class AudioBenchSettings(BaseSettings):
 
     # --- AI / LLM ---
     ollama_model: str = Field(
-        default="deepseek-v3.2:cloud",
+        default="qwen3-next:80b-cloud",
         description="Default Ollama model for AI features",
     )
     ollama_base_url: str = Field(
@@ -130,6 +134,46 @@ class AudioBenchSettings(BaseSettings):
     clean_model: str = Field(
         default="qwen3-next:80b-cloud",
         description="Ollama model for transcript cleaning (spelling/punctuation correction)",
+    )
+
+    # --- Daemon & Memory Layer ---
+    daemon_socket_path: Path = Field(
+        default=Path("/tmp/audiobench-daemon.sock"),
+        description="Path to daemon Unix socket",
+    )
+    daemon_pid_path: Path = Field(
+        default=Path("/tmp/audiobench-daemon.pid"),
+        description="Path to daemon PID file",
+    )
+    daemon_warmup_timeout: float = Field(default=120.0, description="Seconds to wait for daemon startup")
+    daemon_ping_timeout: float = Field(default=0.1, description="Seconds to wait for daemon health check (fail fast)")
+    embedding_model: str = Field(
+        default="nomic-ai/nomic-embed-text-v1.5",
+        description="Primary embedding model for vector storage",
+    )
+    boundary_model: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        description="Fast embedding model for semantic boundary detection",
+    )
+    reranker_model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        description="Cross-encoder model for search result reranking",
+    )
+    embedding_dims: int = Field(default=768, description="Dimensions of primary embedding vectors")
+    chunk_breakpoint_percentile: float = Field(
+        default=85.0,
+        description="Percentile threshold for semantic chunk boundaries",
+    )
+    chunk_max_tokens: int = Field(default=350, description="Max tokens per chunk fallback guard")
+    chunk_sentence_group_size: int = Field(default=3, description="Number of sentences per boundary comparison block")
+    chunk_short_threshold: int = Field(default=600, description="Characters below which to skip chunking entirely")
+    chunk_long_threshold: int = Field(default=10_000, description="Characters above which to enforce max_tokens guard")
+    retrieval_top_k: int = Field(default=15, description="Initial candidates to retrieve from LanceDB")
+    rerank_top_k: int = Field(default=5, description="Candidates to keep after reranking")
+    summary_min_turns: int = Field(default=3, description="Minimum chat turns required to trigger session summary")
+    lancedb_path: Path = Field(
+        default_factory=lambda: _DATA_DIR / "lancedb",
+        description="Path to embedded LanceDB directory",
     )
 
     # --- Engine Selection ---

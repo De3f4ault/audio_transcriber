@@ -291,7 +291,8 @@ def _handle_slash_command(
 @click.option("--model", default=None, help="Ollama model (default: from settings)")
 @click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Interactive wizard")
 @click.option("--chapter", type=int, default=None, help="Ask about a specific chapter")
-def ask(transcript_id: int | None, question: str | None, model: str | None, interactive_mode: bool = False, chapter: int | None = None) -> None:
+@click.option("--log", is_flag=True, help="View the full ask log for an audio file")
+def ask(transcript_id: int | None, question: str | None, model: str | None, interactive_mode: bool = False, chapter: int | None = None, log: bool = False) -> None:
     """Ask a question about a transcript using AI.
 
     \b
@@ -304,22 +305,27 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
     from audiobench.chat.providers.ollama_provider import AIError, OllamaClient
     from audiobench.core.db_engine import init_db
     from audiobench.storage.repository import TranscriptionRepository
+    from audiobench.cli.display.theme import BOLD, ACCENT, DIM
+    import sys
 
     settings = get_settings()
     model_name = model or settings.ollama_model
 
     if interactive_mode:
         from audiobench.cli.wizard import prompt_transcription, prompt_string
-        import sys
         try:
             if not transcript_id:
                 transcript_id = prompt_transcription("Select a transcript to query")
-            if not question:
+            if not log and not question:
                 question = prompt_string("What is your question?")
         except KeyboardInterrupt:
             sys.exit(0)
 
-    if not transcript_id or not question:
+    if not transcript_id:
+        console.print(error_panel("Usage: audiobench ask [ID] [QUESTION]\nOr use --interactive"))
+        sys.exit(1)
+
+    if not log and not question:
         console.print(error_panel("Usage: audiobench ask [ID] [QUESTION]\nOr use --interactive"))
         sys.exit(1)
 
@@ -329,6 +335,36 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
     record = repo.get_by_id(transcript_id)
     if not record:
         console.print(error_panel("Not found", f"Transcript #{transcript_id} not found"))
+        return
+        
+    audio_file_id = record.get("audio_file_id")
+
+    if log:
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.models import AskLog, AskEntry
+        from rich.table import Table
+        
+        with get_session() as session:
+            ask_log = session.query(AskLog).filter_by(audio_file_id=audio_file_id).first()
+            if not ask_log or not ask_log.entries:
+                console.print(f"[dim]No ask log entries found for audio file #{audio_file_id}.[/]")
+                return
+                
+            table = Table(title=f"Ask Log for Audio #{audio_file_id}")
+            table.add_column("Date", style="dim")
+            table.add_column("Model", style="blue")
+            table.add_column("Question", style="green")
+            table.add_column("Answer")
+            
+            for entry in ask_log.entries:
+                table.add_row(
+                    entry.created_at.strftime("%Y-%m-%d %H:%M"),
+                    entry.model_name,
+                    entry.question,
+                    entry.answer[:100] + ("..." if len(entry.answer) > 100 else "")
+                )
+            
+            console.print(table)
         return
         
     if chapter is not None:
@@ -379,11 +415,126 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
             )
             return
 
-        for token in client.stream(prompt, system_prompt=TRANSCRIPT_SYSTEM):
-            console.print(token, end="")
+        import time as _time
+        from rich.live import Live
+        from rich.markdown import Markdown as RichMarkdown
+        from rich.padding import Padding
+        from rich.console import Group
+        from rich.text import Text
+        from audiobench.cli.display.theme import CHAT_CODE_THEME, DIM
+        
+        content_parts = []
+        token_count = 0
+        t_start = _time.monotonic()
+        
+        with Live(
+            console=console,
+            refresh_per_second=8,
+            transient=True,
+        ) as live:
+            for token in client.stream(prompt, system_prompt=TRANSCRIPT_SYSTEM):
+                content_parts.append(token)
+                token_count += 1
+                
+                full_text = "".join(content_parts)
+                preview_lines = full_text.splitlines()
+                display_parts = []
+                
+                if len(preview_lines) > 8:
+                    preview = "\n".join(preview_lines[-8:])
+                    display_parts.append(Text("  ⋮\n", style="dim"))
+                else:
+                    preview = full_text
+                    
+                display_parts.append(Text(preview))
+                elapsed_so_far = _time.monotonic() - t_start
+                tps_so_far = token_count / elapsed_so_far if elapsed_so_far > 0 else 0
+                display_parts.append(
+                    Text(
+                        f"\n  ▍ {token_count} tokens · {tps_so_far:.0f} tok/s",
+                        style="dim",
+                    )
+                )
+                live.update(Group(*display_parts))
 
+        final_md = "".join(content_parts)
+        console.print(
+            Padding(
+                RichMarkdown(final_md, code_theme=CHAT_CODE_THEME),
+                (0, 0, 0, 0),
+            )
+        )
+
+        elapsed = _time.monotonic() - t_start
+        if token_count > 0 and elapsed > 0:
+            tps = token_count / elapsed
+            console.print(
+                f"  [{DIM}]{token_count} tokens · {tps:.1f} tok/s · {elapsed:.1f}s[/]"
+            )
         console.print()
-        console.print()
+
+        # --- PHASE 5.3: Ask Log & Expression Wiring ---
+        from audiobench.chat.chat_store import ChatRepository
+        from audiobench.storage.expression_repository import ExpressionRepository
+        from audiobench.memory.enums import SourceType, RelationType
+        from audiobench.daemon.factory import get_daemon_client
+        from audiobench.core.logger_factory import get_logger
+        
+        _logger = get_logger("cmd.ask")
+        
+        audio_file_id = record.get("audio_file_id")
+        if audio_file_id:
+            chat_repo = ChatRepository()
+            log_id = chat_repo.get_or_create_ask_log(audio_file_id)
+            
+            expr_repo = ExpressionRepository()
+            
+            # 1. Register Query Expression
+            q_expr = expr_repo.register(
+                content=question,
+                source_type=SourceType.ASK_QUERY.value,
+                source_id=log_id,
+            )
+            
+            # 2. Register Answer Expression
+            a_expr = expr_repo.register(
+                content=final_md,
+                source_type=SourceType.ASK_ANSWER.value,
+                source_id=log_id,
+            )
+            
+            # 3. Link Query -> Answer (Wait, relation_type is source)
+            # Query is the source of the answer? No, Answer is derived from Query.
+            # Relation(from=a_expr, to=q_expr, type=source)
+            expr_repo.link(from_id=a_expr.id, to_id=q_expr.id, relation_type=RelationType.SOURCE.value)
+            
+            # 4. Link Answer -> Transcript Expression?
+            # To do this, we need the Tier 1 transcript expression. We don't have its ID immediately,
+            # but we can look it up or we can just link to the transcript ID in source_id (already done).
+            
+            chat_repo.add_ask_entry(
+                log_id=log_id,
+                question=question,
+                answer=final_md,
+                model_name=model_name,
+                question_expression_id=q_expr.id,
+                answer_expression_id=a_expr.id,
+            )
+            
+            try:
+                daemon = get_daemon_client()
+                daemon.embed(
+                    expression_id=q_expr.id,
+                    content=question,
+                    source_type=SourceType.ASK_QUERY,
+                )
+                daemon.embed(
+                    expression_id=a_expr.id,
+                    content=final_md,
+                    source_type=SourceType.ASK_ANSWER,
+                )
+            except Exception as ex:
+                _logger.warning("Daemon not available for ask query embedding: %s", ex)
 
     except AIError as e:
         console.print(error_panel("AI Error", str(e)))
@@ -448,6 +599,12 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
     default=None,
     help="Chat with a specific chapter",
 )
+@click.option(
+    "--summary",
+    type=int,
+    default=None,
+    help="View the session memoir for a conversation",
+)
 def chat(
     transcript_ids: tuple[int, ...],
     model: str | None,
@@ -459,6 +616,7 @@ def chat(
     delete_id: int | None,
     think: bool,
     chapter: int | None,
+    summary: int | None,
 ) -> None:
     """Interactive AI chat with transcript context.
 
@@ -511,6 +669,28 @@ def chat(
         return
 
     # ── Handle --delete ──
+    if summary is not None:
+        init_db()
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.models import ConversationSummary
+        from rich.panel import Panel
+        from rich.markdown import Markdown
+
+        with get_session() as session:
+            record = session.query(ConversationSummary).filter_by(conversation_id=summary).first()
+            if not record:
+                console.print(error_panel("Not found", f"Session summary for conversation #{summary} not found."))
+                import sys
+                sys.exit(1)
+
+            md = f"**Narrative**: {record.narrative}\n\n"
+            md += f"**Key Insights**: {record.key_insights}\n\n"
+            md += f"**Open Threads**: {record.open_threads}\n\n"
+            
+            console.print(Panel(Markdown(md), title=f"Session Summary #{summary}", border_style="blue"))
+        import sys
+        sys.exit(0)
+
     if delete_id is not None:
         if chat_repo.delete_conversation(delete_id):
             console.print(f"  [{SUCCESS}]✓ Deleted conversation #{delete_id}[/]")
@@ -964,6 +1144,62 @@ def chat(
     if not hasattr(session, "_compare_model"):
         session._compare_model = None  # noqa: SLF001
 
+    def _trigger_summary(conv_id: int, messages: list[dict], repo, settings) -> None:
+        """Trigger summary generation in a background thread."""
+        import threading
+        
+        def run_summary():
+            from audiobench.chat.summary_generator import SummaryGenerator
+            from audiobench.storage.expression_repository import ExpressionRepository
+            from audiobench.memory.enums import SourceType
+            from audiobench.daemon.factory import get_daemon_client
+            import json
+            
+            gen = SummaryGenerator()
+            result = gen.generate(messages)
+            if not result:
+                return
+                
+            # Update title
+            if result.refined_title:
+                repo.update_title(conv_id, result.refined_title)
+                
+            # Write Expression
+            expr_repo = ExpressionRepository()
+            expr = expr_repo.register(
+                content=result.narrative,
+                source_type=SourceType.SESSION_SUMMARY.value,
+                source_id=conv_id,
+                session_type="chat",
+                session_id=conv_id,
+            )
+            
+            # Save ConversationSummary record
+            repo.save_summary(
+                conversation_id=conv_id,
+                narrative=result.narrative,
+                drift_phases=json.dumps(result.drift_phases),
+                key_insights=json.dumps(result.key_insights),
+                open_threads=json.dumps(result.open_threads),
+                refined_title=result.refined_title,
+                generated_by=gen.model_name,
+                expression_id=expr.id,
+            )
+            
+            # Embed Expression
+            try:
+                daemon = get_daemon_client()
+                daemon.embed(
+                    expression_id=expr.id,
+                    content=result.narrative,
+                    source_type=SourceType.SESSION_SUMMARY,
+                )
+            except Exception as ex:
+                pass # Already logged by DaemonFactory/Client
+                
+        thread = threading.Thread(target=run_summary, daemon=True)
+        thread.start()
+
     while True:
         try:
             # Show comparison mode in prompt
@@ -982,6 +1218,9 @@ def chat(
                     f"#{session.conversation_id} saved "
                     f"({session.turn_count * 2} messages)[/]"
                 )
+                # --- PHASE 6.2/6.3: Wire Summary Trigger ---
+                if session.turn_count >= 3:
+                    _trigger_summary(session.conversation_id, session.messages, chat_repo, settings)
             console.print(f"  [{DIM}]Goodbye![/]")
             console.print()
             break
@@ -1030,6 +1269,9 @@ def chat(
                         f"({session.turn_count * 2} messages)"
                         f"[/]"
                     )
+                    # --- PHASE 6.2/6.3: Wire Summary Trigger ---
+                    if session.turn_count >= 3:
+                        _trigger_summary(session.conversation_id, session.messages, chat_repo, settings)
                 console.print(f"  [{DIM}]Goodbye![/]")
                 console.print()
                 break

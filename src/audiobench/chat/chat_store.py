@@ -90,6 +90,34 @@ class ChatRepository:
                 ).filter(ChatMessage.role != "system").count() + (1 if role != "system" else 0)
 
             session.commit()
+
+            # --- PHASE 5: Expression Registration ---
+            if role != "system":
+                try:
+                    from audiobench.storage.expression_repository import ExpressionRepository
+                    from audiobench.memory.enums import SourceType
+                    from audiobench.daemon.factory import get_daemon_client
+                    
+                    expr_repo = ExpressionRepository()
+                    expr = expr_repo.register(
+                        content=content,
+                        source_type=SourceType.CHAT_MESSAGE.value,
+                        source_id=msg.id,
+                        session_type="chat",
+                        session_id=conversation_id,
+                        speaker="assistant" if role == "assistant" else "user"
+                    )
+                    
+                    daemon = get_daemon_client()
+                    daemon.embed(
+                        expression_id=expr.id,
+                        content=content,
+                        source_type=SourceType.CHAT_MESSAGE,
+                        speaker="assistant" if role == "assistant" else "user"
+                    )
+                except Exception as e:
+                    logger.error("Failed to register chat message %d as expression: %s", msg.id, e)
+
             return msg.id
 
     def get_conversation(self, conversation_id: int) -> dict | None:
@@ -188,19 +216,63 @@ class ChatRepository:
                 session.commit()
 
     def delete_conversation(self, conversation_id: int) -> bool:
-        """Delete a conversation and all its messages.
-
-        Returns:
-            True if found and deleted, False if not found.
-        """
+        """Delete a conversation. Returns True if deleted."""
         with get_session() as session:
             conv = session.query(ChatConversation).filter_by(id=conversation_id).first()
-            if conv is None:
+            if not conv:
                 return False
+
             session.delete(conv)
             session.commit()
             logger.info("Deleted conversation #%d", conversation_id)
             return True
+
+    # ------------------------------------------------------------------
+    # Ask Log Operations
+    # ------------------------------------------------------------------
+
+    def get_or_create_ask_log(self, audio_file_id: int) -> int:
+        """Get the AskLog ID for an audio file, creating it if necessary."""
+        from audiobench.storage.models import AskLog
+        with get_session() as session:
+            log = session.query(AskLog).filter_by(audio_file_id=audio_file_id).first()
+            if log:
+                return log.id
+
+            log = AskLog(audio_file_id=audio_file_id, entry_count=0)
+            session.add(log)
+            session.commit()
+            return log.id
+
+    def add_ask_entry(
+        self,
+        log_id: int,
+        question: str,
+        answer: str,
+        model_name: str,
+        question_expression_id: int | None = None,
+        answer_expression_id: int | None = None,
+    ) -> int:
+        """Add an entry to an AskLog."""
+        from audiobench.storage.models import AskLog, AskEntry
+        with get_session() as session:
+            entry = AskEntry(
+                log_id=log_id,
+                question=question,
+                answer=answer,
+                model_name=model_name,
+                token_count=(len(question) + len(answer)) // 4,
+                question_expression_id=question_expression_id,
+                answer_expression_id=answer_expression_id,
+            )
+            session.add(entry)
+
+            log = session.query(AskLog).filter_by(id=log_id).first()
+            if log:
+                log.entry_count = session.query(AskEntry).filter_by(log_id=log_id).count() + 1
+
+            session.commit()
+            return entry.id
 
     def delete_all_conversations(self) -> int:
         """Delete all conversations. Returns number deleted."""
@@ -211,3 +283,48 @@ class ChatRepository:
             session.commit()
             logger.info("Deleted %d conversation(s)", count)
             return count
+
+    # ------------------------------------------------------------------
+    # Summary Operations
+    # ------------------------------------------------------------------
+
+    def save_summary(
+        self,
+        conversation_id: int,
+        narrative: str,
+        drift_phases: str,
+        key_insights: str,
+        open_threads: str,
+        refined_title: str | None,
+        generated_by: str,
+        expression_id: int | None = None,
+    ) -> int:
+        """Save a ConversationSummary."""
+        from audiobench.storage.models import ConversationSummary
+        with get_session() as session:
+            summary = session.query(ConversationSummary).filter_by(conversation_id=conversation_id).first()
+            if not summary:
+                summary = ConversationSummary(conversation_id=conversation_id)
+                session.add(summary)
+
+            summary.narrative = narrative
+            summary.drift_phases = drift_phases
+            summary.key_insights = key_insights
+            summary.open_threads = open_threads
+            if refined_title:
+                summary.refined_title = refined_title
+            summary.generated_by = generated_by
+            if expression_id is not None:
+                summary.expression_id = expression_id
+
+            session.commit()
+            return summary.id
+
+    def update_summary_expression(self, summary_id: int, expression_id: int) -> None:
+        """Update the expression ID for a ConversationSummary."""
+        from audiobench.storage.models import ConversationSummary
+        with get_session() as session:
+            summary = session.query(ConversationSummary).filter_by(id=summary_id).first()
+            if summary:
+                summary.expression_id = expression_id
+                session.commit()
