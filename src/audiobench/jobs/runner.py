@@ -43,7 +43,7 @@ def get_job_phase(job_id: int) -> str:
             return "starting"
         last_line = content.rsplit("\n", 1)[-1]
         parts = dict(p.split("=", 1) for p in last_line.split() if "=" in p)
-        
+
         if "progress" in parts:
             return f"{parts.get('phase', 'transcribing')} {parts['progress']}%"
         return parts.get("phase", "running")
@@ -54,25 +54,25 @@ def get_job_phase(job_id: int) -> str:
 def submit_job(args: list[str], audio_file: str | None = None) -> int:
     """Submit a command to run in the background."""
     repo = JobRepository()
-    
+
     # Strip "audiobench" prefix if present
     if args and args[0] == "audiobench":
         args = args[1:]
-        
+
     command_str = "audiobench " + " ".join(args)
     job_id = repo.create_job(command=command_str, audio_file=audio_file)
-    
+
     settings = get_settings()
     log_dir = settings.data_dir / "job_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    
+
     log_path = log_dir / f"job_{job_id}.log"
     events_path = log_dir / f"job_{job_id}.events"
-    
+
     # Pre-create files
     log_path.touch()
     events_path.touch()
-    
+
     # Add --job-id argument to the command so child process can self-report
     # We insert it right after the subcommand, e.g. "transcribe --job-id 7 file.mp4"
     child_args = [sys.executable, "-m", "audiobench"]
@@ -80,7 +80,7 @@ def submit_job(args: list[str], audio_file: str | None = None) -> int:
         child_args.append(args[0])  # subcommand
         child_args.extend(["--job-id", str(job_id)])
         child_args.extend(args[1:])
-    
+
     # Open log file and pass it to child; close OUR copy immediately after Popen
     # so only the child holds the fd open. This prevents a handle leak in the
     # parent process.
@@ -95,11 +95,7 @@ def submit_job(args: list[str], audio_file: str | None = None) -> int:
         kwargs["creationflags"] = 0x00000200
 
     proc = subprocess.Popen(
-        child_args,
-        stdout=log_file,
-        stderr=log_file,
-        stdin=subprocess.DEVNULL,
-        **kwargs
+        child_args, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL, **kwargs
     )
     log_file.close()  # Parent closes its copy — child still has it open
 
@@ -160,7 +156,7 @@ def startup_recovery() -> None:
     """Mark stale running jobs as failed."""
     repo = JobRepository()
     running_jobs = repo.get_running_jobs()
-    
+
     for job in running_jobs:
         pid = job.get("pid")
         if pid and not is_alive(pid):

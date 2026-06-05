@@ -14,10 +14,7 @@ logger = get_logger("storage.migrations.007")
 
 
 def _table_exists(cursor: sqlite3.Cursor, table: str) -> bool:
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table,)
-    )
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cursor.fetchone() is not None
 
 

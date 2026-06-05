@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException, Query
-from typing import List, Dict, Any, Optional
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
 
 from audiobench.core.db_engine import init_db
 from audiobench.storage.repository import TranscriptionRepository
@@ -10,20 +11,23 @@ router = APIRouter()
 init_db()
 repo = TranscriptionRepository()
 
+
 @router.get("/")
-def get_history(limit: int = 50, search: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_history(limit: int = 50, search: str | None = None) -> list[dict[str, Any]]:
     """Get transcription history, optionally filtered by search."""
     if search:
         return repo.search(search, limit=limit)
     return repo.get_history(limit=limit)
 
+
 @router.get("/{transcription_id}")
-def get_transcription(transcription_id: int) -> Dict[str, Any]:
+def get_transcription(transcription_id: int) -> dict[str, Any]:
     """Get a single transcription by ID."""
     data = repo.get_by_id(transcription_id)
     if not data:
         raise HTTPException(status_code=404, detail="Transcription not found")
     return data
+
 
 @router.delete("/{transcription_id}")
 def delete_transcription(transcription_id: int) -> dict:
@@ -32,6 +36,7 @@ def delete_transcription(transcription_id: int) -> dict:
     if not success:
         raise HTTPException(status_code=404, detail="Transcription not found")
     return {"status": "success", "id": transcription_id}
+
 
 @router.delete("/")
 def delete_all_history() -> dict:

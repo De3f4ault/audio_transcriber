@@ -8,7 +8,15 @@ from pathlib import Path
 
 import click
 
-from audiobench.cli.display.theme import ACCENT, BOLD, DIM, SUCCESS, WARNING, console, error_panel, make_table
+from audiobench.cli.display.theme import (
+    ACCENT,
+    DIM,
+    SUCCESS,
+    WARNING,
+    console,
+    error_panel,
+    make_table,
+)
 from audiobench.jobs.repository import JobRepository
 from audiobench.jobs.runner import get_job_phase, is_alive, startup_recovery, watch_job
 
@@ -20,15 +28,16 @@ def jobs(ctx: click.Context) -> None:
 
     Run without arguments to list recent jobs.
     """
-    from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
     import sys
-    
+
+    from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
+
     if not SUPPORTS_BACKGROUND_JOBS:
         console.print(f"  [{WARNING}]Background jobs are only supported on Linux/macOS.[/]")
         sys.exit(1)
 
     startup_recovery()
-    
+
     if ctx.invoked_subcommand is None:
         _list_jobs()
 
@@ -36,11 +45,11 @@ def jobs(ctx: click.Context) -> None:
 def _list_jobs() -> None:
     repo = JobRepository()
     all_jobs = repo.get_all_jobs(limit=20)
-    
+
     if not all_jobs:
         console.print(f"  [{DIM}]No recent jobs found[/]")
         return
-        
+
     table = make_table(
         "Background Jobs",
         [
@@ -49,9 +58,9 @@ def _list_jobs() -> None:
             ("Command", {}),
             ("Phase", {"width": 20}),
             ("Started", {"style": DIM}),
-        ]
+        ],
     )
-    
+
     for job in all_jobs:
         job_id = job["id"]
         status = job.get("status", "unknown")
@@ -61,9 +70,9 @@ def _list_jobs() -> None:
             cmd_str = cmd_str[11:]
         if len(cmd_str) > 40:
             cmd_str = cmd_str[:37] + "..."
-            
+
         started = str(job.get("started_at", ""))[:16]  # Trim seconds/microseconds
-        
+
         # Colorize status
         if status == "running":
             status_disp = f"[{ACCENT}]running[/]"
@@ -75,17 +84,11 @@ def _list_jobs() -> None:
             status_disp = f"[{WARNING}]cancelled[/]"
         else:
             status_disp = status
-            
+
         phase = get_job_phase(job_id) if status == "running" else ""
-        
-        table.add_row(
-            f"#{job_id}",
-            status_disp,
-            cmd_str,
-            phase,
-            started
-        )
-        
+
+        table.add_row(f"#{job_id}", status_disp, cmd_str, phase, started)
+
     console.print(table)
 
 
@@ -134,6 +137,7 @@ def cancel(job_id: int) -> None:
 
             # Wait, then SIGKILL if still alive
             import time
+
             time.sleep(1)
             if is_alive(pid):
                 os.killpg(pid, signal.SIGKILL)
@@ -148,7 +152,7 @@ def cancel(job_id: int) -> None:
     with repo._get_conn() as conn:
         conn.execute(
             "UPDATE jobs SET status = 'cancelled', ended_at = CURRENT_TIMESTAMP, exit_code = 130 WHERE id = ?",
-            (job_id,)
+            (job_id,),
         )
     console.print(f"  [{SUCCESS}]Job #{job_id} cancelled[/]")
 

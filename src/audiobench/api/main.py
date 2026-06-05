@@ -2,14 +2,11 @@
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import os
 
-from audiobench.api.routes import transcribe, settings, history, chat
+from audiobench.api.routes import chat, history, settings, transcribe
 
 app = FastAPI(
-    title="AudioBench API",
-    version="2.0.0",
-    description="Offline AI audio toolkit — REST API"
+    title="AudioBench API", version="2.0.0", description="Offline AI audio toolkit — REST API"
 )
 
 # Allow CORS for Vite frontend during development
@@ -25,6 +22,7 @@ app.include_router(transcribe.router, prefix="/api/transcribe", tags=["transcrib
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(history.router, prefix="/api/history", tags=["history"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
+
 
 @app.get("/api/health")
 def health_check() -> dict:

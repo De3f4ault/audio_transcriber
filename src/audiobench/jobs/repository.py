@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
 
-from audiobench.core.db_engine import get_engine
 from audiobench.core.settings import get_settings
 
 
@@ -33,7 +31,7 @@ class JobRepository:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO jobs (command, audio_file, status, started_at) VALUES (?, ?, 'running', CURRENT_TIMESTAMP)",
-                (command, audio_file)
+                (command, audio_file),
             )
             return cursor.lastrowid
 
@@ -41,21 +39,21 @@ class JobRepository:
         with self._get_conn() as conn:
             conn.execute(
                 "UPDATE jobs SET pid = ?, log_path = ?, events_path = ?, status = 'running' WHERE id = ?",
-                (pid, log_path, events_path, job_id)
+                (pid, log_path, events_path, job_id),
             )
 
     def mark_job_failed(self, job_id: int, exit_code: int | None = None) -> None:
         with self._get_conn() as conn:
             conn.execute(
                 "UPDATE jobs SET status = 'failed', ended_at = CURRENT_TIMESTAMP, exit_code = ? WHERE id = ?",
-                (exit_code, job_id)
+                (exit_code, job_id),
             )
 
     def mark_job_done(self, job_id: int) -> None:
         with self._get_conn() as conn:
             conn.execute(
                 "UPDATE jobs SET status = 'done', ended_at = CURRENT_TIMESTAMP, exit_code = 0 WHERE id = ?",
-                (job_id,)
+                (job_id,),
             )
 
     def get_job(self, job_id: int) -> dict | None:
