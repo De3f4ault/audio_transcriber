@@ -1,19 +1,48 @@
 """REPL session state — holds mutable state across the interactive session.
 
 Provides:
-    - ReplSession: Mutable state container (context, history, navigation)
+    - NavigationFrame: Immutable snapshot of one level of the navigation stack
+    - ReplSession: Mutable state container (context, history, navigation stack)
     - CONTEXT_AWARE_COMMANDS: Set of commands that accept a transcript ID
 """
 
 from __future__ import annotations
 
 import contextlib
-import readline
+import json
+import contextlib
+import json
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
 
 import click
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
 
-from audiobench.cli.display.theme import WARNING, console
+from audiobench.cli.display.theme import DIM, SUCCESS, WARNING, console
 from audiobench.core.focused_entity import FocusedEntity
+
+
+# ── Navigation Stack ─────────────────────────────────────────
+
+
+@dataclass
+class NavigationFrame:
+    """Frozen snapshot of one level of the navigation stack.
+
+    When a command pushes a frame before launching a sub-command,
+    the frame captures the context label and any state needed to
+    resume (scroll position, selected ID, wizard step, etc.).
+
+    The ``resumed`` flag is set to True when the frame is popped,
+    so the relaunched command knows it is re-entering, not starting fresh.
+    """
+
+    context: str
+    state: dict = field(default_factory=dict)
+    resumed: bool = False
+    intent: str = ""
 
 # ── Commands that accept a transcript ID as first positional arg ──
 # When context is set and no ID is given, the REPL auto-injects it.
@@ -35,17 +64,22 @@ class ReplSession:
 
     def __init__(self, cli_group: click.Group) -> None:
         self.cli_group = cli_group
-        self.focus: FocusedEntity | None = None
+        self._root_focus: FocusedEntity | None = None
 
         # Use settings.data_dir for REPL history (project-local)
         from audiobench.core.settings import get_settings
 
-        self._history_file = get_settings().data_dir / "repl_history"
-        self._history_file.parent.mkdir(parents=True, exist_ok=True)
+        _data_dir = get_settings().data_dir
+        _data_dir.mkdir(parents=True, exist_ok=True)
+        self._history_file = _data_dir / "repl_history"
         self._repo = None
         self._command_count = 0
         self._history_ids: list[int] = []  # for .next / .prev navigation
         self._history_cursor: int = -1
+
+        # ── Navigation stack ──
+        self.navigation_stack: deque[NavigationFrame] = deque()
+        self._stack_path = _data_dir / "session_stack.json"
 
     def _get_repo(self):
         """Lazy-init the transcription repository."""
@@ -67,6 +101,38 @@ class ReplSession:
         except Exception:
             self._history_ids = []
 
+    # ── Focus ──
+    @property
+    def focus(self) -> FocusedEntity | None:
+        for frame in reversed(self.navigation_stack):
+            focus_dict = frame.state.get("focus")
+            if focus_dict:
+                return FocusedEntity(
+                    id=focus_dict["id"],
+                    type=focus_dict["type"],
+                    label=focus_dict.get("label", f"{focus_dict['type'].title()} #{focus_dict['id']}"),
+                    chapter_index=focus_dict.get("chapter_index"),
+                    chapter_title=focus_dict.get("chapter_title")
+                )
+        return self._root_focus
+
+    @focus.setter
+    def focus(self, value: FocusedEntity | None) -> None:
+        if not self.navigation_stack:
+            self._root_focus = value
+        else:
+            if value is None:
+                self.navigation_stack[-1].state.pop("focus", None)
+            else:
+                self.navigation_stack[-1].state["focus"] = {
+                    "id": value.id,
+                    "type": value.type,
+                    "label": value.label,
+                    "chapter_index": value.chapter_index,
+                    "chapter_title": value.chapter_title
+                }
+            self._persist_stack()
+
     # ── Prompt ──
 
     @property
@@ -78,20 +144,23 @@ class ReplSession:
             return self.focus.id
         if self.focus.type == "file":
             repo = self._get_repo()
-            
+
             # If a chapter is focused, get the transcript ID of THAT chapter!
             if self.focus.chapter_index is not None:
+                from audiobench.core.db_session import get_session
                 from audiobench.storage.chapter_repository import get_chapter_repo
                 from audiobench.storage.models import ChapterRecord
-                from audiobench.core.db_session import get_session
-                chap = get_chapter_repo().get_chapter_by_index(self.focus.id, self.focus.chapter_index)
+
+                chap = get_chapter_repo().get_chapter_by_index(
+                    self.focus.id, self.focus.chapter_index
+                )
                 if chap and chap.id:
                     with get_session() as db:
                         rec = db.query(ChapterRecord).filter_by(id=chap.id).first()
                         if rec and rec.transcription_id:
                             return rec.transcription_id
                 return None
-                
+
             tx = repo.get_latest_transcript_for_file(self.focus.id)
             return tx["id"] if tx else None
         return None
@@ -101,11 +170,11 @@ class ReplSession:
         if not self.focus or self.focus.type != "file":
             console.print(f"  [{WARNING}]You must focus on an audio file first.[/]")
             return False
-            
+
         self.focus.chapter_index = chapter_index
         self.focus.chapter_title = chapter_title
         return True
-        
+
     def clear_chapter_focus(self) -> None:
         """Clear the currently focused chapter."""
         if self.focus:
@@ -113,23 +182,39 @@ class ReplSession:
             self.focus.chapter_title = None
 
     @property
-    def prompt(self) -> str:
-        # Check for active background jobs
+    def prompt(self) -> Any:
+        """Return the dynamic prompt, formatted for prompt_toolkit."""
+        # Navigation depth signal: [↓2] when inside the stack
         job_badge = ""
         try:
-            from audiobench.jobs.repository import JobRepository
-            running = JobRepository().get_running_jobs()
-            if running:
-                n = len(running)
-                label = "job" if n == 1 else "jobs"
-                job_badge = f"\001\033[33m\002[{n} {label}]\001\033[0m\002 "
+            from audiobench.core.settings import get_settings
+            from pathlib import Path
+
+            active_file = Path(get_settings().data_dir) / "jobs.active"
+            if active_file.exists():
+                count = active_file.read_text().strip()
+                if count.isdigit() and int(count) > 0:
+                    n = int(count)
+                    label = "job" if n == 1 else "jobs"
+                    job_badge = f"<ansiyellow>[{n} {label}]</ansiyellow> "
         except Exception:
             pass
 
+        # Navigation depth signal: [↓2] when inside the stack
+        depth = len(self.navigation_stack)
+        depth_badge = f"<style color='gray'>↓{depth}</style> " if depth > 0 else ""
+
         if self.focus:
             label = self.focus.display_label
-            return f"{job_badge}\001\033[1;36m\002{label}\001\033[0m\002 \001\033[1;35m\002❯\001\033[0m\002 "
-        return f"{job_badge}\001\033[1;35m\002❯\001\033[0m\002 "
+            # Escape HTML characters in label just in case
+            label = label.replace("<", "&lt;").replace(">", "&gt;")
+            return HTML(
+                f"{job_badge}"
+                f"<ansicyan><b>{label}</b></ansicyan> "
+                f"{depth_badge}"
+                f"<ansimagenta><b>❯</b></ansimagenta> "
+            )
+        return HTML(f"{job_badge}{depth_badge}<ansimagenta><b>❯</b></ansimagenta> ")
 
     # ── Variable expansion ──
 
@@ -158,17 +243,17 @@ class ReplSession:
                 if not arg.startswith("-"):
                     has_files = True
                     break
-                    
+
             injections = []
             if not has_files:
                 repo = self._get_repo()
                 audio_file = repo.get_audio_file(self.focus.id)
                 if audio_file and audio_file.get("file_path"):
                     injections.append(str(audio_file["file_path"]))
-                    
+
             if self.focus.chapter_index is not None and "--chapters" not in rest:
                 injections.extend(["--chapters", str(self.focus.chapter_index)])
-                
+
             return [cmd_name] + injections + rest
 
         if cmd_name not in CONTEXT_AWARE_COMMANDS:
@@ -187,7 +272,7 @@ class ReplSession:
         """Set the current context using a transcript ID."""
         repo = self._get_repo()
         record = repo.get_by_id(record_id)
-        
+
         if not record:
             console.print(f"  [{WARNING}]Transcript #{record_id} not found[/]")
             return
@@ -198,22 +283,20 @@ class ReplSession:
             audio_file = repo.get_audio_file(audio_file_id)
             if audio_file:
                 self.focus = FocusedEntity(
-                    type="file", 
-                    id=audio_file_id, 
-                    label=audio_file["file_name"]
+                    type="file", id=audio_file_id, label=audio_file["file_name"]
                 )
             else:
                 # Fallback if DB is inconsistent
                 self.focus = FocusedEntity(
-                    type="transcript", 
-                    id=record_id, 
-                    label=record.get("file_name", f"Transcript #{record_id}")
+                    type="transcript",
+                    id=record_id,
+                    label=record.get("file_name", f"Transcript #{record_id}"),
                 )
         else:
             self.focus = FocusedEntity(
-                type="transcript", 
-                id=record_id, 
-                label=record.get("file_name", f"Transcript #{record_id}")
+                type="transcript",
+                id=record_id,
+                label=record.get("file_name", f"Transcript #{record_id}"),
             )
 
         # Update navigation cursor
@@ -230,13 +313,70 @@ class ReplSession:
         # Refresh logic is implicit now since last_id fetches live from DB
         pass
 
-    # ── Readline history ──
+    # ── Navigation stack ─────────────────────────────────────
 
-    def load_history(self) -> None:
-        with contextlib.suppress(FileNotFoundError):
-            readline.read_history_file(str(self._history_file))
-        readline.set_history_length(1000)
+    def push_frame(self, frame: NavigationFrame) -> None:
+        """Push a context frame onto the navigation stack and persist to disk."""
+        if "focus" not in frame.state and self.focus:
+            f = self.focus
+            frame.state["focus"] = {
+                "id": f.id,
+                "type": f.type,
+                "chapter_index": f.chapter_index,
+                "chapter_title": f.chapter_title
+            }
+        self.navigation_stack.append(frame)
+        self._persist_stack()
 
-    def save_history(self) -> None:
-        with contextlib.suppress(OSError):
-            readline.write_history_file(str(self._history_file))
+    def pop_frame(self) -> NavigationFrame | None:
+        """Pop the top frame. Sets resumed=True on it. Returns None at top level."""
+        if not self.navigation_stack:
+            return None
+        frame = self.navigation_stack.pop()
+        frame.resumed = True
+        self._persist_stack()
+        return frame
+
+    def _persist_stack(self) -> None:
+        """Serialize the navigation stack to disk for crash recovery."""
+        frames = [
+            {"context": f.context, "state": f.state, "resumed": f.resumed}
+            for f in self.navigation_stack
+        ]
+        try:
+            self._stack_path.write_text(json.dumps(frames, default=str))
+        except Exception:
+            pass
+
+    def maybe_resume(self) -> bool:
+        """On startup, check for an interrupted session and offer to restore it."""
+        if not self._stack_path.exists():
+            return False
+        try:
+            data = self._stack_path.read_text().strip()
+            if not data:
+                return False
+            frames = json.loads(data)
+            if not frames:
+                return False
+            count = len(frames)
+            console.print(
+                f"\n  [{WARNING}]Interrupted session found[/] [{DIM}]({count} frame(s)).[/]"
+            )
+            confirm = input("  Resume? [Y/n] ").strip().lower()
+            if confirm in ("", "y", "yes"):
+                self.navigation_stack = deque(
+                    NavigationFrame(**f) for f in frames
+                )
+                console.print(f"  [{SUCCESS}]✓ Session restored.[/]\n")
+                return True
+            self._stack_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+    # ── History ──
+
+    def get_history(self) -> FileHistory:
+        """Return a prompt_toolkit FileHistory instance."""
+        return FileHistory(str(self._history_file))

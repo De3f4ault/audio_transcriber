@@ -83,10 +83,29 @@ class DefaultGroup(click.Group):
         groups = {
             "Core Actions": ["repl", "transcribe", "listen"],
             "Analysis & Exploration": [
-                "ask", "chat", "summarize", "vocab", "bookmark", "analyze", "inspect", "audio", "play", "speak"
+                "ask",
+                "chat",
+                "summarize",
+                "vocab",
+                "bookmark",
+                "analyze",
+                "inspect",
+                "audio",
+                "play",
+                "speak",
             ],
             "Data & Management": ["history", "search", "export", "delete", "show", "clean"],
-            "Configuration & Jobs": ["config", "jobs", "download", "system", "info", "doctor", "cleanup", "preset", "status"]
+            "Configuration & Jobs": [
+                "config",
+                "jobs",
+                "download",
+                "system",
+                "info",
+                "doctor",
+                "cleanup",
+                "preset",
+                "status",
+            ],
         }
 
         categorized = {k: [] for k in groups}

@@ -45,7 +45,9 @@ class ChapterRepository:
 
     # ── Write ────────────────────────────────────────────────
 
-    def save_chapters(self, audio_file_id: int, chapters: list[ChapterInfo] | list[dict]) -> list[ChapterInfo]:
+    def save_chapters(
+        self, audio_file_id: int, chapters: list[ChapterInfo] | list[dict]
+    ) -> list[ChapterInfo]:
         """Save chapters for an audio file, replacing any existing ones.
 
         Accepts either ``ChapterInfo`` instances or plain dicts with the same keys.

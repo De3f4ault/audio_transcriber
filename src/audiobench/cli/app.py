@@ -26,7 +26,7 @@ from audiobench.core.logger_factory import setup_logging
 @click.pass_context
 def cli(ctx: click.Context, verbose: bool, debug: bool, json_mode: bool) -> None:
     """AudioBench — offline audio workbench.
-    
+
     Launch the interactive REPL (default):
       audiobench
 
@@ -48,6 +48,7 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, json_mode: bool) -> None
       audiobench export 3 --interactive                 Re-export transcript
     """
     import os
+
     os.environ["HF_HUB_OFFLINE"] = "0"
     os.environ["TRANSFORMERS_OFFLINE"] = "0"
 

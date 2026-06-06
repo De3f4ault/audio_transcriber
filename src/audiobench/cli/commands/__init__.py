@@ -40,10 +40,11 @@ def register_all(cli: click.Group) -> None:
         # Find all Click commands/groups at module level
         # First, find all groups to collect their subcommands
         groups = [
-            getattr(module, name) for name in dir(module)
+            getattr(module, name)
+            for name in dir(module)
             if not name.startswith("_") and isinstance(getattr(module, name), _click.Group)
         ]
-        
+
         subcommands = set()
         for g in groups:
             subcommands.update(g.commands.values())

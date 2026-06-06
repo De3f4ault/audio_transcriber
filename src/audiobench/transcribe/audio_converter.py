@@ -865,10 +865,14 @@ def split_audio(
         cmd = [
             "ffmpeg",
             "-y",
-            "-ss", str(offset),
-            "-t", str(dur),
-            "-i", str(input_path),
-            "-c", "copy",
+            "-ss",
+            str(offset),
+            "-t",
+            str(dur),
+            "-i",
+            str(input_path),
+            "-c",
+            "copy",
             str(chunk_path),
         ]
 
@@ -884,7 +888,10 @@ def split_audio(
         chunks.append((chunk_path, offset))
         logger.info(
             "Split chunk %d: offset=%.1fs, duration=%.1fs → %s",
-            idx, offset, dur, chunk_path.name,
+            idx,
+            offset,
+            dur,
+            chunk_path.name,
         )
 
         idx += 1

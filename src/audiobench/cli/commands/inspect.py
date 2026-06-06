@@ -113,14 +113,13 @@ def inspect(
             for p in generated:
                 console.print(f"    [{ACCENT}]{p.name}[/] ({format_size(p.stat().st_size)})")
             console.print()
-            
+
             # Print chapters if any
-            from audiobench.core.db_engine import init_db
-            from audiobench.storage.repository import AudioFileRecord
+            from audiobench.cli.display.theme import format_duration, make_table
+            from audiobench.core.db_engine import get_session, init_db
             from audiobench.storage.chapter_repository import get_chapter_repo
+            from audiobench.storage.repository import AudioFileRecord
             from audiobench.storage.utils import get_file_hash
-            from audiobench.core.db_engine import get_session
-            from audiobench.cli.display.theme import make_table, format_duration
 
             init_db()
             fhash = get_file_hash(file_path)
@@ -131,9 +130,12 @@ def inspect(
                     if chapters:
                         # Also query raw DB records for transcription_id (not on ChapterInfo)
                         from audiobench.storage.models import ChapterRecord
+
                         tx_ids = {
                             r.chapter_index: r.transcription_id
-                            for r in session.query(ChapterRecord).filter_by(audio_file_id=audio.id).all()
+                            for r in session.query(ChapterRecord)
+                            .filter_by(audio_file_id=audio.id)
+                            .all()
                         }
                         table = make_table(
                             f"Chapters for {file_path.name}",

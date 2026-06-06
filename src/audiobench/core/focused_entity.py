@@ -3,16 +3,18 @@
 from dataclasses import dataclass
 from typing import Literal
 
+
 @dataclass
 class FocusedEntity:
     """The root context for the current REPL session.
-    
+
     A session is almost always focused on a file. The transcript ID
     is treated as a derived property of the focused file.
     """
+
     type: Literal["file", "transcript", "project"]
-    id: int      # AudioFileRecord.id or TranscriptionRecord.id
-    label: str   # e.g., "meeting.mp4" or "Transcript #42"
+    id: int  # AudioFileRecord.id or TranscriptionRecord.id
+    label: str  # e.g., "meeting.mp4" or "Transcript #42"
     chapter_index: int | None = None
     chapter_title: str | None = None
 

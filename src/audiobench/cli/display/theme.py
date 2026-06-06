@@ -13,6 +13,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
+from rich import box
+
+# Use SQUARE box style across the app because rounded corners often have gaps in some terminal fonts
+BOX_STYLE = box.SQUARE
 
 # ── Shared console ──────────────────────────────────────────
 console = Console(stderr=True)  # Chrome → stderr (keeps stdout clean for piping)
@@ -66,13 +70,13 @@ def app_header(subtitle: str = "") -> Panel:
     content = f"[{BOLD} {ACCENT}]{APP_NAME}[/]"
     if subtitle:
         content += f"\n[{DIM}]{subtitle}[/]"
-    return Panel(content, border_style=DIM, expand=False)
+    return Panel(content, border_style=DIM, expand=False, box=BOX_STYLE)
 
 
 def summary_panel(lines: list[str], title: str = "Summary") -> Panel:
     """Build a consistent summary panel."""
     content = "\n".join(lines)
-    return Panel(content, title=f"[{BOLD}]{title}[/]", border_style=DIM, expand=False)
+    return Panel(content, title=f"[{BOLD}]{title}[/]", border_style=DIM, expand=False, box=BOX_STYLE)
 
 
 def error_panel(message: str, detail: str = "") -> Panel:
@@ -80,7 +84,7 @@ def error_panel(message: str, detail: str = "") -> Panel:
     content = f"[{ERROR}]✗ {message}[/]"
     if detail:
         content += f"\n[{DIM}]{detail}[/]"
-    return Panel(content, border_style=ERROR, expand=False)
+    return Panel(content, border_style=ERROR, expand=False, box=BOX_STYLE)
 
 
 def format_duration(seconds: float) -> str:

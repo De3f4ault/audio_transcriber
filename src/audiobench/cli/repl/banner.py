@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import datetime
 
-import random
-
 from audiobench.cli.display.theme import (
     ACCENT,
     APP_NAME,
@@ -15,21 +13,26 @@ from audiobench.cli.display.theme import (
     console,
     format_duration,
 )
-from audiobench.cli.repl.dot_commands import DOT_COMMANDS
 from audiobench.cli.repl.session import ReplSession
 
 
 def print_banner(session: ReplSession) -> None:
     cmd_count = len(session.cli_group.commands)
-    dot_count = len(DOT_COMMANDS)
 
-    console.print(f"""
-  [{BOLD}][{ACCENT}]╭────────────────────────────────────────────╮[/][/]
-  [{BOLD}][{ACCENT}]│  {APP_NAME} REPL{" " * 31}│[/][/]
-  [{BOLD}][{ACCENT}]│  v{APP_VERSION}  •  {cmd_count} commands  \
-•  {dot_count} dot-commands{" " * 6}│[/][/]
-  [{BOLD}][{ACCENT}]╰────────────────────────────────────────────╯[/][/]
-""")
+    from audiobench.cli.display.theme import BOX_STYLE
+    from rich.panel import Panel
+
+    content = f"[{BOLD}][{ACCENT}]v{APP_VERSION}  •  {cmd_count} commands[/][/]"
+    console.print(
+        Panel(
+            content,
+            title=f"[{BOLD}][{ACCENT}]{APP_NAME} REPL[/][/]",
+            title_align="left",
+            border_style=ACCENT,
+            box=BOX_STYLE,
+            expand=False,
+        )
+    )
 
 
 def print_full_help(session: ReplSession) -> None:
@@ -54,22 +57,30 @@ def print_full_help(session: ReplSession) -> None:
      [{ACCENT}]show[/]   [{ACCENT}]ask "..."[/]   [{ACCENT}]summarize[/]   \
 [{ACCENT}]vocab[/]   [{ACCENT}]export -f srt[/]
 
-  [{BOLD}]3. Dot commands[/] [{DIM}](quick actions on context)[/]
-     [{ACCENT}].stats[/]  [{ACCENT}].show[/]  [{ACCENT}].segments[/]  \
-[{ACCENT}].vocab[/]  [{ACCENT}].info[/]  [{ACCENT}].find "..."[/]
-     [{ACCENT}].play[/]  [{ACCENT}].play 01:25[/]  [{ACCENT}].play segment 3[/]  \
-[{ACCENT}].open[/]  [{ACCENT}].path[/]
-     [{ACCENT}].ask "..."[/]  [{ACCENT}].chat[/]  [{ACCENT}].summarize[/]  \
-[{ACCENT}].export srt[/]  [{ACCENT}].edit[/]
-     [{ACCENT}].use <ID>[/]  [{ACCENT}].clear[/]  [{ACCENT}].next[/]  \
-[{ACCENT}].prev[/]  [{ACCENT}].recent[/]  [{ACCENT}].search "..."[/]
+  [{BOLD}]3. Context commands[/] [{DIM}](quick actions on context)[/]
+     [{ACCENT}]\\stats[/]  [{ACCENT}]\\show[/]  [{ACCENT}]\\focus[/]  \
+[{ACCENT}]\\ls[/]
+     [{ACCENT}]\\ask "..."[/]  [{ACCENT}]\\chat[/]  [{ACCENT}]\\summarize[/]  \
+[{ACCENT}]\\search[/]  [{ACCENT}]\\help[/]
 
-  [{BOLD}]4. Shortcuts[/]
+  [{BOLD}]4. Shell Passthrough[/]
+     [{ACCENT}]!ls -la[/]  [{ACCENT}]!pwd[/]  [{ACCENT}]!ffmpeg -i ...[/]
+
+  [{BOLD}]5. Dot-commands — Semantic Layer[/]
+     [{ACCENT}].search[/] [{DIM}]"concept"[/]   LanceDB ANN — cross-source, no LLM
+     [{ACCENT}].help[/]               Dot-command reference
+
+  [{BOLD}]6. Search Modes[/]
+     [{ACCENT}]\\search[/] [{DIM}]"keyword"[/]  SQLite FTS — instant, exact text
+     [{ACCENT}].search[/] [{DIM}]"concept"[/]  LanceDB    — semantic, all sources
+     [{ACCENT}]?[/] [{DIM}]"question"[/]       LLM synthesis — generates answer
+
+  [{BOLD}]7. Shortcuts[/]
      [{ACCENT}]$last[/]  Expands to context ID ({ctx_label})
      [{ACCENT}]? ...[/]  AI question shorthand: \
 [{ACCENT}]? what are the key points?[/]
 
-  [{BOLD}]5. Meta[/]
+  [{BOLD}]8. Meta[/]
      [{ACCENT}]help[/] [{ACCENT}]/help[/]  This help       \
 [{ACCENT}]/commands[/]  All commands
      [{ACCENT}]/clear[/]  Clear screen     \
@@ -128,19 +139,25 @@ def print_onboarding(session: ReplSession) -> None:
                 f"[{ACCENT}]help[/] [{DIM}]for guide.[/]"
             )
             # Rotating daily tip
-            console.print(
-                f"  [{DIM}]━━ Today's tip:[/] {_pick_tip()}"
-            )
+            console.print(f"  [{DIM}]━━ Today's tip:[/] {_pick_tip()}")
         else:
             # ── First-run: focused getting-started guide ──
             console.print(f"  [{BOLD}]Welcome to AudioBench![/]")
             console.print()
             console.print(f"  [{DIM}]Get started in 3 steps:[/]")
-            console.print(f"    [{ACCENT}]1.[/] [{DIM}]Drop a file in:[/]  [{ACCENT}]work interview.mp3[/]")
-            console.print(f"    [{ACCENT}]2.[/] [{DIM}]Transcribe it:[/]  [{ACCENT}]transcribe[/]  [{DIM}](or[/] [{ACCENT}]transcribe --interactive[/] [{DIM}]for guided setup)[/]")
-            console.print(f"    [{ACCENT}]3.[/] [{DIM}]Ask questions:[/] [{ACCENT}]? what were the main points?[/]")
+            console.print(
+                f"    [{ACCENT}]1.[/] [{DIM}]Drop a file in:[/]  [{ACCENT}]work interview.mp3[/]"
+            )
+            console.print(
+                f"    [{ACCENT}]2.[/] [{DIM}]Transcribe it:[/]  [{ACCENT}]transcribe[/]  [{DIM}](or[/] [{ACCENT}]transcribe --interactive[/] [{DIM}]for guided setup)[/]"
+            )
+            console.print(
+                f"    [{ACCENT}]3.[/] [{DIM}]Ask questions:[/] [{ACCENT}]? what were the main points?[/]"
+            )
             console.print()
-            console.print(f"  [{DIM}]Type[/] [{ACCENT}]help[/] [{DIM}]for a full guide, or[/] [{ACCENT}]/commands[/] [{DIM}]to see everything.[/]")
+            console.print(
+                f"  [{DIM}]Type[/] [{ACCENT}]help[/] [{DIM}]for a full guide, or[/] [{ACCENT}]/commands[/] [{DIM}]to see everything.[/]"
+            )
     except Exception:
         console.print(
             f"  [{DIM}]Type[/] [{ACCENT}]help[/] "

@@ -142,7 +142,7 @@ class TranscriptionRecord(Base):
     language: Mapped[str] = mapped_column(String(10), default="en", index=True)
     language_probability: Mapped[float] = mapped_column(Float, default=0.0)
     engine: Mapped[str] = mapped_column(String(64), default="faster-whisper")
-    model_name: Mapped[str] = mapped_column(String(64), default="medium")
+    model_name: Mapped[str] = mapped_column(String(64), default="large-v3-turbo")
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     word_count: Mapped[int] = mapped_column(Integer, default=0)
     segment_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -491,8 +491,9 @@ class StagingCartItem(Base):
         Integer, ForeignKey("audio_files.id", ondelete="CASCADE"), nullable=False, unique=True
     )
     engine: Mapped[str] = mapped_column(String(64), default="gemini")
-    model_name: Mapped[str] = mapped_column(String(64), default="medium")
+    model_name: Mapped[str] = mapped_column(String(64), default="large-v3-turbo")
     speed_preset: Mapped[str] = mapped_column(String(64), default="balanced")
+    strategy: Mapped[str] = mapped_column(String(64), default="batch")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
     # Relationships
@@ -512,6 +513,7 @@ class JobQueueItem(Base):
     engine: Mapped[str | None] = mapped_column(String(64), nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     speed_preset: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), default="pending"
     )  # pending, processing, done, failed

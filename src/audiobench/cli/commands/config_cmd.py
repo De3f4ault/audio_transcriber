@@ -81,38 +81,47 @@ def preset() -> None:
       audiobench transcribe file.m4a --preset meeting
     """
 
+
 # ── Config Group ────────────────────────────────────────────
 
+
 @click.group(invoke_without_command=True)
-@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Launch interactive setup wizard")
+@click.option(
+    "-i", "--interactive", "interactive_mode", is_flag=True, help="Launch interactive setup wizard"
+)
 @click.pass_context
 def config(ctx: click.Context, interactive_mode: bool) -> None:
     """Manage global application settings.
-    
+
     \b
     Examples:
       audiobench config --interactive
       audiobench config set gemini_model gemini-2.0-flash
     """
     if interactive_mode or ctx.invoked_subcommand is None:
-        from audiobench.cli.wizard import prompt_string, prompt_menu
-        from audiobench.core.settings import get_settings, AudioBenchSettings
         import sys
-        
+
+        from audiobench.cli.wizard import prompt_menu, prompt_string
+        from audiobench.core.settings import AudioBenchSettings, get_settings
+
         settings = get_settings()
         data = settings.model_dump()
-        
+
         console.print(f"\n  [{BOLD} {ACCENT}]AudioBench Config Wizard[/]")
-        
+
         try:
             current_hf = data.get("hf_token", "") or ""
-            hf = prompt_string(f"Hugging Face Token (for diarization) [{current_hf}]", default=current_hf)
-            if hf: data["hf_token"] = hf
-            
+            hf = prompt_string(
+                f"Hugging Face Token (for diarization) [{current_hf}]", default=current_hf
+            )
+            if hf:
+                data["hf_token"] = hf
+
             current_gemini = data.get("gemini_model", "gemini-2.0-flash")
             gemini = prompt_string(f"Gemini Model [{current_gemini}]", default=current_gemini)
-            if gemini: data["gemini_model"] = gemini
-            
+            if gemini:
+                data["gemini_model"] = gemini
+
             data["default_model"] = prompt_menu(
                 "Default Whisper Model",
                 [
@@ -121,41 +130,42 @@ def config(ctx: click.Context, interactive_mode: bool) -> None:
                     ("small", "Good balance", "small"),
                     ("large-v3-turbo", "High accuracy, slower", "large-v3-turbo"),
                 ],
-                default_idx=3
+                default_idx=3,
             )
-            
+
             updated = AudioBenchSettings(**data)
             updated.save()
             console.print(f"\n  [{SUCCESS}]✓ Configuration saved to {settings.config_file}[/]")
-            
+
         except KeyboardInterrupt:
             sys.exit(0)
+
 
 @config.command("set")
 @click.argument("key")
 @click.argument("value")
 def config_set(key: str, value: str) -> None:
     """Set a global configuration value and save to settings.json."""
-    from audiobench.core.settings import get_settings, AudioBenchSettings
-    
+    from audiobench.core.settings import AudioBenchSettings, get_settings
+
     current_settings = get_settings()
-    
+
     if not hasattr(current_settings, key):
         console.print(error_panel("Unknown setting", f"'{key}' is not a valid configuration key."))
         return
-        
+
     # Get current data, update the key, and re-validate by creating a new instance
     data = current_settings.model_dump()
     data[key] = value
-    
+
     try:
         # Re-instantiate to trigger Pydantic validation and type coercion
         updated_settings = AudioBenchSettings(**data)
         updated_settings.save()
-        
+
         # Update the singleton in-place so subsequent code in this run sees it
         setattr(current_settings, key, getattr(updated_settings, key))
-        
+
         console.print(f"  [{SUCCESS}]✓[/] Configuration updated")
         console.print(f"    [{DIM}]{key} = {getattr(updated_settings, key)}[/]")
     except Exception as e:

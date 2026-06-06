@@ -43,71 +43,136 @@ def jobs(ctx: click.Context) -> None:
 
 
 def _list_jobs() -> None:
+    from audiobench.core.db_session import get_session
+    from audiobench.storage.models import JobQueueItem
+
     repo = JobRepository()
     all_jobs = repo.get_all_jobs(limit=20)
 
-    if not all_jobs:
+    with get_session() as session:
+        queue_items = session.query(JobQueueItem).order_by(JobQueueItem.id.desc()).limit(20).all()
+
+    if not all_jobs and not queue_items:
         console.print(f"  [{DIM}]No recent jobs found[/]")
         return
 
-    table = make_table(
-        "Background Jobs",
-        [
-            ("ID", {"width": 4, "justify": "right"}),
-            ("Status", {"width": 10}),
-            ("Command", {}),
-            ("Phase", {"width": 20}),
-            ("Started", {"style": DIM}),
-        ],
-    )
+    # 1. Print Standard Background Jobs
+    if all_jobs:
+        table = make_table(
+            "Background Jobs",
+            [
+                ("ID", {"width": 4, "justify": "right"}),
+                ("Status", {"width": 10}),
+                ("Command", {}),
+                ("Phase", {"width": 20}),
+                ("Started", {"style": DIM}),
+            ],
+        )
 
-    for job in all_jobs:
-        job_id = job["id"]
-        status = job.get("status", "unknown")
-        cmd_str = job.get("command", "")
-        # truncate command
-        if cmd_str.startswith("audiobench "):
-            cmd_str = cmd_str[11:]
-        if len(cmd_str) > 40:
-            cmd_str = cmd_str[:37] + "..."
+        for job in all_jobs:
+            job_id = job["id"]
+            status = job.get("status", "unknown")
+            cmd_str = job.get("command", "")
+            if cmd_str.startswith("audiobench "):
+                cmd_str = cmd_str[11:]
+            if len(cmd_str) > 40:
+                cmd_str = cmd_str[:37] + "..."
 
-        started = str(job.get("started_at", ""))[:16]  # Trim seconds/microseconds
+            started = str(job.get("started_at", ""))[:16]
 
-        # Colorize status
-        if status == "running":
-            status_disp = f"[{ACCENT}]running[/]"
-        elif status == "done":
-            status_disp = f"[{SUCCESS}]done[/]"
-        elif status == "failed":
-            status_disp = f"[{WARNING}]failed[/]"
-        elif status == "cancelled":
-            status_disp = f"[{WARNING}]cancelled[/]"
-        else:
-            status_disp = status
+            if status == "running":
+                status_disp = f"[{ACCENT}]running[/]"
+            elif status == "done":
+                status_disp = f"[{SUCCESS}]done[/]"
+            elif status == "failed":
+                status_disp = f"[{WARNING}]failed[/]"
+            elif status == "cancelled":
+                status_disp = f"[{WARNING}]cancelled[/]"
+            else:
+                status_disp = status
 
-        phase = get_job_phase(job_id) if status == "running" else ""
+            phase = get_job_phase(job_id) if status == "running" else ""
+            table.add_row(f"#{job_id}", status_disp, cmd_str, phase, started)
 
-        table.add_row(f"#{job_id}", status_disp, cmd_str, phase, started)
+        console.print(table)
+        console.print()
 
-    console.print(table)
+    # 2. Print Batch Queue Items
+    if queue_items:
+        queue_table = make_table(
+            "Batch Queue",
+            [
+                ("QID", {"width": 4, "justify": "right"}),
+                ("Status", {"width": 10}),
+                ("File", {}),
+                ("Engine", {"width": 10}),
+                ("Created", {"style": DIM}),
+            ],
+        )
+
+        for item in queue_items:
+            status = item.status
+            file_name = Path(item.file_path).name
+            if len(file_name) > 40:
+                file_name = file_name[:37] + "..."
+            
+            created = str(item.created_at)[:16]
+
+            if status == "processing":
+                status_disp = f"[{ACCENT}]running[/]"
+            elif status == "done":
+                status_disp = f"[{SUCCESS}]done[/]"
+            elif status == "failed":
+                status_disp = f"[{WARNING}]failed[/]"
+            else:
+                status_disp = status
+
+            engine = item.engine or "default"
+            queue_table.add_row(f"Q{item.id}", status_disp, file_name, engine, created)
+
+        console.print(queue_table)
 
 
 @jobs.command(name="fg")
-@click.argument("job_id", type=int)
-def watch(job_id: int) -> None:
+@click.argument("job_id", type=str)
+def watch(job_id: str) -> None:
     """Bring a background job to the foreground (tail its logs).
 
     Works for both running and finished jobs.
     """
     startup_recovery()
     repo = JobRepository()
-    job = repo.get_job(job_id)
+    
+    actual_job_id = None
+    if str(job_id).upper().startswith('Q'):
+        try:
+            q_id = int(str(job_id)[1:])
+            from audiobench.core.db_session import get_session
+            from audiobench.storage.models import JobQueueItem
+            with get_session() as session:
+                q_item = session.query(JobQueueItem).filter_by(id=q_id).first()
+                if q_item and q_item.active_job_id:
+                    actual_job_id = q_item.active_job_id
+                else:
+                    console.print(error_panel("Not Found", f"Queue Item Q{q_id} does not have an active background job yet."))
+                    return
+        except ValueError:
+            pass
+            
+    if actual_job_id is None:
+        try:
+            actual_job_id = int(job_id)
+        except ValueError:
+            console.print(error_panel("Invalid ID", "Please provide a valid Job ID (e.g. 1) or Queue ID (e.g. Q12)"))
+            return
+
+    job = repo.get_job(actual_job_id)
     if not job:
-        console.print(error_panel("Not Found", f"Job #{job_id} does not exist"))
+        console.print(error_panel("Not Found", f"Job #{actual_job_id} does not exist"))
         return
 
     # watch_job now handles both running and finished jobs
-    watch_job(job_id)
+    watch_job(actual_job_id)
 
 
 @jobs.command(name="cancel")

@@ -30,6 +30,7 @@ from audiobench.transcribe.audio_converter import AudioLoader
 from audiobench.transcribe.engines.engine_protocol import TranscriptionEngine
 from audiobench.transcribe.engines.engine_registry import create_engine
 from audiobench.transcribe.transcription_result import AudioMetadata, Segment, Transcript
+from audiobench.transcribe.checkpoint_manager import CheckpointManager
 
 logger = get_logger("core.pipeline")
 
@@ -69,13 +70,18 @@ class TranscriptionPipeline:
         auto_name: bool = False,
         on_phase: PhaseCallback | None = None,
         on_segment: SegmentCallback | None = None,
+        filters: list[str] | None = None,
         engine_name: str | None = None,
         job_id: int | None = None,
         target_chapters: list[int] | None = None,
         resume: bool = False,
+        strategy: str = "batch",
+        pipeline_workers: int = 2,
         parallel: int = 1,
         skip_ghost: bool = True,
         chapter_id: int | None = None,
+        diarize_mode: str = "fast",
+        diarize_threshold: float = 0.65,
     ) -> Transcript:
         """Transcribe an audio file through the full pipeline.
 
@@ -129,11 +135,16 @@ class TranscriptionPipeline:
                     map_speakers=map_speakers,
                     auto_name=auto_name,
                     on_segment=on_segment,
+                    filters=filters,
                     engine_name=engine_name,
                     job_id=job_id,
                     resume=resume,
+                    strategy=strategy,
+                    pipeline_workers=pipeline_workers,
                     parallel=parallel,
                     skip_ghost=skip_ghost,
+                    diarize_mode=diarize_mode,
+                    diarize_threshold=diarize_threshold,
                 )
             else:
                 transcript = self._run_single_pipeline(
@@ -150,8 +161,11 @@ class TranscriptionPipeline:
                     map_speakers=map_speakers,
                     auto_name=auto_name,
                     on_segment=on_segment,
+                    filters=filters,
                     chapter_id=chapter_id,
                     job_id=job_id,
+                    diarize_mode=diarize_mode,
+                    diarize_threshold=diarize_threshold,
                 )
 
             if output_path:
@@ -160,6 +174,7 @@ class TranscriptionPipeline:
 
             if job_id:
                 from audiobench.jobs.repository import JobRepository
+
                 JobRepository().mark_job_done(job_id)
 
             return transcript
@@ -167,6 +182,7 @@ class TranscriptionPipeline:
         except Exception:
             if job_id:
                 from audiobench.jobs.repository import JobRepository
+
                 JobRepository().mark_job_failed(job_id, exit_code=1)
             raise
 
@@ -187,8 +203,11 @@ class TranscriptionPipeline:
         map_speakers: str | None,
         auto_name: bool,
         on_segment: SegmentCallback | None,
+        filters: list[str] | None,
         chapter_id: int | None,
         job_id: int | None,
+        diarize_mode: str = "fast",
+        diarize_threshold: float = 0.65,
     ) -> Transcript:
         """Load, transcribe, diarize, and save a single audio file."""
         is_gemini = engine.engine_name == "gemini"
@@ -198,65 +217,116 @@ class TranscriptionPipeline:
         condition_on_prev = self._settings.resolve_condition_on_previous_text(preset)
 
         emit("converting", "Converting audio...")
-        logger.info("Pipeline: loading %s (preset=%s, beam=%d, batch=%d)", file_path, preset, beam, batch)
+        logger.info(
+            "Pipeline: loading %s (preset=%s, beam=%d, batch=%d)", file_path, preset, beam, batch
+        )
 
         with AudioLoader() as loader:
-            wav_path, metadata = loader.load(file_path)
+            wav_path, metadata = loader.load(file_path, filters=filters)
 
             # Cache check
             cached = self._check_cache(metadata, skip_cache)
             if cached:
                 transcript = cached
-                if enable_diarization and not is_gemini and not any(s.speaker for s in transcript.segments):
-                    transcript = self._run_diarization(wav_path, transcript, emit)
+                if (
+                    enable_diarization
+                    and not is_gemini
+                    and not any(s.speaker for s in transcript.segments)
+                ):
+                    transcript = self._run_diarization(wav_path, transcript, emit, diarize_mode, diarize_threshold)
                 emit("done", "Retrieved from cache")
-                self._emit_event(job_id, phase="done", words=transcript.word_count,
-                                 speakers=len(transcript.speaker_map), duration=int(transcript.duration_seconds))
+                self._emit_event(
+                    job_id,
+                    phase="done",
+                    words=transcript.word_count,
+                    speakers=len(transcript.speaker_map),
+                    duration=int(transcript.duration_seconds),
+                )
                 return transcript
 
             # Transcribe
             task = "translate" if translate else "transcribe"
-            emit("transcribing", "Translating to English..." if translate else "Transcribing...", 0.0)
+            emit(
+                "transcribing", "Translating to English..." if translate else "Transcribing...", 0.0
+            )
             logger.info("Pipeline: transcribing with %s (preset=%s)", engine.engine_name, preset)
 
             def _progress(pct: float) -> None:
                 emit("transcribing", "Transcribing...", pct)
 
-            audio_input = str(file_path) if is_gemini else wav_path
+            audio_input = wav_path
             if is_gemini:
                 transcript = engine.transcribe(
-                    audio_input, language=language or self._settings.language,
-                    task=task, word_timestamps=word_ts, on_phase=emit, diarize=enable_diarization,
+                    audio_input,
+                    language=language or self._settings.language,
+                    task=task,
+                    word_timestamps=word_ts,
+                    on_phase=emit,
+                    diarize=enable_diarization,
                 )
             else:
                 transcript = engine.transcribe(
-                    audio_input, language=language or self._settings.language,
-                    task=task, word_timestamps=word_ts, beam_size=beam, batch_size=batch,
-                    temperature=temperature, compression_ratio_threshold=2.4, no_speech_threshold=0.6,
-                    log_prob_threshold=-1.0, condition_on_previous_text=condition_on_prev,
-                    repetition_penalty=1.1, initial_prompt=initial_prompt,
-                    progress_callback=_progress, on_segment=on_segment,
+                    audio_input,
+                    language=language or self._settings.language,
+                    task=task,
+                    word_timestamps=word_ts,
+                    beam_size=beam,
+                    batch_size=batch,
+                    temperature=temperature,
+                    compression_ratio_threshold=2.4,
+                    no_speech_threshold=0.6,
+                    log_prob_threshold=-1.0,
+                    condition_on_previous_text=condition_on_prev,
+                    repetition_penalty=1.1,
+                    initial_prompt=initial_prompt,
+                    progress_callback=_progress,
+                    on_segment=on_segment,
                 )
             transcript.audio = metadata
 
             # Diarization
             if enable_diarization and not is_gemini:
-                transcript = self._run_diarization(wav_path, transcript, emit)
+                transcript = self._run_diarization(wav_path, transcript, emit, diarize_mode, diarize_threshold)
 
             # Speaker naming
-            self._apply_speaker_naming(transcript, map_speakers, auto_name, enable_diarization, emit)
+            self._apply_speaker_naming(
+                transcript, map_speakers, auto_name, enable_diarization, emit
+            )
 
             # Save
             emit("saving", "Saving to database...")
-            tx_id = self._repository.save_transcription(transcript, metadata, chapter_id=chapter_id)
+            tx_id = self._repository.save_transcription(transcript, metadata, chapter_id=chapter_id, on_phase=emit)
             logger.info("Pipeline: saved as transcription #%d", tx_id)
 
+            # Fire plugin hook
+            try:
+                from audiobench.events import get_bus
+                get_bus().emit(
+                    "transcription.complete",
+                    tx_id=tx_id,
+                    file_path=str(file_path),
+                    duration_seconds=transcript.duration_seconds,
+                    word_count=transcript.word_count,
+                    language=transcript.language,
+                )
+            except Exception:
+                logger.warning("EventBus emit failed (non-fatal)", exc_info=True)
+
             if transcript.segments:
-                self._spawn_refinement(tx_id, raw_text=transcript.text, segments=transcript.segments)
+                self._spawn_refinement(
+                    tx_id, raw_text=transcript.text, segments=transcript.segments
+                )
+                if chapter_id is None:
+                    self._spawn_auto_naming(tx_id, str(file_path), transcript)
 
             emit("done", "Complete!")
-            self._emit_event(job_id, phase="done", words=transcript.word_count,
-                             speakers=len(transcript.speaker_map), duration=int(transcript.duration_seconds))
+            self._emit_event(
+                job_id,
+                phase="done",
+                words=transcript.word_count,
+                speakers=len(transcript.speaker_map),
+                duration=int(transcript.duration_seconds),
+            )
             return transcript
 
     # ── Private: Chapter pipeline ─────────────────────────────────────────────
@@ -264,7 +334,7 @@ class TranscriptionPipeline:
     def _run_chapter_pipeline(
         self,
         file_path: str | Path,
-        target_chapters: list[int],
+        target_chapters: list[int] | str,
         emit: Callable,
         language: str | None,
         word_timestamps: bool,
@@ -276,11 +346,16 @@ class TranscriptionPipeline:
         map_speakers: str | None,
         auto_name: bool,
         on_segment: SegmentCallback | None,
+        filters: list[str] | None,
         engine_name: str | None,
         job_id: int | None,
         resume: bool,
+        strategy: str,
+        pipeline_workers: int,
         parallel: int,
         skip_ghost: bool,
+        diarize_mode: str = "fast",
+        diarize_threshold: float = 0.65,
     ) -> Transcript:
         """Split a file by chapter indices and transcribe each chunk."""
         from audiobench.chapters.cue_parser import ChapterInfo
@@ -293,19 +368,30 @@ class TranscriptionPipeline:
         audio_record = self._ensure_audio_record(file_path, emit)
         all_chapters = repo.get_chapters(audio_record.id if audio_record else 0)
 
+        cm = CheckpointManager(file_path)
+
         # Filter to the requested indices
-        chapters_to_process = [c for c in all_chapters if c.index in target_chapters]
+        if target_chapters == "all":
+            chapters_to_process = all_chapters
+        else:
+            chapters_to_process = [c for c in all_chapters if c.index in target_chapters]
+        
         if skip_ghost:
             chapters_to_process = [c for c in chapters_to_process if not c.is_ghost]
+            
         if resume:
-            # We can't query transcription_status from ChapterInfo directly, need the repo
-            # Re-fetch raw status; for now omit resume filtering here — it's handled in save
-            pass
-        if not chapters_to_process:
-            raise ValueError(
-                f"None of the requested chapters {target_chapters} need processing "
-                "(all filtered out by skip_ghost or resume)."
-            )
+            chapters_to_process = [c for c in chapters_to_process if not cm.has_checkpoint(c.index)]
+            if len(chapters_to_process) < len(all_chapters):
+                logger.info("Resuming: Skipped %d already-completed chapters.", len(all_chapters) - len(chapters_to_process))
+
+        if not chapters_to_process and target_chapters:
+            # Everything is already done! Load all checkpoints.
+            results = [cm.load_checkpoint(c.index) for c in all_chapters]
+            results = [r for r in results if r is not None]
+            if not results:
+                raise RuntimeError("No checkpoints found, but resume filtered all chapters.")
+            emit("done", "Loaded all from cache")
+            return self._merge_transcripts(results)
 
         splitter = ChapterSplitter()
         source_path = Path(audio_record.file_path if audio_record else file_path)
@@ -314,10 +400,20 @@ class TranscriptionPipeline:
             emit("converting", "Extracting chapters...", 0.0)
             chunk_paths = splitter.split(source_path, chapters_to_process, Path(tmp_dir), fmt="wav")
 
-            def _process_chunk(i: int, chap: ChapterInfo, chunk_path: Path | None) -> Transcript | None:
+            def _process_chunk(
+                i: int, chap: ChapterInfo, chunk_path: Path | None, do_diarize: bool
+            ) -> Transcript | None:
                 if chunk_path is None:
                     return None
+                
+                # Check checkpoint
+                if resume and cm.has_checkpoint(chap.index):
+                    res = cm.load_checkpoint(chap.index)
+                    if res:
+                        return res
+
                 emit("transcribing", f"Transcribing chapter {chap.index}...", float(i) / len(chapters_to_process))
+                
                 result = self.transcribe_file(
                     file_path=chunk_path,
                     language=language,
@@ -328,17 +424,21 @@ class TranscriptionPipeline:
                     speed_preset=speed_preset,
                     initial_prompt=initial_prompt,
                     translate=translate,
-                    enable_diarization=enable_diarization,
+                    enable_diarization=do_diarize,
                     map_speakers=map_speakers,
                     auto_name=auto_name,
                     on_phase=None,
                     on_segment=on_segment,
+                    filters=filters,
                     engine_name=engine_name,
                     job_id=job_id,
-                    target_chapters=None,      # prevent recursion
+                    target_chapters=None,
                     chapter_id=chap.id,
+                    diarize_mode=diarize_mode,
+                    diarize_threshold=diarize_threshold,
                 )
-                # Shift timestamps to match the full-file timeline
+                
+                # Shift timestamps
                 offset = chap.start_time
                 for seg in result.segments:
                     seg.start += offset
@@ -346,31 +446,78 @@ class TranscriptionPipeline:
                     for word in seg.words:
                         word.start += offset
                         word.end += offset
+                
+                # Save checkpoint
+                cm.save_checkpoint(chap.index, result)
                 return result
 
-            if parallel > 1:
-                with ThreadPoolExecutor(max_workers=parallel) as ex:
-                    futures = [ex.submit(_process_chunk, i, c, p)
-                               for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths))]
+            results = []
+            
+            if strategy == "batch":
+                # Phase 1: Transcribe all
+                for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths)):
+                    r = _process_chunk(i, c, p, do_diarize=False)
+                    if r: results.append(r)
+                
+                # Phase 2: Diarize all
+                if enable_diarization:
+                    emit("diarizing", "Diarizing all chapters...", 0.0)
+                    for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths)):
+                        res = cm.load_checkpoint(c.index)
+                        if res and p and p.exists() and not any(s.speaker for s in res.segments):
+                            emit("diarizing", f"Diarizing chapter {c.index}...", float(i) / len(chapters_to_process))
+                            # Diarize and overwrite checkpoint
+                            res = self._run_diarization(p, res, emit, diarize_mode, diarize_threshold)
+                            cm.save_checkpoint(c.index, res)
+            
+            elif strategy == "concurrent":
+                import torch
+                # Limit Pyannote CPU usage to prevent fighting with Whisper
+                torch.set_num_threads(1)
+                
+                def _process_concurrent(idx: int, c: ChapterInfo, p: Path) -> Transcript | None:
+                    # Whisper
+                    r = _process_chunk(idx, c, p, do_diarize=False)
+                    if not r: return None
+                    
+                    # Pyannote
+                    if enable_diarization and p and p.exists() and not any(s.speaker for s in r.segments):
+                        r = self._run_diarization(p, r, emit, diarize_mode, diarize_threshold)
+                        cm.save_checkpoint(c.index, r)
+                    return r
+                
+                with ThreadPoolExecutor(max_workers=pipeline_workers) as ex:
+                    futures = [ex.submit(_process_concurrent, i, c, p) for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths))]
                     results = [f.result() for f in futures if f.result() is not None]
+                    
             else:
-                results = [r for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths))
-                           if (r := _process_chunk(i, c, p)) is not None]
+                # strategy == "chunk"
+                if parallel > 1:
+                    with ThreadPoolExecutor(max_workers=parallel) as ex:
+                        futures = [ex.submit(_process_chunk, i, c, p, enable_diarization) for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths))]
+                        results = [f.result() for f in futures if f.result() is not None]
+                else:
+                    results = [r for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths)) if (r := _process_chunk(i, c, p, enable_diarization)) is not None]
 
-        if not results:
+        # Load all checkpoints (including those skipped via resume)
+        final_results = []
+        for c in all_chapters:
+            r = cm.load_checkpoint(c.index)
+            if r: final_results.append(r)
+
+        if not final_results:
             raise RuntimeError("No chapters were successfully transcribed.")
 
-        # Merge all chapter transcripts into one
-        return self._merge_transcripts(results)
+        return self._merge_transcripts(final_results)
 
     # ── Private: Helpers ──────────────────────────────────────────────────────
 
     def _ensure_audio_record(self, file_path: str | Path, emit: Callable):
         """Ensure the audio file has a DB record, importing it into the library if needed."""
         from audiobench.chapters.detector import ChapterDetector
+        from audiobench.core.db_session import get_session
         from audiobench.storage.chapter_repository import get_chapter_repo
         from audiobench.storage.models import AudioFileRecord
-        from audiobench.core.db_session import get_session
 
         with AudioLoader() as loader:
             _, metadata = loader.load(file_path)
@@ -384,10 +531,14 @@ class TranscriptionPipeline:
         new_path = self._repository._import_to_library(str(file_path))
         with get_session() as session:
             audio_record = AudioFileRecord(
-                file_path=new_path, file_name=metadata.file_name,
-                file_size_bytes=metadata.file_size_bytes, format=metadata.format,
-                duration_seconds=metadata.duration_seconds, sample_rate=metadata.sample_rate,
-                channels=metadata.channels, file_hash=metadata.file_hash,
+                file_path=new_path,
+                file_name=metadata.file_name,
+                file_size_bytes=metadata.file_size_bytes,
+                format=metadata.format,
+                duration_seconds=metadata.duration_seconds,
+                sample_rate=metadata.sample_rate,
+                channels=metadata.channels,
+                file_hash=metadata.file_hash,
             )
             session.add(audio_record)
             session.commit()
@@ -412,12 +563,17 @@ class TranscriptionPipeline:
         data = self._repository.get_by_id(cached.id)
         return self._reconstruct_transcript(data, metadata) if data else None
 
-    def _run_diarization(self, wav_path: str, transcript: Transcript, emit: Callable) -> Transcript:
+    def _run_diarization(self, wav_path: str, transcript: Transcript, emit: Callable, diarize_mode: str = "fast", diarize_threshold: float = 0.65) -> Transcript:
         """Run speaker diarization, returning updated transcript (or original on failure)."""
         emit("diarizing", "Identifying speakers...")
         try:
-            from audiobench.diarization.engine import PyannoteDiarizer
-            diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token)
+            if diarize_mode == "accurate":
+                from audiobench.diarization.engine import PyannoteDiarizer
+                diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token)
+            else:
+                from audiobench.diarization.engine import LightweightDiarizer
+                diarizer = LightweightDiarizer(distance_threshold=diarize_threshold)
+                
             result = diarizer.diarize(wav_path, transcript)
             logger.info("Pipeline: diarization complete")
             return result
@@ -475,7 +631,8 @@ class TranscriptionPipeline:
             self._engine = create_engine(
                 engine_name=selected,
                 model_name=(
-                    self._settings.gemini_model if selected == "gemini"
+                    self._settings.gemini_model
+                    if selected == "gemini"
                     else self._settings.model_name
                 ),
                 device=self._settings.resolve_device(),
@@ -495,6 +652,7 @@ class TranscriptionPipeline:
         if not job_id:
             return
         import time
+
         line = " ".join(f"{k}={v}" for k, v in kwargs.items())
         line += f" ts={int(time.time())}"
         log_dir = self._settings.data_dir / "job_logs"
@@ -506,12 +664,14 @@ class TranscriptionPipeline:
         """Format transcript and write to file."""
         if fmt == "pdf":
             from audiobench.export.pdf import PDFExporter
+
             data = transcript.dict()
             data["file_name"] = Path(output_path).stem if output_path else "transcript"
             PDFExporter().export_transcript(data, output_path)
             return
 
         from audiobench.output.base import get_formatter
+
         formatter = get_formatter(fmt)
         content = formatter.format(transcript)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -520,10 +680,12 @@ class TranscriptionPipeline:
 
     def _auto_name_speakers(self, transcript: Transcript) -> None:
         """Use Gemini to detect actual speaker names from the transcript context."""
-        from google import genai
-        from audiobench.output.text import TextFormatter
         import json
         import re
+
+        from google import genai
+
+        from audiobench.output.text import TextFormatter
 
         if not self._settings.gemini_api_key:
             logger.warning("Gemini API key not configured, skipping auto-name")
@@ -602,18 +764,152 @@ class TranscriptionPipeline:
         thread.start()
         logger.info("Spawned background refinement thread for #%d", tx_id)
 
+    def _spawn_auto_naming(self, tx_id: int, file_path: str, transcript: Transcript) -> None:
+        """Spawn a background thread to generate a semantic title and rename the file."""
+        import threading
+
+        def _rename() -> None:
+            try:
+                import re
+                from pathlib import Path
+
+                from google import genai
+
+                from audiobench.core.db_session import get_session
+                from audiobench.storage.models import AudioFileRecord, TranscriptionRecord
+
+                # Get first ~5 minutes of text to generate title
+                intro_segments = [s for s in transcript.segments if s.end <= 300][:50]
+                intro_text = " ".join([s.text for s in intro_segments])
+
+                if not intro_text.strip():
+                    return
+
+                prompt = (
+                    "Based on the following transcript excerpt, generate a concise, highly semantic 3-5 word title for this audio file.\n"
+                    "Do NOT use quotes, special characters, or prefixes like 'Title:'. Just the raw title text.\n\n"
+                    f"{intro_text}"
+                )
+
+                new_title = ""
+                try:
+                    if self._settings.gemini_api_key:
+                        client = genai.Client(api_key=self._settings.gemini_api_key)
+                        response = client.models.generate_content(
+                            model="gemini-2.5-pro", contents=prompt
+                        )
+                        new_title = response.text.strip()
+                    else:
+                        raise ValueError("No Gemini API key configured")
+                except Exception as e:
+                    logger.warning(
+                        "Gemini auto-rename failed/unavailable (%s), falling back to Ollama", e
+                    )
+                    from audiobench.chat.providers.ollama_provider import OllamaClient
+
+                    ollama = OllamaClient(
+                        base_url=self._settings.ollama_base_url,
+                        model=self._settings.clean_model,
+                    )
+                    if not ollama.is_available():
+                        logger.warning("Ollama not available for fallback rename")
+                        return
+
+                    response = ollama.chat([{"role": "user", "content": prompt}], think=False)
+                    new_title = response.get("content", "").strip()
+
+                if not new_title:
+                    # BOTH FAILED! Tag the file for later retry.
+                    with get_session() as session:
+                        tx_record = session.query(TranscriptionRecord).get(tx_id)
+                        if tx_record:
+                            audio_record = session.query(AudioFileRecord).get(
+                                tx_record.audio_file_id
+                            )
+                            if audio_record:
+                                import json
+
+                                try:
+                                    tags_list = (
+                                        json.loads(audio_record.tags) if audio_record.tags else []
+                                    )
+                                except Exception:
+                                    tags_list = []
+                                if "pending_auto_rename" not in tags_list:
+                                    tags_list.append("pending_auto_rename")
+                                    audio_record.tags = json.dumps(tags_list)
+                        session.commit()
+                    logger.info(
+                        "Auto-rename failed completely. Tagged #%d with pending_auto_rename", tx_id
+                    )
+                    return
+
+                # Clean up title for filesystem
+                new_title = re.sub(r"[^\w\s-]", " ", new_title).strip()
+                new_title = re.sub(r"\s+", " ", new_title)
+
+                if not new_title or len(new_title.split()) > 15:
+                    logger.warning("Auto-rename generated invalid title: %s", new_title)
+                    return
+
+                old_path = Path(file_path)
+                if not old_path.exists():
+                    logger.warning("Original file missing, skipping rename: %s", old_path)
+                    return
+
+                new_filename = f"{new_title}{old_path.suffix}"
+                new_path = old_path.parent / new_filename
+
+                # Handle collisions
+                counter = 1
+                while new_path.exists() and new_path != old_path:
+                    new_path = old_path.parent / f"{new_title}_{counter}{old_path.suffix}"
+                    new_filename = new_path.name
+                    counter += 1
+
+                if new_path != old_path:
+                    old_path.rename(new_path)
+
+                    # Update DB
+                    with get_session() as session:
+                        tx_record = session.query(TranscriptionRecord).get(tx_id)
+                        if tx_record:
+                            audio_record = session.query(AudioFileRecord).get(
+                                tx_record.audio_file_id
+                            )
+                            if audio_record:
+                                audio_record.file_name = new_filename
+                                audio_record.file_path = str(new_path)
+                        session.commit()
+
+                    logger.info("Auto-renamed file to %s", new_filename)
+            except Exception as e:
+                logger.warning("Background auto-rename failed for #%d: %s", tx_id, e)
+
+        thread = threading.Thread(target=_rename, name=f"rename-{tx_id}", daemon=True)
+        thread.start()
+        logger.info("Spawned background auto-rename thread for #%d", tx_id)
+
     def _reconstruct_transcript(self, data: dict, metadata: AudioMetadata) -> Transcript:
         """Reconstruct a Transcript from cached DB data."""
         from audiobench.transcribe.transcription_result import Segment
 
         segments = [
-            Segment(id=s["index"], text=s["text"], start=s["start"], end=s["end"], speaker=s.get("speaker"))
+            Segment(
+                id=s["index"],
+                text=s["text"],
+                start=s["start"],
+                end=s["end"],
+                speaker=s.get("speaker"),
+            )
             for s in data.get("segments", [])
         ]
         return Transcript(
-            segments=segments, language=data.get("language", "en"),
+            segments=segments,
+            language=data.get("language", "en"),
             language_probability=data.get("language_probability", 0.0),
-            audio=metadata, duration_seconds=data.get("duration", 0.0),
+            audio=metadata,
+            duration_seconds=data.get("duration", 0.0),
             engine=data.get("engine", "faster-whisper"),
             model_name=data.get("model", "large-v3-turbo"),
         )

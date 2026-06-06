@@ -42,8 +42,8 @@ from audiobench.core.prompts import (
 _INLINE_MAX_BYTES_DEFAULT = 20 * 1024 * 1024
 
 # ── Chunking constants ──────────────────────────────────────
-_CHUNK_DURATION = 15 * 60      # 15 minutes per chunk (seconds)
-_CHUNK_OVERLAP = 30            # 30 seconds overlap between chunks
+_CHUNK_DURATION = 15 * 60  # 15 minutes per chunk (seconds)
+_CHUNK_OVERLAP = 30  # 30 seconds overlap between chunks
 # With the Files API handling up to 2 GB per file, we relax the threshold
 # to 45 minutes (from 20 min). Long files still benefit from chunking due
 # to the model's practical output-token limit per request.
@@ -61,7 +61,7 @@ class GeminiEngine(TranscriptionEngine):
 
     Rate-limit resilience:
       - generate_content is wrapped with tenacity exponential-backoff
-        retrying on google.api_core.exceptions.ResourceExhausted (HTTP 429).
+        retrying on google.genai.errors.APIError (HTTP 429).
       - On full retry exhaustion, falls back to gemini_upload_fallback_model.
     """
 
@@ -192,7 +192,10 @@ class GeminiEngine(TranscriptionEngine):
 
         if duration > self._chunk_threshold:
             return self._transcribe_chunked(
-                audio_path, prompt, on_phase, duration,
+                audio_path,
+                prompt,
+                on_phase,
+                duration,
             )
 
         return self._transcribe_single(audio_path, prompt, on_phase)
@@ -206,31 +209,31 @@ class GeminiEngine(TranscriptionEngine):
         `load_model` from settings) is respected at call time rather than at
         class-definition time.
         """
-        try:
-            from google.api_core.exceptions import ResourceExhausted
-        except ImportError:
-            # google-api-core not installed; fall back to a bare wrapper
-            # (no retry) so the engine still works without the extra package.
-            def _bare_generate(model_name: str, contents: list) -> Any:
+
+        def is_retryable(exc):
+            from google.genai.errors import APIError
+
+            if isinstance(exc, APIError):
+                return exc.code == 429 or exc.code >= 500
+            return False
+
+        @retry(
+            retry=retry_if_exception_type(Exception),
+            wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
+            stop=stop_after_attempt(self._max_retries),
+            reraise=True,
+        )
+        def _generate_with_retry(model_name: str, contents: list) -> Any:
+            try:
                 return self._client.models.generate_content(
                     model=model_name,
                     contents=contents,
                 )
-            return _bare_generate
-
-        max_retries = self._max_retries
-
-        @retry(
-            retry=retry_if_exception_type(ResourceExhausted),
-            wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
-            stop=stop_after_attempt(max_retries),
-            reraise=True,
-        )
-        def _generate_with_retry(model_name: str, contents: list) -> Any:
-            return self._client.models.generate_content(
-                model=model_name,
-                contents=contents,
-            )
+            except Exception as e:
+                if is_retryable(e):
+                    raise e
+                # Do not retry other exceptions
+                raise e
 
         return _generate_with_retry
 
@@ -241,14 +244,14 @@ class GeminiEngine(TranscriptionEngine):
         retry attempts (quota fully depleted for the request window).
         """
         try:
-            from google.api_core.exceptions import ResourceExhausted
             _generate = self._make_generate_caller()
             return _generate(self._model_name, contents)
         except Exception as exc:
-            # Check if it's a ResourceExhausted (quota) and we have a fallback.
+            # Check if it's a quota error (429) and we have a fallback.
             try:
-                from google.api_core.exceptions import ResourceExhausted as RE
-                is_quota = isinstance(exc, RE)
+                from google.genai.errors import APIError
+
+                is_quota = isinstance(exc, APIError) and exc.code == 429
             except ImportError:
                 is_quota = "quota" in str(exc).lower() or "429" in str(exc)
 
@@ -295,7 +298,9 @@ class GeminiEngine(TranscriptionEngine):
 
         logger.info(
             "Uploading %s (%.1f MB) to Gemini Files API (mime=%s)",
-            audio_path.name, size_mb, mime,
+            audio_path.name,
+            size_mb,
+            mime,
         )
 
         try:
@@ -318,8 +323,8 @@ class GeminiEngine(TranscriptionEngine):
         if on_phase and callable(on_phase):
             on_phase("processing", "Gemini is processing the audio file...", None)
 
-        max_polls = 30          # up to ~60 seconds
-        poll_interval = 2.0     # seconds between polls
+        max_polls = 30  # up to ~60 seconds
+        poll_interval = 2.0  # seconds between polls
 
         for attempt in range(max_polls):
             try:
@@ -335,7 +340,8 @@ class GeminiEngine(TranscriptionEngine):
             if state_name == "ACTIVE":
                 logger.info(
                     "File %s is ACTIVE after %d poll(s)",
-                    uploaded.name, attempt + 1,
+                    uploaded.name,
+                    attempt + 1,
                 )
                 return uploaded.uri, uploaded.name
 
@@ -347,7 +353,9 @@ class GeminiEngine(TranscriptionEngine):
 
             logger.debug(
                 "File %s state=%s — polling again in %.0fs",
-                uploaded.name, state_name, poll_interval,
+                uploaded.name,
+                state_name,
+                poll_interval,
             )
             time.sleep(poll_interval)
 
@@ -393,7 +401,11 @@ class GeminiEngine(TranscriptionEngine):
         try:
             if file_size <= self._inline_max_bytes:
                 # ── Inline path (small files) ────────────────────────
-                logger.info("Using inline upload (%.1f MB ≤ %d MB threshold)", size_mb, self._inline_max_bytes // (1024 * 1024))
+                logger.info(
+                    "Using inline upload (%.1f MB ≤ %d MB threshold)",
+                    size_mb,
+                    self._inline_max_bytes // (1024 * 1024),
+                )
                 audio_bytes = audio_path.read_bytes()
 
                 contents = [
@@ -406,7 +418,11 @@ class GeminiEngine(TranscriptionEngine):
                 ]
             else:
                 # ── Files API path (large files) ─────────────────────
-                logger.info("Using Files API upload (%.1f MB > %d MB threshold)", size_mb, self._inline_max_bytes // (1024 * 1024))
+                logger.info(
+                    "Using Files API upload (%.1f MB > %d MB threshold)",
+                    size_mb,
+                    self._inline_max_bytes // (1024 * 1024),
+                )
                 file_uri, file_name_to_delete = self._upload_via_files_api(
                     audio_path, mime, on_phase
                 )
@@ -437,7 +453,8 @@ class GeminiEngine(TranscriptionEngine):
                     # Non-fatal — the file will expire on its own.
                     logger.warning(
                         "Could not delete Files API entry %s: %s",
-                        file_name_to_delete, del_exc,
+                        file_name_to_delete,
+                        del_exc,
                     )
 
         return self._parse_response(response, audio_path)
@@ -481,20 +498,27 @@ class GeminiEngine(TranscriptionEngine):
 
                 logger.info(
                     "Transcribing chunk %d/%d (offset=%.0fs): %s",
-                    i + 1, len(chunks), time_offset, chunk_path.name,
+                    i + 1,
+                    len(chunks),
+                    time_offset,
+                    chunk_path.name,
                 )
 
                 try:
                     # Don't forward on_phase to individual chunks —
                     # _transcribe_chunked already emits chunk-level progress.
                     transcript = self._transcribe_single(
-                        chunk_path, prompt, None,
+                        chunk_path,
+                        prompt,
+                        None,
                     )
                     chunk_results.append((transcript, time_offset))
                 except EngineError as e:
                     logger.warning(
                         "Chunk %d/%d failed (skipping): %s",
-                        i + 1, len(chunks), e,
+                        i + 1,
+                        len(chunks),
+                        e,
                     )
         finally:
             # Clean up chunk temp files (but not the original).
@@ -575,7 +599,10 @@ class GeminiEngine(TranscriptionEngine):
 
         logger.info(
             "Stitched %d chunks → %d segments, %d words, %.0fs",
-            len(chunk_results), len(all_segments), total_words, duration,
+            len(chunk_results),
+            len(all_segments),
+            total_words,
+            duration,
         )
 
         return Transcript(
@@ -668,7 +695,7 @@ class GeminiEngine(TranscriptionEngine):
         # a complete segment.  A complete segment ends with `}` and
         # the next non-whitespace character (before truncation) would
         # be `,` or `]`.
-        search_region = raw[seg_match.end():]
+        search_region = raw[seg_match.end() :]
 
         # Find all closing braces that are followed by a comma or by
         # another opening brace (next segment) — these mark complete
@@ -678,9 +705,9 @@ class GeminiEngine(TranscriptionEngine):
         i = 0
         while i < len(search_region):
             ch = search_region[i]
-            if ch == '{':
+            if ch == "{":
                 depth += 1
-            elif ch == '}':
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
                     # This `}` closes a top-level object in the array.
@@ -689,7 +716,7 @@ class GeminiEngine(TranscriptionEngine):
                 # Skip over strings to avoid counting braces inside them.
                 i += 1
                 while i < len(search_region) and search_region[i] != '"':
-                    if search_region[i] == '\\':
+                    if search_region[i] == "\\":
                         i += 1  # skip escaped char
                     i += 1
             i += 1
@@ -699,7 +726,7 @@ class GeminiEngine(TranscriptionEngine):
 
         # Rebuild: everything up to and including the last good `}`,
         # then close the array and outer object.
-        repaired = raw[:last_good + 1] + "\n  ]\n}"
+        repaired = raw[: last_good + 1] + "\n  ]\n}"
 
         try:
             return json.loads(repaired)
@@ -712,8 +739,8 @@ class GeminiEngine(TranscriptionEngine):
         # trimming from the last good position backwards until we find
         # a parseable prefix.
         for trim_pos in range(last_good, seg_match.end(), -1):
-            if raw[trim_pos] == '}':
-                candidate = raw[:trim_pos + 1] + "\n  ]\n}"
+            if raw[trim_pos] == "}":
+                candidate = raw[: trim_pos + 1] + "\n  ]\n}"
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError:

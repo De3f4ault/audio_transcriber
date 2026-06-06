@@ -146,6 +146,7 @@ def history(
     # Optionally add chapter counts if not in chapter mode
     if not show_chapters:
         from audiobench.storage.chapter_repository import get_chapter_repo
+
         chap_repo = get_chapter_repo()
         file_chapter_counts = {}
         unique_audio_ids = {r.get("audio_file_id") for r in records if r.get("audio_file_id")}
@@ -153,7 +154,7 @@ def history(
             chapters = chap_repo.list_for_file(aid)
             if chapters:
                 file_chapter_counts[aid] = len(chapters)
-                
+
         for rec in records:
             aid = rec.get("audio_file_id")
             if aid and file_chapter_counts.get(aid):
@@ -490,8 +491,13 @@ def export(
 
     # ── Interactive wizard ──────────────────────────────────
     if interactive_mode:
-        from audiobench.cli.wizard import prompt_transcription, prompt_menu, prompt_string, prompt_bool
-        
+        from audiobench.cli.wizard import (
+            prompt_bool,
+            prompt_menu,
+            prompt_string,
+            prompt_transcription,
+        )
+
         try:
             transcription_id = prompt_transcription("Select a transcription to export")
             output_format = prompt_menu(
@@ -503,21 +509,24 @@ def export(
                     ("VTT", "Web Video Text Tracks", "vtt"),
                     ("JSON", "Raw JSON dump", "json"),
                     ("All", "Export all formats", "all"),
-                ]
+                ],
             )
-            
+
             output_path = prompt_string("Output path (leave empty for default)", default="")
             if not output_path:
                 output_path = None
-                
+
             open_after = prompt_bool("Open file after export?", default=True)
-            
+
         except KeyboardInterrupt:
             sys.exit(0)
-            
+
     if not transcription_id or not output_format:
-        from audiobench.cli.display.theme import console, error_panel
-        console.print(error_panel("Usage: audiobench export [TRANSCRIPTION_ID] -f [FORMAT]\nOr use --interactive"))
+        console.print(
+            error_panel(
+                "Usage: audiobench export [TRANSCRIPTION_ID] -f [FORMAT]\nOr use --interactive"
+            )
+        )
         sys.exit(1)
 
     init_db()
@@ -553,16 +562,18 @@ def export(
     if output_format in ("pdf", "all"):
         if not output_path:
             from audiobench.core.settings import get_settings
+
             settings = get_settings()
             exports_dir = settings.data_dir / "exports"
             exports_dir.mkdir(parents=True, exist_ok=True)
             # Generate a sensible default filename for PDF
             base_name = Path(data.get("file_name", f"transcript_{transcription_id}")).stem
             output_path = str(exports_dir / f"{base_name}.pdf")
-        
+
         from audiobench.export.pdf import PDFExporter
+
         exporter = PDFExporter()
-        
+
         try:
             exporter.export_transcript(data, output_path)
             console.print(
@@ -573,7 +584,7 @@ def export(
                 _open_file(output_path)
         except Exception as e:
             console.print(f"  [{WARNING}]PDF Export failed:[/] {e}")
-        
+
         if output_format == "pdf":
             return
 
@@ -584,6 +595,7 @@ def export(
     if not output_path and output_format != "pdf":
         # Default to exports directory instead of stdout if not explicitly provided
         from audiobench.core.settings import get_settings
+
         settings = get_settings()
         exports_dir = settings.data_dir / "exports"
         exports_dir.mkdir(parents=True, exist_ok=True)

@@ -44,14 +44,14 @@ class OllamaClient:
         self,
         base_url: str = "http://localhost:11434",
         model: str = "deepseek-v3.2:cloud",
-        timeout: int = 120,
+        timeout: tuple[int, int] = (10, 600),
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
         # Streaming reads may take minutes for large-context prompts
         # (connect_timeout, read_timeout)
-        self._stream_timeout = (10, 300)
+        self._stream_timeout = (10, 600)
 
     def _ensure_requests(self):
         """Lazy import of requests."""

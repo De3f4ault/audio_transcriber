@@ -14,10 +14,11 @@ logger = get_logger("chapters.cue_parser")
 @dataclass
 class ChapterInfo:
     """Lightweight representation of a chapter — the universal currency across all layers.
-    
+
     Used by: ChapterDetector → ChapterRepository → CLI commands → formatters.
     Eliminates the ORM-object vs dict ambiguity that caused most of the inconsistency bugs.
     """
+
     index: int
     title: str
     start_time: float
@@ -48,12 +49,12 @@ class CueParser:
 
     def parse(self, cue_path: Path, total_duration: float) -> list[ChapterInfo]:
         """Parse a .cue file into a list of ChapterInfo objects.
-        
+
         Args:
             cue_path: Path to the .cue file.
             total_duration: Total duration of the audio file in seconds,
                             used to set the end time of the final chapter.
-                            
+
         Returns:
             A list of ChapterInfo objects.
         """
@@ -79,19 +80,19 @@ class CueParser:
         # Simple state machine for parsing tracks
         for line in content.splitlines():
             line = line.strip()
-            
+
             # TRACK 01 AUDIO
             track_match = re.match(r"^TRACK\s+(\d+)\s+AUDIO", line, re.IGNORECASE)
             if track_match:
                 if current_track is not None:
                     chapters.append(current_track)
                 current_track = {
-                    "index": int(track_match.group(1)) - 1, # 0-indexed
+                    "index": int(track_match.group(1)) - 1,  # 0-indexed
                     "title": f"Track {int(track_match.group(1))}",
-                    "start_time": 0.0
+                    "start_time": 0.0,
                 }
                 continue
-                
+
             if current_track is None:
                 continue
 
@@ -99,7 +100,7 @@ class CueParser:
             title_match = re.match(r'^TITLE\s+"?([^"]+)"?', line, re.IGNORECASE)
             if title_match:
                 current_track["title"] = title_match.group(1)
-                
+
             # INDEX 01 00:00:00 (MM:SS:FF)
             index_match = re.match(r"^INDEX\s+01\s+(\d+):(\d+):(\d+)", line, re.IGNORECASE)
             if index_match:
@@ -115,20 +116,18 @@ class CueParser:
         for i, chap in enumerate(chapters):
             start = chap["start_time"]
             # Next chapter's start time, or total duration if it's the last one
-            end = chapters[i+1]["start_time"] if i + 1 < len(chapters) else total_duration
-            
+            end = chapters[i + 1]["start_time"] if i + 1 < len(chapters) else total_duration
+
             # Prevent end_time from exceeding total duration (just in case)
             end = min(end, total_duration)
-            
-            is_ghost = (end <= start)
-            
-            result.append(ChapterInfo(
-                index=i,
-                title=chap["title"],
-                start_time=start,
-                end_time=end,
-                is_ghost=is_ghost
-            ))
-            
+
+            is_ghost = end <= start
+
+            result.append(
+                ChapterInfo(
+                    index=i, title=chap["title"], start_time=start, end_time=end, is_ghost=is_ghost
+                )
+            )
+
         logger.info("Parsed %d chapters from %s", len(result), cue_path.name)
         return result

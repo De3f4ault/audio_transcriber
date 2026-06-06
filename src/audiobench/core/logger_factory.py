@@ -50,7 +50,6 @@ def setup_logging(level: str = "INFO") -> None:
 
     # File handler — plain text for debugging
     try:
-
         from audiobench.core.settings import get_settings
 
         log_dir = get_settings().data_dir / "logs"

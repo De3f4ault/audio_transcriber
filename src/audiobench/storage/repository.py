@@ -91,6 +91,7 @@ class TranscriptionRepository:
         transcript: Transcript,
         audio_metadata: AudioMetadata | None = None,
         chapter_id: int | None = None,
+        on_phase: object | None = None,
     ) -> int:
         """Save a transcription result to the database.
 
@@ -223,7 +224,7 @@ class TranscriptionRepository:
 
             # --- PHASE 5: Expression Registration & Chunking ---
             try:
-                self._register_expressions(tx_record.id, transcript, chapter_id)
+                self._register_expressions(tx_record.id, transcript, chapter_id, on_phase)
             except Exception as e:
                 logger.error(
                     "Failed to register expressions for transcription %d: %s", tx_record.id, e
@@ -232,7 +233,7 @@ class TranscriptionRepository:
             return tx_record.id
 
     def _register_expressions(
-        self, transcription_id: int, transcript: Transcript, chapter_id: int | None
+        self, transcription_id: int, transcript: Transcript, chapter_id: int | None, on_phase: object | None = None
     ) -> None:
         """Process transcription text through daemon and register semantic expressions."""
         from audiobench.daemon.factory import get_daemon_client
@@ -255,6 +256,9 @@ class TranscriptionRepository:
             for seg in transcript.segments:
                 segments_for_daemon.append({"speaker": seg.speaker, "text": seg.text})
 
+        if on_phase:
+            on_phase("embedding", "Chunking text...", 0.0)
+
         chunk_results = daemon.chunk(
             transcript.text, transcription_id, diarized, segments_for_daemon
         )
@@ -268,6 +272,19 @@ class TranscriptionRepository:
         # Step 2. Group into parents
         parent_groups = parent_child_grouper(chunks)
 
+        # Calculate exact total of vector embeddings to be generated
+        total_embeds = 1 + len(parent_groups) + sum(len(pg.children) for pg in parent_groups)
+        current_embed = 0
+
+        def _update_progress():
+            nonlocal current_embed
+            current_embed += 1
+            if on_phase and total_embeds > 0:
+                on_phase("embedding", "Generating embeddings...", float(current_embed) / total_embeds)
+
+        if on_phase:
+            on_phase("embedding", "Generating embeddings...", 0.0)
+
         # Step 3. Register Tier 1 (full cleaned text)
         cleaned_text = _clean_text(transcript.text)
         t1_expr = expr_repo.register(
@@ -278,6 +295,7 @@ class TranscriptionRepository:
 
         # Send Tier 1 to daemon for embedding
         daemon.embed(t1_expr.id, cleaned_text, SourceType.AUDIO_TRANSCRIPT)
+        _update_progress()
 
         # Step 4. Register Tier 2 and Tier 3
         for pg in parent_groups:
@@ -291,6 +309,7 @@ class TranscriptionRepository:
                 from_id=t2_expr.id, to_id=t1_expr.id, relation_type=RelationType.SOURCE.value
             )
             daemon.embed(t2_expr.id, pg.parent_text, SourceType.AUDIO_TRANSCRIPT)
+            _update_progress()
 
             # Tier 3 children
             for child in pg.children:
@@ -306,10 +325,11 @@ class TranscriptionRepository:
                 daemon.embed(
                     t3_expr.id, child.content, SourceType.AUDIO_TRANSCRIPT, speaker=child.speaker
                 )
+                _update_progress()
 
         logger.info("Registered semantic expressions for transcription %d", transcription_id)
 
-    def save_live_session(self, transcript: Transcript) -> int:
+    def save_live_session(self, transcript: Transcript, on_phase: object | None = None) -> int:
         """Save a live transcription session to the database.
 
         Live sessions have no source audio file.
@@ -352,7 +372,7 @@ class TranscriptionRepository:
             )
 
             try:
-                self._register_expressions(tx_record.id, transcript, None)
+                self._register_expressions(tx_record.id, transcript, None, on_phase)
             except Exception as e:
                 logger.error(
                     "Failed to register expressions for live session %d: %s", tx_record.id, e

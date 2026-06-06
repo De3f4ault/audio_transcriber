@@ -94,10 +94,10 @@ class ChatRepository:
             # --- PHASE 5: Expression Registration ---
             if role != "system":
                 try:
-                    from audiobench.storage.expression_repository import ExpressionRepository
-                    from audiobench.memory.enums import SourceType
                     from audiobench.daemon.factory import get_daemon_client
-                    
+                    from audiobench.memory.enums import SourceType
+                    from audiobench.storage.expression_repository import ExpressionRepository
+
                     expr_repo = ExpressionRepository()
                     expr = expr_repo.register(
                         content=content,
@@ -105,15 +105,15 @@ class ChatRepository:
                         source_id=msg.id,
                         session_type="chat",
                         session_id=conversation_id,
-                        speaker="assistant" if role == "assistant" else "user"
+                        speaker="assistant" if role == "assistant" else "user",
                     )
-                    
+
                     daemon = get_daemon_client()
                     daemon.embed(
                         expression_id=expr.id,
                         content=content,
                         source_type=SourceType.CHAT_MESSAGE,
-                        speaker="assistant" if role == "assistant" else "user"
+                        speaker="assistant" if role == "assistant" else "user",
                     )
                 except Exception as e:
                     logger.error("Failed to register chat message %d as expression: %s", msg.id, e)
@@ -234,6 +234,7 @@ class ChatRepository:
     def get_or_create_ask_log(self, audio_file_id: int) -> int:
         """Get the AskLog ID for an audio file, creating it if necessary."""
         from audiobench.storage.models import AskLog
+
         with get_session() as session:
             log = session.query(AskLog).filter_by(audio_file_id=audio_file_id).first()
             if log:
@@ -254,7 +255,8 @@ class ChatRepository:
         answer_expression_id: int | None = None,
     ) -> int:
         """Add an entry to an AskLog."""
-        from audiobench.storage.models import AskLog, AskEntry
+        from audiobench.storage.models import AskEntry, AskLog
+
         with get_session() as session:
             entry = AskEntry(
                 log_id=log_id,
@@ -301,8 +303,13 @@ class ChatRepository:
     ) -> int:
         """Save a ConversationSummary."""
         from audiobench.storage.models import ConversationSummary
+
         with get_session() as session:
-            summary = session.query(ConversationSummary).filter_by(conversation_id=conversation_id).first()
+            summary = (
+                session.query(ConversationSummary)
+                .filter_by(conversation_id=conversation_id)
+                .first()
+            )
             if not summary:
                 summary = ConversationSummary(conversation_id=conversation_id)
                 session.add(summary)
@@ -323,6 +330,7 @@ class ChatRepository:
     def update_summary_expression(self, summary_id: int, expression_id: int) -> None:
         """Update the expression ID for a ConversationSummary."""
         from audiobench.storage.models import ConversationSummary
+
         with get_session() as session:
             summary = session.query(ConversationSummary).filter_by(id=summary_id).first()
             if summary:

@@ -1,10 +1,11 @@
-import sys
 import platform
-from pathlib import Path
+import sys
 from datetime import datetime
+from pathlib import Path
+
 from jinja2 import Environment, FileSystemLoader
 
-from audiobench.cli.display.theme import console, WARNING, ACCENT, DIM, BOLD
+from audiobench.cli.display.theme import ACCENT, BOLD, DIM, WARNING, console
 
 
 class PDFExporter:
@@ -18,7 +19,7 @@ class PDFExporter:
     def _get_os_install_command(self) -> str:
         """Pragmatically detect the OS and return the exact setup command for missing C-libraries."""
         system = platform.system()
-        
+
         if system == "Darwin":
             return "brew install pango cairo glib"
         elif system == "Linux":
@@ -43,19 +44,21 @@ class PDFExporter:
         """Lazy load WeasyPrint and gracefully catch missing system libraries."""
         try:
             import weasyprint  # noqa: F401
-        except ImportError as e:
+        except ImportError:
             console.print(f"  [{WARNING}]Missing Python package:[/] weasyprint")
             console.print(f"  [{DIM}]Run:[/] pip install weasyprint jinja2")
             sys.exit(1)
         except OSError as e:
             # This happens when dlopen() fails to load Cairo or Pango
             console.print(f"\n  [{BOLD}][{WARNING}]System Dependency Missing[/][/]")
-            console.print(f"  AudioBench uses WeasyPrint for professional PDF generation.")
-            console.print(f"  This requires the [b]Cairo[/] and [b]Pango[/] graphics libraries to be installed on your system.")
+            console.print("  AudioBench uses WeasyPrint for professional PDF generation.")
+            console.print(
+                "  This requires the [b]Cairo[/] and [b]Pango[/] graphics libraries to be installed on your system."
+            )
             console.print()
             console.print(f"  [{DIM}]Error details:[/] {e}")
             console.print()
-            
+
             cmd = self._get_os_install_command()
             console.print(f"  [{BOLD}]To fix this on your system, run:[/]")
             console.print(f"    [{ACCENT}]{cmd}[/]\n")
@@ -77,15 +80,15 @@ class PDFExporter:
 
         # 1. Prepare data context
         file_name = rec.get("file_name", f"Transcript #{rec['id']}")
-        
+
         # Format segments with human-readable timestamps
         segments = rec.get("segments", [])
         for seg in segments:
             seg["start_formatted"] = self._format_time(seg.get("start", 0))
             seg["end_formatted"] = self._format_time(seg.get("end", 0))
-            
+
             # Map raw speaker IDs (e.g. SPEAKER_00) to names if a mapping exists
-            # For this simple exporter, we just rely on what is in the segment, 
+            # For this simple exporter, we just rely on what is in the segment,
             # or if the user used map_speakers during diarization, the names are already in the DB.
             if "speaker" in seg and "speaker_name" not in seg:
                 seg["speaker_name"] = seg["speaker"]
@@ -112,10 +115,10 @@ class PDFExporter:
             "model": rec.get("model_name", "unknown"),
             "segments": segments,
             "chapter_map": chapter_map,
-            # We don't have a DB field for AI summary yet natively stored on the transcript record 
+            # We don't have a DB field for AI summary yet natively stored on the transcript record
             # in standard AudioBench unless implemented via dot-commands saving.
             # So summary will be empty for now.
-            "summary": rec.get("summary", ""), 
+            "summary": rec.get("summary", ""),
         }
 
         # 2. Render HTML
@@ -125,9 +128,9 @@ class PDFExporter:
         # 3. Generate PDF
         # We wrap HTML in WeasyPrint's HTML class and call write_pdf
         pdf_file = weasyprint.HTML(string=html_content).write_pdf()
-        
+
         # 4. Save to disk
         out_path = Path(output_path)
         out_path.write_bytes(pdf_file)
-        
+
         return out_path

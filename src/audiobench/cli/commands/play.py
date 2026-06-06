@@ -26,7 +26,6 @@ from audiobench.cli.display.theme import (
     WARNING,
     console,
     error_panel,
-
 )
 
 # ── Engine priority for smart transcript selection ──
@@ -72,9 +71,7 @@ def _score_transcript(record: dict) -> int:
     return engine_score + model_score + word_bonus
 
 
-def _find_best_transcript_for_file(
-    repo, file_path: str
-) -> dict | None:
+def _find_best_transcript_for_file(repo, file_path: str) -> dict | None:
     """Find the best transcript for a given audio file path.
 
     Searches all transcripts that reference the same audio file
@@ -90,9 +87,7 @@ def _find_best_transcript_for_file(
     with get_session() as session:
         # Find audio records matching this file path
         audio_records = (
-            session.query(AudioFileRecord)
-            .filter(AudioFileRecord.file_path == resolved)
-            .all()
+            session.query(AudioFileRecord).filter(AudioFileRecord.file_path == resolved).all()
         )
 
         if not audio_records:
@@ -182,7 +177,6 @@ def _play_with_lyrics(
 ) -> None:
     """Play audio with interactive controls and synchronized transcript."""
     import select
-
     import termios
     import tty
 
@@ -240,8 +234,11 @@ def _play_with_lyrics(
         from audiobench.storage.bookmark_repository import (
             BOOKMARK_TYPES,
             BookmarkRepository,
+        )
+        from audiobench.storage.bookmark_repository import (
             _format_timestamp as _bfmt,
         )
+
         bookmark_repo = BookmarkRepository()
 
     def _set_flash(msg: str) -> None:
@@ -308,13 +305,13 @@ def _play_with_lyrics(
                             seq = sys.stdin.read(1)
                             if seq == "[":
                                 arrow = sys.stdin.read(1)
-                                if arrow == "C":     # → seek +5s
+                                if arrow == "C":  # → seek +5s
                                     mpv.seek(5)
-                                elif arrow == "D":   # ← seek -5s
+                                elif arrow == "D":  # ← seek -5s
                                     mpv.seek(-5)
-                                elif arrow == "A":   # ↑ seek +60s
+                                elif arrow == "A":  # ↑ seek +60s
                                     mpv.seek(60)
-                                elif arrow == "B":   # ↓ seek -60s
+                                elif arrow == "B":  # ↓ seek -60s
                                     mpv.seek(-60)
 
                     # ── Bookmark keybindings ──
@@ -327,12 +324,13 @@ def _play_with_lyrics(
                             if seg_text:
                                 auto_name = seg_text[:80]
                         bid = bookmark_repo.add(
-                            audio_file_id, pos,
+                            audio_file_id,
+                            pos,
                             name=auto_name,
                             transcription_id=transcription_id,
                         )
                         last_bookmark_id = bid
-                        _set_flash(f"🔖 {_bfmt(pos)} \"{auto_name[:40]}\"")
+                        _set_flash(f'🔖 {_bfmt(pos)} "{auto_name[:40]}"')
 
                     elif key == "B" and bookmark_repo and audio_file_id:
                         # Region start/end toggle
@@ -343,7 +341,9 @@ def _play_with_lyrics(
                         else:
                             auto_name = f"Region {_bfmt(region_start)}→{_bfmt(pos)}"
                             bid = bookmark_repo.add_region(
-                                audio_file_id, region_start, pos,
+                                audio_file_id,
+                                region_start,
+                                pos,
                                 name=auto_name,
                                 transcription_id=transcription_id,
                             )
@@ -423,9 +423,7 @@ def _play_with_lyrics(
                         f"  {bar}{speed_str}"
                     )
                     progress_text = Text(progress_line)
-                    progress_text.stylize(
-                        "bold cyan" if paused else "dim"
-                    )
+                    progress_text.stylize("bold cyan" if paused else "dim")
                     parts.append(Text(""))
                     parts.append(Align.center(progress_text))
                     parts.append(Text(""))
@@ -495,8 +493,7 @@ def _play_with_lyrics(
                     )
                 else:
                     ctrl_str = (
-                        "␣ pause  ←→ ±5s  ↑↓ ±60s  [ ] speed  "
-                        "9/0 vol  m mute  ⌫ reset  q quit"
+                        "␣ pause  ←→ ±5s  ↑↓ ±60s  [ ] speed  9/0 vol  m mute  ⌫ reset  q quit"
                     )
                 controls = Text(ctrl_str, style="dim")
                 parts.append(Text(""))
@@ -513,15 +510,11 @@ def _play_with_lyrics(
                 time.sleep(0.1)  # 10fps for smooth sync
 
         # Playback finished naturally
-        _show_listen_stats(
-            listen_start, mpv.get_position(), listen_start_pos, total_duration
-        )
+        _show_listen_stats(listen_start, mpv.get_position(), listen_start_pos, total_duration)
 
     except KeyboardInterrupt:
         mpv.terminate()
-        _show_listen_stats(
-            listen_start, current_time, listen_start_pos, total_duration
-        )
+        _show_listen_stats(listen_start, current_time, listen_start_pos, total_duration)
     finally:
         # Restore terminal
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -550,8 +543,7 @@ def _show_listen_stats(
     if total_duration > 0:
         pct = min(end_pos / total_duration * 100, 100)
         console.print(
-            f"  [{DIM}]Listened:  {_sfmt(listened)} "
-            f"({pct:.0f}% of {_sfmt(total_duration)})[/]"
+            f"  [{DIM}]Listened:  {_sfmt(listened)} ({pct:.0f}% of {_sfmt(total_duration)})[/]"
         )
     else:
         console.print(f"  [{DIM}]Listened:  {_sfmt(listened)}[/]")
@@ -776,16 +768,21 @@ def play(
             audio_id = record.get("audio_file_id")
             if audio_id:
                 from audiobench.storage.chapter_repository import get_chapter_repo
+
                 chap = get_chapter_repo().get_chapter_by_index(audio_id, chapter)
                 if chap:
                     start_seconds = chap.start_time
                     if not quiet:
                         console.print(f"  [{DIM}]Starting from Chapter {chapter}: {chap.title}[/]")
                 else:
-                    console.print(error_panel("Not found", f"Chapter {chapter} does not exist for this file."))
+                    console.print(
+                        error_panel("Not found", f"Chapter {chapter} does not exist for this file.")
+                    )
                     sys.exit(1)
         else:
-            console.print(error_panel("No Record", "Cannot use --chapter without a database record."))
+            console.print(
+                error_panel("No Record", "Cannot use --chapter without a database record.")
+            )
             sys.exit(1)
     elif seek_to:
         parsed = _parse_timestamp(seek_to)
@@ -809,8 +806,7 @@ def play(
 
         if not segments:
             console.print(
-                f"  [{WARNING}]Transcript has no segments — "
-                f"falling back to plain playback.[/]"
+                f"  [{WARNING}]Transcript has no segments — falling back to plain playback.[/]"
             )
             lyrics = False
             watch = False
@@ -829,8 +825,7 @@ def play(
             )
         if start_seconds > 0:
             console.print(
-                f"    From:   {int(start_seconds // 60):02d}:"
-                f"{int(start_seconds % 60):02d}"
+                f"    From:   {int(start_seconds // 60):02d}:{int(start_seconds % 60):02d}"
             )
         if speed:
             console.print(f"    Speed:  {speed:.1f}x")
@@ -857,7 +852,11 @@ def play(
     if show_bookmarks and audio_file_id and not quiet:
         from audiobench.storage.bookmark_repository import (
             BOOKMARK_TYPES as _BM_TYPES,
+        )
+        from audiobench.storage.bookmark_repository import (
             BookmarkRepository as _BmRepo,
+        )
+        from audiobench.storage.bookmark_repository import (
             _format_timestamp as _bfmt,
         )
 
@@ -870,9 +869,7 @@ def play(
                 t = _bfmt(bm["timestamp"])
                 if bm.get("is_region") and bm.get("end_timestamp"):
                     t += f"→{_bfmt(bm['end_timestamp'])}"
-                console.print(
-                    f"    [{DIM}]#{bm['id']}[/] {emoji} {t}  {bm['name'][:40]}"
-                )
+                console.print(f"    [{DIM}]#{bm['id']}[/] {emoji} {t}  {bm['name'][:40]}")
             console.print()
         else:
             console.print(f"  [{DIM}]No bookmarks yet (press b during playback)[/]")
@@ -898,40 +895,53 @@ def play(
             if not quiet:
                 from audiobench.storage.bookmark_repository import (
                     BOOKMARK_TYPES,
+                )
+                from audiobench.storage.bookmark_repository import (
                     _format_timestamp as _bfmt,
                 )
+
                 emoji = BOOKMARK_TYPES.get(bm["bookmark_type"], "🔖")
                 console.print(
-                    f"    From:   {emoji} #{bm['id']} {_bfmt(start_seconds)} "
-                    f"\"{bm['name'][:40]}\""
+                    f'    From:   {emoji} #{bm["id"]} {_bfmt(start_seconds)} "{bm["name"][:40]}"'
                 )
         else:
-            console.print(
-                error_panel("Bookmark not found", f"'{from_bookmark}'")
-            )
+            console.print(error_panel("Bookmark not found", f"'{from_bookmark}'"))
             sys.exit(1)
 
     # ── Route to mode ──
     if lyrics and segments:
         _play_with_lyrics(
-            file_path, segments, record_name,
-            start_seconds, speed, total_duration,
+            file_path,
+            segments,
+            record_name,
+            start_seconds,
+            speed,
+            total_duration,
             resume=resume,
             audio_file_id=audio_file_id,
             transcription_id=transcription_id,
         )
     elif watch and segments:
         _play_with_subtitles(
-            file_path, segments, record_name,
-            start_seconds, speed,
+            file_path,
+            segments,
+            record_name,
+            start_seconds,
+            speed,
         )
     else:
         # Plain playback
         cmd = [
-            "ffplay", "-autoexit",
-            "-window_title", f"AudioBench: {record_name}",
-            "-x", "1", "-y", "1",
-            "-loglevel", "quiet",
+            "ffplay",
+            "-autoexit",
+            "-window_title",
+            f"AudioBench: {record_name}",
+            "-x",
+            "1",
+            "-y",
+            "1",
+            "-loglevel",
+            "quiet",
             str(file_path),
         ]
         if start_seconds > 0:
@@ -942,10 +952,7 @@ def play(
 
         if not quiet:
             console.print(f"  [{ACCENT}]▶[/] Playing: {record_name}")
-            console.print(
-                f"  [{DIM}]Press 'q' in the popup window to stop, "
-                f"or Ctrl+C here[/]"
-            )
+            console.print(f"  [{DIM}]Press 'q' in the popup window to stop, or Ctrl+C here[/]")
             console.print()
 
         try:

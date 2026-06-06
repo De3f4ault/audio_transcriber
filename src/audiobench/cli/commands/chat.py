@@ -209,8 +209,7 @@ def _handle_slash_command(
             session._compare_model = None  # noqa: SLF001
             if old:
                 console.print(
-                    f"  [{SUCCESS}]✓ Comparison mode OFF[/] "
-                    f"[{DIM}](was comparing with {old})[/]"
+                    f"  [{SUCCESS}]✓ Comparison mode OFF[/] [{DIM}](was comparing with {old})[/]"
                 )
             else:
                 console.print(f"  [{DIM}]Comparison mode was already off[/]")
@@ -221,8 +220,7 @@ def _handle_slash_command(
         session._compare_model = new_model  # noqa: SLF001
         if old and old != new_model:
             console.print(
-                f"  [{ACCENT}]⚡ Switched comparison:[/] "
-                f"[{DIM}]{old}[/] → [{BOLD}]{new_model}[/]"
+                f"  [{ACCENT}]⚡ Switched comparison:[/] [{DIM}]{old}[/] → [{BOLD}]{new_model}[/]"
             )
         else:
             console.print(
@@ -237,6 +235,8 @@ def _handle_slash_command(
         from audiobench.storage.bookmark_repository import (
             BOOKMARK_TYPES,
             BookmarkRepository,
+        )
+        from audiobench.storage.bookmark_repository import (
             _format_timestamp as _bfmt,
         )
 
@@ -271,9 +271,7 @@ def _handle_slash_command(
             time_str = _bfmt(b["timestamp"])
             if b.get("is_region") and b.get("end_timestamp"):
                 time_str += f"→{_bfmt(b['end_timestamp'])}"
-            console.print(
-                f"    [{DIM}]#{b['id']}[/] {emoji} {time_str}  {b['name'][:40]}"
-            )
+            console.print(f"    [{DIM}]#{b['id']}[/] {emoji} {time_str}  {b['name'][:40]}")
         console.print()
 
     else:
@@ -292,7 +290,14 @@ def _handle_slash_command(
 @click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Interactive wizard")
 @click.option("--chapter", type=int, default=None, help="Ask about a specific chapter")
 @click.option("--log", is_flag=True, help="View the full ask log for an audio file")
-def ask(transcript_id: int | None, question: str | None, model: str | None, interactive_mode: bool = False, chapter: int | None = None, log: bool = False) -> None:
+def ask(
+    transcript_id: int | None,
+    question: str | None,
+    model: str | None,
+    interactive_mode: bool = False,
+    chapter: int | None = None,
+    log: bool = False,
+) -> None:
     """Ask a question about a transcript using AI.
 
     \b
@@ -301,18 +306,20 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
       audiobench ask 3 "Who is responsible for the API?"
       audiobench ask 3 "List all mentioned dates" --model deepseek-v3.2
     """
+    import sys
+
     from audiobench.chat.context_builder import TRANSCRIPT_SYSTEM, qa
     from audiobench.chat.providers.ollama_provider import AIError, OllamaClient
+    from audiobench.cli.display.theme import ACCENT, BOLD, DIM
     from audiobench.core.db_engine import init_db
     from audiobench.storage.repository import TranscriptionRepository
-    from audiobench.cli.display.theme import BOLD, ACCENT, DIM
-    import sys
 
     settings = get_settings()
     model_name = model or settings.ollama_model
 
     if interactive_mode:
-        from audiobench.cli.wizard import prompt_transcription, prompt_string
+        from audiobench.cli.wizard import prompt_string, prompt_transcription
+
         try:
             if not transcript_id:
                 transcript_id = prompt_transcription("Select a transcript to query")
@@ -336,41 +343,43 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
     if not record:
         console.print(error_panel("Not found", f"Transcript #{transcript_id} not found"))
         return
-        
+
     audio_file_id = record.get("audio_file_id")
 
     if log:
-        from audiobench.core.db_session import get_session
-        from audiobench.storage.models import AskLog, AskEntry
         from rich.table import Table
-        
+
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.models import AskLog
+
         with get_session() as session:
             ask_log = session.query(AskLog).filter_by(audio_file_id=audio_file_id).first()
             if not ask_log or not ask_log.entries:
                 console.print(f"[dim]No ask log entries found for audio file #{audio_file_id}.[/]")
                 return
-                
+
             table = Table(title=f"Ask Log for Audio #{audio_file_id}")
             table.add_column("Date", style="dim")
             table.add_column("Model", style="blue")
             table.add_column("Question", style="green")
             table.add_column("Answer")
-            
+
             for entry in ask_log.entries:
                 table.add_row(
                     entry.created_at.strftime("%Y-%m-%d %H:%M"),
                     entry.model_name,
                     entry.question,
-                    entry.answer[:100] + ("..." if len(entry.answer) > 100 else "")
+                    entry.answer[:100] + ("..." if len(entry.answer) > 100 else ""),
                 )
-            
+
             console.print(table)
         return
-        
+
     if chapter is not None:
+        from audiobench.core.db_session import get_session
         from audiobench.storage.chapter_repository import get_chapter_repo
         from audiobench.storage.models import ChapterRecord
-        from audiobench.core.db_session import get_session
+
         audio_file_id = record.get("audio_file_id")
         if audio_file_id:
             chap = get_chapter_repo().get_chapter_by_index(audio_file_id, chapter)
@@ -383,10 +392,18 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
                     if chap_record:
                         record = chap_record
                     else:
-                        console.print(error_panel("Chapter Not Found", f"Chapter {chapter} transcript is missing."))
+                        console.print(
+                            error_panel(
+                                "Chapter Not Found", f"Chapter {chapter} transcript is missing."
+                            )
+                        )
                     return
             else:
-                console.print(error_panel("Chapter Not Ready", f"Chapter {chapter} is missing or not transcribed."))
+                console.print(
+                    error_panel(
+                        "Chapter Not Ready", f"Chapter {chapter} is missing or not transcribed."
+                    )
+                )
                 return
 
     console.print()
@@ -416,17 +433,19 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
             return
 
         import time as _time
+
+        from rich.console import Group
         from rich.live import Live
         from rich.markdown import Markdown as RichMarkdown
         from rich.padding import Padding
-        from rich.console import Group
         from rich.text import Text
+
         from audiobench.cli.display.theme import CHAT_CODE_THEME, DIM
-        
+
         content_parts = []
         token_count = 0
         t_start = _time.monotonic()
-        
+
         with Live(
             console=console,
             refresh_per_second=8,
@@ -435,17 +454,17 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
             for token in client.stream(prompt, system_prompt=TRANSCRIPT_SYSTEM):
                 content_parts.append(token)
                 token_count += 1
-                
+
                 full_text = "".join(content_parts)
                 preview_lines = full_text.splitlines()
                 display_parts = []
-                
+
                 if len(preview_lines) > 8:
                     preview = "\n".join(preview_lines[-8:])
                     display_parts.append(Text("  ⋮\n", style="dim"))
                 else:
                     preview = full_text
-                    
+
                 display_parts.append(Text(preview))
                 elapsed_so_far = _time.monotonic() - t_start
                 tps_so_far = token_count / elapsed_so_far if elapsed_so_far > 0 else 0
@@ -468,50 +487,50 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
         elapsed = _time.monotonic() - t_start
         if token_count > 0 and elapsed > 0:
             tps = token_count / elapsed
-            console.print(
-                f"  [{DIM}]{token_count} tokens · {tps:.1f} tok/s · {elapsed:.1f}s[/]"
-            )
+            console.print(f"  [{DIM}]{token_count} tokens · {tps:.1f} tok/s · {elapsed:.1f}s[/]")
         console.print()
 
         # --- PHASE 5.3: Ask Log & Expression Wiring ---
         from audiobench.chat.chat_store import ChatRepository
-        from audiobench.storage.expression_repository import ExpressionRepository
-        from audiobench.memory.enums import SourceType, RelationType
-        from audiobench.daemon.factory import get_daemon_client
         from audiobench.core.logger_factory import get_logger
-        
+        from audiobench.daemon.factory import get_daemon_client
+        from audiobench.memory.enums import RelationType, SourceType
+        from audiobench.storage.expression_repository import ExpressionRepository
+
         _logger = get_logger("cmd.ask")
-        
+
         audio_file_id = record.get("audio_file_id")
         if audio_file_id:
             chat_repo = ChatRepository()
             log_id = chat_repo.get_or_create_ask_log(audio_file_id)
-            
+
             expr_repo = ExpressionRepository()
-            
+
             # 1. Register Query Expression
             q_expr = expr_repo.register(
                 content=question,
                 source_type=SourceType.ASK_QUERY.value,
                 source_id=log_id,
             )
-            
+
             # 2. Register Answer Expression
             a_expr = expr_repo.register(
                 content=final_md,
                 source_type=SourceType.ASK_ANSWER.value,
                 source_id=log_id,
             )
-            
+
             # 3. Link Query -> Answer (Wait, relation_type is source)
             # Query is the source of the answer? No, Answer is derived from Query.
             # Relation(from=a_expr, to=q_expr, type=source)
-            expr_repo.link(from_id=a_expr.id, to_id=q_expr.id, relation_type=RelationType.SOURCE.value)
-            
+            expr_repo.link(
+                from_id=a_expr.id, to_id=q_expr.id, relation_type=RelationType.SOURCE.value
+            )
+
             # 4. Link Answer -> Transcript Expression?
             # To do this, we need the Tier 1 transcript expression. We don't have its ID immediately,
             # but we can look it up or we can just link to the transcript ID in source_id (already done).
-            
+
             chat_repo.add_ask_entry(
                 log_id=log_id,
                 question=question,
@@ -520,7 +539,7 @@ def ask(transcript_id: int | None, question: str | None, model: str | None, inte
                 question_expression_id=q_expr.id,
                 answer_expression_id=a_expr.id,
             )
-            
+
             try:
                 daemon = get_daemon_client()
                 daemon.embed(
@@ -671,24 +690,33 @@ def chat(
     # ── Handle --delete ──
     if summary is not None:
         init_db()
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+
         from audiobench.core.db_session import get_session
         from audiobench.storage.models import ConversationSummary
-        from rich.panel import Panel
-        from rich.markdown import Markdown
 
         with get_session() as session:
             record = session.query(ConversationSummary).filter_by(conversation_id=summary).first()
             if not record:
-                console.print(error_panel("Not found", f"Session summary for conversation #{summary} not found."))
+                console.print(
+                    error_panel(
+                        "Not found", f"Session summary for conversation #{summary} not found."
+                    )
+                )
                 import sys
+
                 sys.exit(1)
 
             md = f"**Narrative**: {record.narrative}\n\n"
             md += f"**Key Insights**: {record.key_insights}\n\n"
             md += f"**Open Threads**: {record.open_threads}\n\n"
-            
-            console.print(Panel(Markdown(md), title=f"Session Summary #{summary}", border_style="blue"))
+
+            console.print(
+                Panel(Markdown(md), title=f"Session Summary #{summary}", border_style="blue")
+            )
         import sys
+
         sys.exit(0)
 
     if delete_id is not None:
@@ -745,9 +773,10 @@ def chat(
         record = tx_repo.get_by_id(tid)
         if record:
             if chapter is not None:
+                from audiobench.core.db_session import get_session
                 from audiobench.storage.chapter_repository import get_chapter_repo
                 from audiobench.storage.models import ChapterRecord
-                from audiobench.core.db_session import get_session
+
                 audio_file_id = record.get("audio_file_id")
                 if audio_file_id:
                     chap = get_chapter_repo().get_chapter_by_index(audio_file_id, chapter)
@@ -758,14 +787,20 @@ def chat(
                         if tx_id:
                             chap_record = tx_repo.get_by_id(tx_id)
                             if chap_record:
-                                chap_record["file_name"] = f"{record['file_name']} (Chapter {chapter}: {chap.title})"
+                                chap_record["file_name"] = (
+                                    f"{record['file_name']} (Chapter {chapter}: {chap.title})"
+                                )
                                 transcripts_to_load.append(chap_record)
                                 continue
                             else:
-                                console.print(f"  [{DIM}]Chapter {chapter} transcript not found, skipping[/]")
+                                console.print(
+                                    f"  [{DIM}]Chapter {chapter} transcript not found, skipping[/]"
+                                )
                                 continue
                     else:
-                        console.print(f"  [{DIM}]Chapter {chapter} not found or not transcribed, skipping[/]")
+                        console.print(
+                            f"  [{DIM}]Chapter {chapter} not found or not transcribed, skipping[/]"
+                        )
                         continue
             transcripts_to_load.append(record)
         else:
@@ -847,14 +882,10 @@ def chat(
                 if len(msg["thinking"]) > 300:
                     think_preview += "…"
                 parts.append(Text(f"💭 {think_preview}", style="dim italic"))
-            parts.append(
-                RichMarkdown(msg["content"], code_theme=CHAT_CODE_THEME)
-            )
+            parts.append(RichMarkdown(msg["content"], code_theme=CHAT_CODE_THEME))
             model_label = msg.get("model_name") or "Model"
             border = "cyan" if side == "left" else "magenta"
-            layout[side].update(
-                Panel(Group(*parts), title=model_label, border_style=border)
-            )
+            layout[side].update(Panel(Group(*parts), title=model_label, border_style=border))
         console.print(layout)
 
     # ── Render past messages on resume ──
@@ -1055,9 +1086,7 @@ def chat(
                 )
 
             # Save user message
-            chat_repo.add_message(
-                session.conversation_id, "user", user_text
-            )
+            chat_repo.add_message(session.conversation_id, "user", user_text)
             session._messages.append(  # noqa: SLF001
                 {"role": "user", "content": user_text}
             )
@@ -1071,12 +1100,14 @@ def chat(
                 thinking=res_a["thinking"],
                 model_name=res_a["model_name"],
             )
-            session._messages.append({  # noqa: SLF001
-                "role": "assistant",
-                "content": res_a["content"],
-                "thinking": res_a["thinking"],
-                "model_name": res_a["model_name"],
-            })
+            session._messages.append(
+                {  # noqa: SLF001
+                    "role": "assistant",
+                    "content": res_a["content"],
+                    "thinking": res_a["thinking"],
+                    "model_name": res_a["model_name"],
+                }
+            )
 
             # Save Model B response
             res_b = result["model_b"]
@@ -1087,20 +1118,20 @@ def chat(
                 thinking=res_b["thinking"],
                 model_name=res_b["model_name"],
             )
-            session._messages.append({  # noqa: SLF001
-                "role": "assistant",
-                "content": res_b["content"],
-                "thinking": res_b["thinking"],
-                "model_name": res_b["model_name"],
-            })
+            session._messages.append(
+                {  # noqa: SLF001
+                    "role": "assistant",
+                    "content": res_b["content"],
+                    "thinking": res_b["thinking"],
+                    "model_name": res_b["model_name"],
+                }
+            )
 
             # Stats
             elapsed = result["elapsed"]
             total_tokens = res_a["tokens"] + res_b["tokens"]
             tps = total_tokens / elapsed if elapsed > 0 else 0
-            console.print(
-                f"  [{DIM}]{total_tokens} tok · {tps:.0f} tok/s · {elapsed:.1f}s[/]"
-            )
+            console.print(f"  [{DIM}]{total_tokens} tok · {tps:.0f} tok/s · {elapsed:.1f}s[/]")
             console.print()
 
             # Trigger title generation if first turn
@@ -1120,12 +1151,11 @@ def chat(
     def _read_multiline() -> str:
         """Read multi-line input via prompt_toolkit (Alt+Enter or \"\"\" to end)."""
         console.print(
-            f'  [{DIM}]Multi-line mode — type \"\"\" on its own line or press '
-            f'Alt+Enter to submit:[/]'
+            f'  [{DIM}]Multi-line mode — type """ on its own line or press Alt+Enter to submit:[/]'
         )
         try:
             text = _pt_session.prompt(
-                ANSI('\033[38;5;240m... \033[0m'),
+                ANSI("\033[38;5;240m... \033[0m"),
                 multiline=True,
             )
         except (EOFError, KeyboardInterrupt):
@@ -1147,23 +1177,24 @@ def chat(
     def _trigger_summary(conv_id: int, messages: list[dict], repo, settings) -> None:
         """Trigger summary generation in a background thread."""
         import threading
-        
+
         def run_summary():
-            from audiobench.chat.summary_generator import SummaryGenerator
-            from audiobench.storage.expression_repository import ExpressionRepository
-            from audiobench.memory.enums import SourceType
-            from audiobench.daemon.factory import get_daemon_client
             import json
-            
+
+            from audiobench.chat.summary_generator import SummaryGenerator
+            from audiobench.daemon.factory import get_daemon_client
+            from audiobench.memory.enums import SourceType
+            from audiobench.storage.expression_repository import ExpressionRepository
+
             gen = SummaryGenerator()
             result = gen.generate(messages)
             if not result:
                 return
-                
+
             # Update title
             if result.refined_title:
                 repo.update_title(conv_id, result.refined_title)
-                
+
             # Write Expression
             expr_repo = ExpressionRepository()
             expr = expr_repo.register(
@@ -1173,7 +1204,7 @@ def chat(
                 session_type="chat",
                 session_id=conv_id,
             )
-            
+
             # Save ConversationSummary record
             repo.save_summary(
                 conversation_id=conv_id,
@@ -1185,7 +1216,7 @@ def chat(
                 generated_by=gen.model_name,
                 expression_id=expr.id,
             )
-            
+
             # Embed Expression
             try:
                 daemon = get_daemon_client()
@@ -1194,20 +1225,53 @@ def chat(
                     content=result.narrative,
                     source_type=SourceType.SESSION_SUMMARY,
                 )
-            except Exception as ex:
-                pass # Already logged by DaemonFactory/Client
-                
+            except Exception:
+                pass  # Already logged by DaemonFactory/Client
+
         thread = threading.Thread(target=run_summary, daemon=True)
         thread.start()
+
+    def _push_exit_frame() -> None:
+        """Push a navigation frame onto the REPL session stack (if inside REPL).
+
+        The chat command can be invoked two ways:
+          1. Directly: `audiobench chat 152`  — no REPL session, no-op.
+          2. Via REPL: `\\chat` or `chat 152`   — ReplSession is accessible
+             through Click's parent context object.
+
+        We look for a ReplSession on the Click context; if absent we skip
+        silently so standalone invocations are unaffected.
+        """
+        if not session.conversation_id:
+            return
+        try:
+            from audiobench.cli.repl.session import NavigationFrame, ReplSession
+            ctx = click.get_current_context(silent=True)
+            # Walk up the Click context chain looking for a ReplSession
+            repl_session: ReplSession | None = None
+            while ctx is not None:
+                obj = getattr(ctx, "obj", None)
+                if isinstance(obj, ReplSession):
+                    repl_session = obj
+                    break
+                ctx = getattr(ctx, "parent", None)
+            if repl_session is not None:
+                repl_session.push_frame(NavigationFrame(
+                    context="chat",
+                    state={"conversation_id": session.conversation_id},
+                    intent="mid-conversation",
+                ))
+        except Exception:
+            pass  # Never crash on exit cleanup
 
     while True:
         try:
             # Show comparison mode in prompt
             cmp_active = getattr(session, "_compare_model", None)
             if cmp_active:
-                prompt_str = ANSI('\033[38;5;214m⚡ >>> \033[0m')
+                prompt_str = ANSI("\033[38;5;214m⚡ >>> \033[0m")
             else:
-                prompt_str = ANSI('\033[38;5;48m>>> \033[0m')
+                prompt_str = ANSI("\033[38;5;48m>>> \033[0m")
             user_input = _pt_session.prompt(prompt_str).strip()
         except (EOFError, KeyboardInterrupt):
             console.print()
@@ -1221,6 +1285,7 @@ def chat(
                 # --- PHASE 6.2/6.3: Wire Summary Trigger ---
                 if session.turn_count >= 3:
                     _trigger_summary(session.conversation_id, session.messages, chat_repo, settings)
+            _push_exit_frame()
             console.print(f"  [{DIM}]Goodbye![/]")
             console.print()
             break
@@ -1271,7 +1336,10 @@ def chat(
                     )
                     # --- PHASE 6.2/6.3: Wire Summary Trigger ---
                     if session.turn_count >= 3:
-                        _trigger_summary(session.conversation_id, session.messages, chat_repo, settings)
+                        _trigger_summary(
+                            session.conversation_id, session.messages, chat_repo, settings
+                        )
+                _push_exit_frame()
                 console.print(f"  [{DIM}]Goodbye![/]")
                 console.print()
                 break

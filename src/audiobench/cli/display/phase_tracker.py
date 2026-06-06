@@ -40,14 +40,16 @@ class PhaseTracker:
     summary appears at the very bottom when done.
     """
 
-    PHASES = ["loading", "converting", "uploading", "processing", "transcribing", "saving"]
+    PHASES = ["loading", "converting", "uploading", "processing", "transcribing", "diarizing", "saving", "embedding"]
     LABELS = {
         "loading": "Loading model",
         "converting": "Converting audio",
         "uploading": "Uploading",
         "processing": "Processing upload",
         "transcribing": "Transcribing",
+        "diarizing": "Diarizing speakers",
         "saving": "Saving",
+        "embedding": "Generating embeddings",
     }
     SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -67,14 +69,12 @@ class PhaseTracker:
 
     @property
     def _visible_phases(self) -> list[str]:
-        """Return phases to display, hiding 'uploading' and 'processing' if never used."""
-        hidden_unless_used = {"uploading", "processing"}
+        """Return phases to display, hiding optional phases if never used."""
+        hidden_unless_used = {"uploading", "processing", "diarizing"}
         return [
             p
             for p in self.PHASES
-            if p not in hidden_unless_used
-            or p in self.phase_times
-            or p == self._current_phase
+            if p not in hidden_unless_used or p in self.phase_times or p == self._current_phase
         ]
 
     def start(self) -> None:
@@ -242,7 +242,17 @@ class PhaseTracker:
         """Save accumulated segments to a .partial.txt file."""
         if not self.segments:
             return None
-        partial_path = str(Path(input_path).with_suffix(".partial.txt"))
+        from audiobench.core.settings import get_settings
+        import hashlib
+        
+        input_p = Path(input_path)
+        key = str(input_p.absolute()).encode("utf-8")
+        hash_prefix = hashlib.sha256(key).hexdigest()[:12]
+        
+        checkpoints_dir = get_settings().data_dir / "checkpoints"
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        
+        partial_path = str(checkpoints_dir / f"{hash_prefix}.partial.txt")
         lines = []
         for seg in self.segments:
             start = getattr(seg, "start", 0)

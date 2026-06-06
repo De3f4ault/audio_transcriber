@@ -125,9 +125,7 @@ class TranscriptRefiner:
         real-time activity display in the CLI.
         On any failure or line-count mismatch, returns the original batch.
         """
-        numbered_input = "\n".join(
-            f"{i + 1}. {text.strip()}" for i, text in enumerate(batch)
-        )
+        numbered_input = "\n".join(f"{i + 1}. {text.strip()}" for i, text in enumerate(batch))
 
         try:
             # think=True: Qwen3 uses its reasoning chain first then returns clean segments
@@ -181,9 +179,11 @@ class TranscriptRefiner:
             if line and line[0].isdigit():
                 dot_pos = line.find(".")
                 paren_pos = line.find(")")
-                sep = min(
-                    p for p in (dot_pos, paren_pos) if p > 0
-                ) if any(p > 0 for p in (dot_pos, paren_pos)) else -1
+                sep = (
+                    min(p for p in (dot_pos, paren_pos) if p > 0)
+                    if any(p > 0 for p in (dot_pos, paren_pos))
+                    else -1
+                )
                 if sep > 0:
                     lines.append(line[sep + 1 :].strip())
                     continue
@@ -218,8 +218,7 @@ class TranscriptRefiner:
             if refined and len(refined) > len(raw_text) * 0.5:
                 return refined
             logger.warning(
-                "Refinement produced suspicious output (len %d vs raw %d), "
-                "keeping raw text",
+                "Refinement produced suspicious output (len %d vs raw %d), keeping raw text",
                 len(refined),
                 len(raw_text),
             )

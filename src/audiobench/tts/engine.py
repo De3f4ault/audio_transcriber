@@ -85,8 +85,7 @@ class PiperTTSEngine:
         if not model_path.exists():
             raise TTSError(
                 f"Voice model not found: {voice_name}",
-                f"Expected at: {model_path}\n"
-                f"Download with: audiobench download-voice {voice_name}",
+                f"Expected at: {model_path}\nDownload with: audiobench download-voice {voice_name}",
             )
 
         logger.info("Loading TTS voice: %s", voice_name)

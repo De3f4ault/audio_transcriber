@@ -91,6 +91,20 @@ from audiobench.core.settings import get_settings
     help="Identify speakers (Gemini: built-in, Whisper: requires pyannote.audio + HF token)",
 )
 @click.option(
+    "--diarize-mode",
+    type=click.Choice(["fast", "accurate"]),
+    default="fast",
+    show_default=True,
+    help="fast: uses Whisper VAD + AHC (default). accurate: uses Pyannote.",
+)
+@click.option(
+    "--diarize-threshold",
+    type=float,
+    default=0.65,
+    show_default=True,
+    help="Distance threshold for AHC clustering in fast diarization mode.",
+)
+@click.option(
     "-R",
     "--recursive",
     is_flag=True,
@@ -197,6 +211,19 @@ from audiobench.core.settings import get_settings
     help="Internal: ID of the background job for status reporting",
 )
 @click.option(
+    "--strategy",
+    type=click.Choice(["chunk", "batch", "concurrent"]),
+    default="batch",
+    show_default=True,
+    help="Pipeline execution strategy. 'batch' transcribes all chapters first then diarizes all. 'chunk' interleaves. 'concurrent' overlaps both.",
+)
+@click.option(
+    "--pipeline-workers",
+    type=int,
+    default=2,
+    help="Worker count for --strategy concurrent.",
+)
+@click.option(
     "--interactive",
     "interactive_mode",
     is_flag=True,
@@ -220,6 +247,8 @@ def transcribe(
     initial_prompt: str | None,
     translate: bool,
     diarize: bool,
+    diarize_mode: str,
+    diarize_threshold: float,
     recursive: bool,
     extensions: str | None,
     from_file: str | None,
@@ -237,6 +266,8 @@ def transcribe(
     interactive_mode: bool,
     target_chapters: str | None,
     resume: bool,
+    strategy: str,
+    pipeline_workers: int,
     parallel: int,
     skip_ghost: bool,
 ) -> None:
@@ -246,6 +277,9 @@ def transcribe(
     Examples:
       audiobench transcribe meeting.m4a                  Print to stdout
       audiobench transcribe meeting.m4a -f srt           Auto-save meeting.srt
+      audiobench transcribe book.m4b --strategy batch    Batch mode (default)
+      audiobench transcribe book.m4b --strategy chunk    Sequential per-chapter
+      audiobench transcribe book.m4b --strategy concurrent Overlapped pipeline
       audiobench transcribe meeting.m4a -o notes.srt     Format from extension
       audiobench transcribe *.m4a -o ./out/              Batch to directory
       audiobench transcribe --fast lecture.mp3            Fast preset
@@ -277,34 +311,87 @@ def transcribe(
       audiobench transcribe file.m4a --preset meeting    Use saved preset
       audiobench transcribe dir/ --id-only               Output IDs only (piping)
     """
-    from audiobench.transcribe.transcriber import TranscriptionPipeline
     from audiobench.core.platform import SUPPORTS_BACKGROUND_JOBS
+    from audiobench.transcribe.transcriber import TranscriptionPipeline
 
     # ── Interactive wizard ──────────────────────────────────
     if interactive_mode:
         from audiobench.cli.wizard import prompt_bool, prompt_menu, prompt_string
 
-        # Resolve file for display (may be set already)
-        display_file = str(files[0]) if files else "<file>"
+        if not files:
+            source_action = prompt_menu(
+                "Select Transcription Source",
+                [
+                    ("Library", "Select files from your untranscribed library", "library"),
+                    ("Import", "Browse OS to import new files", "import"),
+                    ("Path", "Paste the file's path manually", "path"),
+                    ("Exit", "Cancel and exit", "exit"),
+                ],
+                default_idx=0,
+            )
+            
+            if source_action == "exit":
+                return
+            elif source_action == "path":
+                from audiobench.cli.wizard import prompt_file
+                p = prompt_file("Enter file path")
+                files = (p,)
+            elif source_action == "import":
+                from audiobench.cli.commands.import_cmd import run_import_flow
+                from audiobench.core.db_session import get_session
+                from audiobench.storage.models import AudioFileRecord
+                imported_ids = run_import_flow()
+                if not imported_ids:
+                    return
+                with get_session() as session:
+                    rec = session.query(AudioFileRecord).get(imported_ids[0])
+                    if rec: files = (rec.file_path,)
+            elif source_action == "library":
+                from audiobench.cli.tui.library_tui import launch_library_tui
+                from audiobench.core.db_session import get_session
+                from audiobench.storage.models import AudioFileRecord
+                result = launch_library_tui()
+                selected_ids = result.get("selected_ids", [])
+                if not selected_ids:
+                    return
+                with get_session() as session:
+                    rec = session.query(AudioFileRecord).get(selected_ids[0])
+                    if rec: files = (rec.file_path,)
+            
+            if not files:
+                return
+
+        # Resolve file for display
+        display_file = str(files[0])
         file_size_str = ""
         try:
             p = Path(display_file)
             if p.exists():
                 sz = p.stat().st_size / (1024 * 1024)
                 from audiobench.transcribe.audio_converter import probe
+
                 info = probe(display_file)
                 file_size_str = f" · {format_duration(info.duration)} · {sz:.0f} MB"
         except Exception:
             pass
 
-        console.print(f"""
-  [{BOLD}][{ACCENT}]╭─ AudioBench Transcription Wizard ─╮[/][/]
-  [{BOLD}][{ACCENT}]│  {Path(display_file).name:<32} {file_size_str:<12}│[/][/]
-  [{BOLD}][{ACCENT}]╰────────────────────────────────────────╯[/][/]
-""")
-        
+        from audiobench.cli.display.theme import BOX_STYLE
+        from rich.panel import Panel
+
+        console.print(
+            Panel(
+                f"[{BOLD}][{ACCENT}]{Path(display_file).name:<32} {file_size_str:<12}[/][/]",
+                title=f"[{BOLD}][{ACCENT}]AudioBench Transcription Wizard[/][/]",
+                title_align="left",
+                border_style=ACCENT,
+                box=BOX_STYLE,
+                expand=False,
+            )
+        )
+
         try:
             from audiobench.chapters.detector import ChapterDetector
+
             detector = ChapterDetector()
             detected_chapters = detector.detect(Path(display_file))
         except Exception:
@@ -312,19 +399,20 @@ def transcribe(
 
         try:
             if detected_chapters:
-                chapters_raw = prompt_string(
-                    f"Chapters to transcribe ({len(detected_chapters)} detected) [e.g. 1,3,5 or 1-5 — press Enter for all]",
-                    default="",
-                )
-                if chapters_raw.strip():
-                    target_chapters = chapters_raw.strip()
-                    
+                from audiobench.cli.wizard import prompt_chapters
+
+                chapter_selection = prompt_chapters(detected_chapters)
+                if chapter_selection is not None:
+                    # User picked specific chapters — pass the compact range string
+                    target_chapters = chapter_selection
+                # else: None → transcribe all; leave target_chapters as-is (None)
+
             # Engine
             chosen_engine = prompt_menu(
                 "Engine",
                 [
-                    ("Whisper",  "local, private, offline", "whisper"),
-                    ("Gemini",   "cloud, faster, smarter",  "gemini"),
+                    ("Whisper", "local, private, offline", "whisper"),
+                    ("Gemini", "cloud, faster, smarter", "gemini"),
                 ],
                 default_idx=0,
             )
@@ -335,11 +423,11 @@ def transcribe(
                 model = prompt_menu(
                     "Model",
                     [
-                        ("tiny",           "fastest, lowest quality",   "tiny"),
-                        ("base",           "fast, decent",              "base"),
-                        ("medium",         "balanced",                  "medium"),
-                        ("large-v3",       "slow, best quality",        "large-v3"),
-                        ("large-v3-turbo", "fast, near-large quality",  "large-v3-turbo"),
+                        ("tiny", "fastest, lowest quality", "tiny"),
+                        ("base", "fast, decent", "base"),
+                        ("medium", "balanced", "medium"),
+                        ("large-v3", "slow, best quality", "large-v3"),
+                        ("large-v3-turbo", "fast, near-large quality", "large-v3-turbo"),
                     ],
                     default_idx=2,
                 )
@@ -349,9 +437,9 @@ def transcribe(
                 speed_preset = prompt_menu(
                     "Speed preset",
                     [
-                        ("fast",     "beam=1, batch=4",     "fast"),
-                        ("balanced", "beam=3, batch=4",     "balanced"),
-                        ("accurate", "beam=5, sequential",  "accurate"),
+                        ("fast", "beam=1, batch=4", "fast"),
+                        ("balanced", "beam=3, batch=4", "balanced"),
+                        ("accurate", "beam=5, sequential", "accurate"),
                     ],
                     default_idx=1,
                 )
@@ -370,8 +458,8 @@ def transcribe(
                 prompt_menu(
                     "Diarization model",
                     [
-                        ("3.1 (legacy)", "slower, broader support",  "speaker-diarization-3.1"),
-                        ("3.0 (stable)", "stable general-purpose",   "speaker-diarization-3.0"),
+                        ("3.1 (legacy)", "slower, broader support", "speaker-diarization-3.1"),
+                        ("3.0 (stable)", "stable general-purpose", "speaker-diarization-3.0"),
                     ],
                     default_idx=0,
                 )  # model arg not yet wired into PyannoteDiarizer — stored for future use
@@ -380,30 +468,44 @@ def transcribe(
             chosen_fmt = prompt_menu(
                 "Output format",
                 [
-                    ("none",  "print to terminal only",  ""),
-                    ("txt",   "plain text file",          "txt"),
-                    ("srt",   "SRT subtitles",            "srt"),
-                    ("vtt",   "WebVTT subtitles",         "vtt"),
-                    ("json",  "structured JSON",          "json"),
-                    ("all",   "all formats",              "all"),
+                    ("none", "print to terminal only", ""),
+                    ("txt", "plain text file", "txt"),
+                    ("srt", "SRT subtitles", "srt"),
+                    ("vtt", "WebVTT subtitles", "vtt"),
+                    ("json", "structured JSON", "json"),
+                    ("pdf", "professional PDF document", "pdf"),
+                    ("all", "all formats", "all"),
                 ],
                 default_idx=0,
             )
             if chosen_fmt:
                 output_format = chosen_fmt
 
+            # Output directory
+            if output_format:
+                out_raw = prompt_string(
+                    "Output directory  [Enter to save next to source]",
+                    default="",
+                )
+                if out_raw.strip():
+                    output_path = out_raw.strip()
+
             # Pre-run summary
             console.print(f"\n  [{BOLD}]Ready to transcribe:[/]")
-            console.print(f"    [{DIM}]File:[/]    {display_file}")
-            console.print(f"    [{DIM}]Engine:[/]  {engine_name}")
+            console.print(f"    [{DIM}]File:[/]     {display_file}")
+            if detected_chapters:
+                console.print(f"    [{DIM}]Chapters:[/] {target_chapters if target_chapters else 'all'}")
+            console.print(f"    [{DIM}]Engine:[/]   {engine_name}")
             if model:
-                console.print(f"    [{DIM}]Model:[/]   {model}")
-            console.print(f"    [{DIM}]Speed:[/]   {speed_preset}")
+                console.print(f"    [{DIM}]Model:[/]    {model}")
+            console.print(f"    [{DIM}]Speed:[/]    {speed_preset}")
             if language:
-                console.print(f"    [{DIM}]Lang:[/]    {language}")
-            console.print(f"    [{DIM}]Diarize:[/] {'yes' if diarize else 'no'}")
+                console.print(f"    [{DIM}]Lang:[/]     {language}")
+            console.print(f"    [{DIM}]Diarize:[/]  {'yes' if diarize else 'no'}")
             if output_format:
-                console.print(f"    [{DIM}]Format:[/]  {output_format}")
+                console.print(f"    [{DIM}]Format:[/]   {output_format}")
+            if output_path:
+                console.print(f"    [{DIM}]Output:[/]   {output_path}")
             console.print()
 
             go = prompt_bool("Start transcription?", default=True)
@@ -417,7 +519,9 @@ def transcribe(
 
     if background:
         if not SUPPORTS_BACKGROUND_JOBS:
-            console.print(f"  [{WARNING}]Background jobs are only supported on Linux/macOS. Running in foreground...[/]")
+            console.print(
+                f"  [{WARNING}]Background jobs are only supported on Linux/macOS. Running in foreground...[/]"
+            )
             background = False
         else:
             from audiobench.jobs.runner import submit_job
@@ -441,7 +545,7 @@ def transcribe(
         if model:
             clean_args += ["--model", model]
         if speed_preset and speed_preset != "balanced":
-            clean_args += ["--speed", speed_preset]
+            clean_args.append(f"--{speed_preset}")
         if no_cache:
             clean_args.append("--no-cache")
         if no_timestamps:
@@ -462,6 +566,10 @@ def transcribe(
             clean_args.append("--translate")
         if diarize:
             clean_args.append("--diarize")
+        if diarize_mode and diarize_mode != "fast":
+            clean_args += ["--diarize-mode", diarize_mode]
+        if diarize_threshold != 0.65:
+            clean_args += ["--diarize-threshold", str(diarize_threshold)]
         if recursive:
             clean_args.append("--recursive")
         if extensions:
@@ -490,7 +598,7 @@ def transcribe(
         if files:
             audio_file = str(files[0])
             if len(files) > 1:
-                audio_file += f" (+{len(files)-1} more)"
+                audio_file += f" (+{len(files) - 1} more)"
 
         job_id = submit_job(clean_args, audio_file=audio_file)
         console.print(f"  [{SUCCESS}][{job_id}][/] Background job submitted")
@@ -532,27 +640,165 @@ def transcribe(
     if id_only:
         quiet = True
 
-    # ── Resolve input files ──
+    # ── Unified Staging Loop (Router) ──
     if not files and not from_file:
-        console.print(
-            error_panel(
-                "No input", "Provide files, directories, --from-file, or pipe paths via stdin (-)"
+        from audiobench.cli.commands.import_cmd import run_import_flow
+        from audiobench.cli.tui.library_tui import launch_library_tui
+        from audiobench.cli.wizard import prompt_menu
+        from audiobench.cli.wizard_checkout import prompt_checkout_cart
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.models import StagingCartItem
+
+        while True:
+            # Check cart status
+            with get_session() as session:
+                cart_count = session.query(StagingCartItem).count()
+
+            options = []
+            if cart_count > 0:
+                options.append(
+                    ("Checkout", f"Review and transcribe {cart_count} staged file(s)", "checkout")
+                )
+
+            options.extend(
+                [
+                    ("Library", "Select files from your untranscribed library", "library"),
+                    ("Import", "Browse OS to import new files", "import"),
+                    ("Path", "Paste a file path manually", "path"),
+                    ("Exit", "Cancel and exit", "exit"),
+                ]
             )
-        )
-        return
+
+            action = prompt_menu("Select Transcription Source", options, default_idx=0)
+
+            if action == "exit":
+                return
+
+            if action == "path":
+                from audiobench.cli.wizard import prompt_file
+                import os
+                p = prompt_file("Enter file path")
+                if not os.path.exists(p):
+                    console.print(f"  [{WARNING}]File does not exist: {p}[/]")
+                    continue
+                
+                # Import it invisibly so it has an audio_file_id
+                from audiobench.transcribe.audio_converter import probe
+                from audiobench.storage.repository import AudioFileRepository
+                try:
+                    info = probe(p)
+                    repo = AudioFileRepository()
+                    rec_id = repo.add_file(p, info.duration, info.format_name, info.size_bytes)
+                    with get_session() as session:
+                        if not session.query(StagingCartItem).filter_by(audio_file_id=rec_id).first():
+                            session.add(StagingCartItem(audio_file_id=rec_id))
+                        session.commit()
+                except Exception as e:
+                    console.print(f"  [{WARNING}]Failed to add path: {e}[/]")
+                continue
+
+            if action == "library":
+                result = launch_library_tui()
+                tui_action = result.get("action")
+                selected_ids = result.get("selected_ids", [])
+
+                if selected_ids:
+                    with get_session() as session:
+                        for sid in selected_ids:
+                            if (
+                                not session.query(StagingCartItem)
+                                .filter_by(audio_file_id=sid)
+                                .first()
+                            ):
+                                session.add(StagingCartItem(audio_file_id=sid))
+                        session.commit()
+
+                if tui_action == "switch_to_import":
+                    action = "import"
+                elif tui_action == "transcribe":
+                    action = "checkout"
+
+            if action == "import":
+                imported_ids = run_import_flow()
+                if imported_ids:
+                    with get_session() as session:
+                        for sid in imported_ids:
+                            if (
+                                not session.query(StagingCartItem)
+                                .filter_by(audio_file_id=sid)
+                                .first()
+                            ):
+                                session.add(StagingCartItem(audio_file_id=sid))
+                        session.commit()
+                continue
+
+            if action == "checkout":
+                checkout_action = prompt_checkout_cart()
+                if checkout_action == "cancel" or not checkout_action:
+                    continue
+                elif checkout_action == "clear":
+                    with get_session() as session:
+                        session.query(StagingCartItem).delete()
+                        session.commit()
+                    console.print(f"  [{DIM}]Cart cleared.[/]")
+                    continue
+                elif checkout_action == "edit":
+                    from audiobench.cli.wizard_checkout import edit_cart_items
+                    edit_cart_items()
+                    continue
+                elif checkout_action in ("now", "later"):
+                    from audiobench.jobs.queue_worker import _spawn_daemon, process_queue
+                    from audiobench.storage.models import JobQueueItem
+
+                    with get_session() as session:
+                        items = session.query(StagingCartItem).all()
+                        count = len(items)
+                        for item in items:
+                            file_path = item.audio_file.file_path if item.audio_file else None
+                            if file_path:
+                                session.add(
+                                    JobQueueItem(
+                                        file_path=file_path,
+                                        engine=item.engine,
+                                        model_name=item.model_name,
+                                        speed_preset=item.speed_preset,
+                                        status="pending",
+                                    )
+                                )
+                        session.query(StagingCartItem).delete()
+                        session.commit()
+
+                    if count == 0:
+                        console.print(f"  [{DIM}]Cart was empty.[/]")
+                        return
+
+                    if checkout_action == "now":
+                        console.print(
+                            f"\n  [{ACCENT}]Processing {count} files sequentially in foreground...[/]"
+                        )
+                        process_queue(foreground=True)
+                        return
+                    elif checkout_action == "later":
+                        _spawn_daemon()
+                        console.print(
+                            f"\n  [{ACCENT}]✓ Added {count} files to background queue.[/]"
+                        )
+                        return
 
     parsed_chapters = None
     if target_chapters:
-        parsed_chapters = []
-        for part in target_chapters.split(","):
-            part = part.strip()
-            if "-" in part:
-                start_str, end_str = part.split("-", 1)
-                parsed_chapters.extend(range(int(start_str), int(end_str) + 1))
-            else:
-                parsed_chapters.append(int(part))
-        parsed_chapters = sorted(list(set(parsed_chapters)))
-
+        if target_chapters.lower() == "all":
+            parsed_chapters = "all"
+        else:
+            parsed_chapters = []
+            for part in target_chapters.split(","):
+                part = part.strip()
+                if "-" in part:
+                    start_str, end_str = part.split("-", 1)
+                    parsed_chapters.extend(range(int(start_str), int(end_str) + 1))
+                else:
+                    parsed_chapters.append(int(part))
+            parsed_chapters = sorted(list(set(parsed_chapters)))
 
     resolved_files = collect_files(
         files,
@@ -714,6 +960,8 @@ def transcribe(
                 initial_prompt=initial_prompt,
                 translate=translate,
                 enable_diarization=diarize,
+                diarize_mode=diarize_mode,
+                diarize_threshold=diarize_threshold,
                 map_speakers=map_speakers,
                 auto_name=auto_name,
                 on_phase=tracker.update,
@@ -729,6 +977,7 @@ def transcribe(
 
             if job_id:
                 from audiobench.jobs.repository import JobRepository
+
                 JobRepository().mark_job_done(job_id)
 
             # For non-streaming engines (Gemini), segments aren't emitted
@@ -749,12 +998,16 @@ def transcribe(
             if quiet:
                 if resolved_format == "pdf":
                     from audiobench.export.pdf import PDFExporter
+
                     # Ensure transcript acts like a dict for PDFExporter
                     data = transcript.dict()
                     data["file_name"] = Path(str(file_path)).stem
-                    PDFExporter().export_transcript(data, resolved_output or f"{data['file_name']}.pdf")
+                    PDFExporter().export_transcript(
+                        data, resolved_output or f"{data['file_name']}.pdf"
+                    )
                 else:
                     from audiobench.output.base import get_formatter
+
                     formatter = get_formatter(resolved_format)
                     stdout.print(formatter.format(transcript), highlight=False)
             else:
@@ -802,6 +1055,7 @@ def transcribe(
                         continue
                     if extra_fmt == "pdf":
                         from audiobench.export.pdf import PDFExporter
+
                         data = transcript.dict()
                         data["file_name"] = Path(str(file_path)).stem
                         PDFExporter().export_transcript(data, extra_out)

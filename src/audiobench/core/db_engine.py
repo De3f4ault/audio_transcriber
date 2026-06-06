@@ -155,6 +155,15 @@ def init_db() -> None:
                 migrate_010(db_path)
             except Exception as e:
                 logger.warning("Migration m010 failed (non-fatal): %s", e)
+                
+            try:
+                from audiobench.storage.migrations.m011_strategy_column import (
+                    migrate as migrate_011,
+                )
+
+                migrate_011(db_path)
+            except Exception as e:
+                logger.warning("Migration m011 failed (non-fatal): %s", e)
 
             # Run the new idempotent SQL migrations (Phase 0/1)
             try:

@@ -191,20 +191,20 @@ def auto_bookmark(transcript_with_timestamps: str, *, focus: str | None = None) 
         "═══ TYPE GUIDE WITH EXAMPLES ═══\n\n"
         '  "highlight" (⭐) — Key insight, decision, or turning point\n'
         '     Example: A speaker says "we\'ve decided to pivot to Rust"\n'
-        '     Example: A profound realization or emotional breakthrough\n\n'
+        "     Example: A profound realization or emotional breakthrough\n\n"
         '  "todo" (📌) — Action item, task, commitment, or follow-up\n'
         '     Example: "I need to call Sarah about the budget by Friday"\n'
-        '     Example: Any stated intention to do something later\n\n'
+        "     Example: Any stated intention to do something later\n\n"
         '  "note" (📝) — Interesting context, background info, or observation\n'
-        '     Example: Historical background that explains a later point\n'
-        '     Example: A tangential but interesting fact or anecdote\n\n'
+        "     Example: Historical background that explains a later point\n"
+        "     Example: A tangential but interesting fact or anecdote\n\n"
         '  "bookmark" (🔖) — Important structural moment (intro, conclusion, topic shift)\n'
         '     Example: "Let me now talk about the second quarter"\n'
-        '     Example: Opening/closing of a recording or major section\n\n'
+        "     Example: Opening/closing of a recording or major section\n\n"
         '  "edit" (✂️) — Dead air, filler, tangent, repetition, or cut candidate\n'
         '     Example: Long pause, "um um um", off-topic rambling\n'
-        '     Example: Technical interruption, audio glitch, repeated content\n'
-        '     ALWAYS use both timestamp AND end_timestamp for edit regions\n\n'
+        "     Example: Technical interruption, audio glitch, repeated content\n"
+        "     ALWAYS use both timestamp AND end_timestamp for edit regions\n\n"
         "═══ RULES ═══\n\n"
         "1. TIMESTAMP PRECISION: Use the EXACT second values from the [XXs] markers.\n"
         "   Do NOT round or approximate. If a segment starts at [223.45s], use 223.45.\n"
@@ -224,5 +224,3 @@ def auto_bookmark(transcript_with_timestamps: str, *, focus: str | None = None) 
         f"{focus_block}\n"
         f"TRANSCRIPT:\n{transcript_with_timestamps}"
     )
-
-

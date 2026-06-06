@@ -30,23 +30,27 @@ def _split_segment_by_speaker(seg: Segment) -> list[tuple[str | None, float, flo
         spk = word.speaker or seg.speaker
         if spk != current_speaker and current_words:
             # Flush current chunk
-            chunks.append((
-                current_speaker,
-                current_words[0].start,
-                current_words[-1].end,
-                " ".join(w.word for w in current_words),
-            ))
+            chunks.append(
+                (
+                    current_speaker,
+                    current_words[0].start,
+                    current_words[-1].end,
+                    " ".join(w.word for w in current_words),
+                )
+            )
             current_words = []
         current_speaker = spk
         current_words.append(word)
 
     if current_words:
-        chunks.append((
-            current_speaker,
-            current_words[0].start,
-            current_words[-1].end,
-            " ".join(w.word for w in current_words),
-        ))
+        chunks.append(
+            (
+                current_speaker,
+                current_words[0].start,
+                current_words[-1].end,
+                " ".join(w.word for w in current_words),
+            )
+        )
 
     return chunks
 

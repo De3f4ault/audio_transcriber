@@ -61,3 +61,7 @@ site/
 
 # Runtime data
 data/
+
+# External repos
+telegram-media-downloader/
+Python_File_Scanner_1/

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import click
 
 
@@ -37,6 +35,7 @@ class TestReplSession:
     def test_expand_vars_with_context(self):
         session = self._make_session()
         from audiobench.core.focused_entity import FocusedEntity
+
         session.focus = FocusedEntity(type="transcript", id=42, label="Transcript #42")
         args = ["show", "$last"]
         result = session.expand_vars(args)
@@ -45,6 +44,7 @@ class TestReplSession:
     def test_auto_inject_id_context_aware(self):
         session = self._make_session()
         from audiobench.core.focused_entity import FocusedEntity
+
         session.focus = FocusedEntity(type="transcript", id=10, label="Transcript #10")
         args = ["show"]
         result = session.auto_inject_id(args)
@@ -53,6 +53,7 @@ class TestReplSession:
     def test_auto_inject_id_skips_explicit(self):
         session = self._make_session()
         from audiobench.core.focused_entity import FocusedEntity
+
         session.focus = FocusedEntity(type="transcript", id=10, label="Transcript #10")
         args = ["show", "99"]
         result = session.auto_inject_id(args)
@@ -61,6 +62,7 @@ class TestReplSession:
     def test_auto_inject_id_skips_non_aware(self):
         session = self._make_session()
         from audiobench.core.focused_entity import FocusedEntity
+
         session.focus = FocusedEntity(type="transcript", id=10, label="Transcript #10")
         args = ["history"]
         result = session.auto_inject_id(args)
@@ -69,6 +71,7 @@ class TestReplSession:
     def test_clear_context(self):
         session = self._make_session()
         from audiobench.core.focused_entity import FocusedEntity
+
         session.focus = FocusedEntity(type="transcript", id=42, label="Transcript #42")
         session.focus = None
         assert session.last_id is None
@@ -79,24 +82,24 @@ class TestSlashCommands:
     """Test slash command routing."""
 
     def test_exit_returns_true(self):
-        from audiobench.cli.repl.slash_commands import handle_slash_command
         from audiobench.cli.repl.session import ReplSession
+        from audiobench.cli.repl.slash_commands import handle_slash_command
 
         group = click.Group("test")
         session = ReplSession(group)
         assert handle_slash_command("/exit", session) is True
 
     def test_quit_returns_true(self):
-        from audiobench.cli.repl.slash_commands import handle_slash_command
         from audiobench.cli.repl.session import ReplSession
+        from audiobench.cli.repl.slash_commands import handle_slash_command
 
         group = click.Group("test")
         session = ReplSession(group)
         assert handle_slash_command("/quit", session) is True
 
     def test_unknown_returns_false(self):
-        from audiobench.cli.repl.slash_commands import handle_slash_command
         from audiobench.cli.repl.session import ReplSession
+        from audiobench.cli.repl.slash_commands import handle_slash_command
 
         group = click.Group("test")
         session = ReplSession(group)

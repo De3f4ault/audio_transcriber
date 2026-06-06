@@ -23,7 +23,6 @@ from audiobench.cli.display.theme import (
 )
 from audiobench.storage.bookmark_repository import BOOKMARK_TYPES, _format_timestamp
 
-
 # ── Helpers ─────────────────────────────────────────────────
 
 
@@ -35,21 +34,13 @@ def _resolve_audio_file_id(target: str) -> int | None:
     with get_session() as session:
         # Try as transcript ID
         if target.isdigit():
-            rec = (
-                session.query(TranscriptionRecord)
-                .filter_by(id=int(target))
-                .first()
-            )
+            rec = session.query(TranscriptionRecord).filter_by(id=int(target)).first()
             if rec and rec.audio_file_id:
                 return rec.audio_file_id
 
         # Try as file path
         resolved = str(Path(target).expanduser().resolve())
-        audio = (
-            session.query(AudioFileRecord)
-            .filter(AudioFileRecord.file_path == resolved)
-            .first()
-        )
+        audio = session.query(AudioFileRecord).filter(AudioFileRecord.file_path == resolved).first()
         if audio:
             return audio.id
 
@@ -101,7 +92,13 @@ def _parse_time_or_range(time_str: str) -> tuple[float, float | None]:
 
 
 @click.group(invoke_without_command=True)
-@click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Launch interactive bookmark wizard")
+@click.option(
+    "-i",
+    "--interactive",
+    "interactive_mode",
+    is_flag=True,
+    help="Launch interactive bookmark wizard",
+)
 @click.pass_context
 def bookmark(ctx: click.Context, interactive_mode: bool) -> None:
     """Manage audio bookmarks and region markers.
@@ -118,27 +115,27 @@ def bookmark(ctx: click.Context, interactive_mode: bool) -> None:
     init_db()
 
     if interactive_mode or ctx.invoked_subcommand is None:
-        from audiobench.cli.wizard import prompt_transcription, prompt_menu, prompt_string
+        from audiobench.cli.wizard import prompt_menu, prompt_string, prompt_transcription
         from audiobench.storage.bookmark_repository import BookmarkRepository
-        
+
         try:
             target_id = prompt_transcription("Select a transcription to manage bookmarks")
             repo = BookmarkRepository()
-            
+
             while True:
-                from audiobench.storage.models import TranscriptionRecord
                 from audiobench.core.db_session import get_session
-                
+                from audiobench.storage.models import TranscriptionRecord
+
                 audio_id = None
                 with get_session() as session:
                     rec = session.query(TranscriptionRecord).filter_by(id=target_id).first()
                     if rec:
                         audio_id = rec.audio_file_id
-                        
+
                 if not audio_id:
                     console.print(error_panel("No linked audio found"))
                     break
-                    
+
                 bms = repo.list_for_file(audio_id)
                 options = [
                     ("list", f"List bookmarks ({len(bms)})", "list"),
@@ -146,9 +143,9 @@ def bookmark(ctx: click.Context, interactive_mode: bool) -> None:
                     ("auto", "AI Auto-Bookmark", "auto"),
                     ("back", "Exit", "back"),
                 ]
-                
+
                 action = prompt_menu(f"\nBookmark Menu (Transcript #{target_id})", options)
-                
+
                 if action == "back":
                     break
                 elif action == "list":
@@ -157,11 +154,13 @@ def bookmark(ctx: click.Context, interactive_mode: bool) -> None:
                     else:
                         for b in bms:
                             time_str = _format_timestamp(b["timestamp"])
-                            if b["is_region"]: time_str += f"-{_format_timestamp(b['end_timestamp'])}"
+                            if b["is_region"]:
+                                time_str += f"-{_format_timestamp(b['end_timestamp'])}"
                             console.print(f"  [{ACCENT}]#{b['id']}[/] {time_str} - {b['name']}")
                 elif action == "add":
                     time_str = prompt_string("Timestamp (MM:SS) or Region (MM:SS-MM:SS)")
-                    if not time_str: continue
+                    if not time_str:
+                        continue
                     name = prompt_string("Name", default=f"Bookmark @ {time_str}")
                     start, end = _parse_time_or_range(time_str)
                     if end is not None:
@@ -171,8 +170,14 @@ def bookmark(ctx: click.Context, interactive_mode: bool) -> None:
                     console.print(f"  [{SUCCESS}]✓ Added bookmark '{name}'[/]")
                 elif action == "auto":
                     focus = prompt_string("Focus (e.g. 'action items', leave empty for general)")
-                    ctx.invoke(auto_cmd, target=str(target_id), model=None, focus=focus if focus else None, dry_run=False)
-                    
+                    ctx.invoke(
+                        auto_cmd,
+                        target=str(target_id),
+                        model=None,
+                        focus=focus if focus else None,
+                        dry_run=False,
+                    )
+
         except KeyboardInterrupt:
             sys.exit(0)
 
@@ -183,14 +188,18 @@ def bookmark(ctx: click.Context, interactive_mode: bool) -> None:
 @bookmark.command(name="list")
 @click.argument("target", required=False, default=None)
 @click.option(
-    "--type", "type_filter", default=None,
+    "--type",
+    "type_filter",
+    default=None,
     type=click.Choice(list(BOOKMARK_TYPES.keys())),
     help="Filter by bookmark type",
 )
 @click.option(
-    "--format", "output_format",
+    "--format",
+    "output_format",
     type=click.Choice(["table", "json", "ids"]),
-    default="table", show_default=True,
+    default="table",
+    show_default=True,
     help="Output format",
 )
 def list_cmd(
@@ -206,9 +215,7 @@ def list_cmd(
     if target:
         audio_id = _resolve_audio_file_id(target)
         if audio_id is None:
-            console.print(
-                error_panel("Not found", f"No audio file found for '{target}'")
-            )
+            console.print(error_panel("Not found", f"No audio file found for '{target}'"))
             sys.exit(1)
         bookmarks = repo.list_for_file(audio_id, type_filter=type_filter)
         file_label = _get_audio_name(audio_id)
@@ -233,6 +240,7 @@ def list_cmd(
 
     # Fetch chapters if any
     from audiobench.storage.chapter_repository import get_chapter_repo
+
     chap_repo = get_chapter_repo()
     file_chapters = {}
     if target and audio_id:
@@ -261,8 +269,7 @@ def list_cmd(
         emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "🔖")
         if b["is_region"]:
             time_str = (
-                f"{_format_timestamp(b['timestamp'])}→"
-                f"{_format_timestamp(b['end_timestamp'])}"
+                f"{_format_timestamp(b['timestamp'])}→{_format_timestamp(b['end_timestamp'])}"
             )
         else:
             time_str = _format_timestamp(b["timestamp"])
@@ -275,7 +282,7 @@ def list_cmd(
         if aid and file_chapters.get(aid):
             # Find chapter containing this bookmark's timestamp
             for ch in file_chapters[aid]:
-                end = ch.end_time if ch.end_time else float('inf')
+                end = ch.end_time if ch.end_time else float("inf")
                 if ch.start_time <= float(b["timestamp"]) <= end:
                     chapter_title = ch.title[:20]
                     break
@@ -301,7 +308,9 @@ def list_cmd(
 @click.argument("time_str", required=False, default=None)
 @click.argument("name", required=False, default=None)
 @click.option(
-    "--type", "bookmark_type", default="bookmark",
+    "--type",
+    "bookmark_type",
+    default="bookmark",
     type=click.Choice(list(BOOKMARK_TYPES.keys())),
     help="Bookmark type",
 )
@@ -320,23 +329,26 @@ def add(
 
     audio_id = _resolve_audio_file_id(target)
     if audio_id is None:
-        console.print(
-            error_panel("Not found", f"No audio file found for '{target}'")
-        )
+        console.print(error_panel("Not found", f"No audio file found for '{target}'"))
         sys.exit(1)
 
     if chapter is not None:
         from audiobench.storage.chapter_repository import get_chapter_repo
+
         chap = get_chapter_repo().get_chapter_by_index(audio_id, chapter)
         if not chap:
-            console.print(error_panel("Chapter Not Found", f"Chapter {chapter} does not exist for this file."))
+            console.print(
+                error_panel("Chapter Not Found", f"Chapter {chapter} does not exist for this file.")
+            )
             sys.exit(1)
         start = chap.start_time
         end = chap.end_time if chap.end_time else None
         name = name or chap.title
     else:
         if not time_str:
-            console.print(error_panel("Missing Argument", "You must provide either a time_str or --chapter"))
+            console.print(
+                error_panel("Missing Argument", "You must provide either a time_str or --chapter")
+            )
             sys.exit(1)
         start, end = _parse_time_or_range(time_str)
         if start == 0.0 and end is None and time_str != "00:00":
@@ -350,8 +362,12 @@ def add(
 
     if end is not None:
         bid = repo.add_region(
-            audio_id, start, end,
-            name=default_name, bookmark_type=bookmark_type, notes=notes,
+            audio_id,
+            start,
+            end,
+            name=default_name,
+            bookmark_type=bookmark_type,
+            notes=notes,
         )
         console.print(
             f"  [{SUCCESS}]✓[/] Region #{bid}: "
@@ -360,8 +376,11 @@ def add(
         )
     else:
         bid = repo.add(
-            audio_id, start,
-            name=default_name, bookmark_type=bookmark_type, notes=notes,
+            audio_id,
+            start,
+            name=default_name,
+            bookmark_type=bookmark_type,
+            notes=notes,
         )
         console.print(
             f"  [{SUCCESS}]✓[/] Bookmark #{bid}: "
@@ -382,7 +401,7 @@ def rename(bookmark_id: int, new_name: str) -> None:
 
     repo = BookmarkRepository()
     if repo.update(bookmark_id, name=new_name):
-        console.print(f"  [{SUCCESS}]✓[/] Renamed #{bookmark_id} → \"{new_name}\"")
+        console.print(f'  [{SUCCESS}]✓[/] Renamed #{bookmark_id} → "{new_name}"')
     else:
         console.print(error_panel(f"Bookmark #{bookmark_id} not found"))
         sys.exit(1)
@@ -483,9 +502,7 @@ def search(query: str, limit: int) -> None:
     for b in results:
         emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "🔖")
         time_str = _format_timestamp(b["timestamp"])
-        console.print(
-            f"    [{ACCENT}]#{b['id']}[/] {emoji} {time_str}  {b['name']}"
-        )
+        console.print(f"    [{ACCENT}]#{b['id']}[/] {emoji} {time_str}  {b['name']}")
         if b.get("notes"):
             console.print(f"         [{DIM}]{b['notes'][:60]}[/]")
 
@@ -497,9 +514,11 @@ def search(query: str, limit: int) -> None:
 @click.argument("target")
 @click.option("-o", "--output", "output_path", default=None, help="Output file")
 @click.option(
-    "--format", "fmt",
+    "--format",
+    "fmt",
     type=click.Choice(["json", "audacity"]),
-    default="json", show_default=True,
+    default="json",
+    show_default=True,
     help="Export format (json or audacity label track)",
 )
 def export_cmd(target: str, output_path: str | None, fmt: str) -> None:
@@ -520,9 +539,7 @@ def export_cmd(target: str, output_path: str | None, fmt: str) -> None:
     if output_path:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         Path(output_path).write_text(data, encoding="utf-8")
-        console.print(
-            f"  [{SUCCESS}]✓[/] Exported ({fmt}) → [{ACCENT}]{output_path}[/]"
-        )
+        console.print(f"  [{SUCCESS}]✓[/] Exported ({fmt}) → [{ACCENT}]{output_path}[/]")
     else:
         stdout.print(data, highlight=False)
 
@@ -534,9 +551,11 @@ def export_cmd(target: str, output_path: str | None, fmt: str) -> None:
 @click.argument("target")
 @click.argument("input_file", type=click.Path(exists=True))
 @click.option(
-    "--format", "fmt",
+    "--format",
+    "fmt",
     type=click.Choice(["json", "audacity", "auto"]),
-    default="auto", show_default=True,
+    default="auto",
+    show_default=True,
     help="Import format (auto-detects from content)",
 )
 def import_cmd(target: str, input_file: str, fmt: str) -> None:
@@ -652,7 +671,7 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
     if focus:
         console.print(f"    Focus:   {focus}")
     if dry_run:
-        console.print(f"    Mode:    [yellow]DRY RUN[/]")
+        console.print("    Mode:    [yellow]DRY RUN[/]")
     console.print(f"  [{DIM}]{'─' * 44}[/]")
     console.print()
 
@@ -700,7 +719,9 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
     try:
         bookmarks_data = json_lib.loads(cleaned)
     except json_lib.JSONDecodeError as e:
-        console.print(error_panel("Parse error", f"AI returned invalid JSON:\n{e}\n\nRaw:\n{cleaned[:500]}"))
+        console.print(
+            error_panel("Parse error", f"AI returned invalid JSON:\n{e}\n\nRaw:\n{cleaned[:500]}")
+        )
         sys.exit(1)
 
     if not isinstance(bookmarks_data, list):
@@ -793,4 +814,3 @@ def auto_cmd(target: str, model: str | None, focus: str | None, dry_run: bool) -
     else:
         console.print(f"  [{SUCCESS}]✓[/] Created {created} bookmark(s) via AI")
     console.print()
-

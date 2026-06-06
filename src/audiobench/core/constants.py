@@ -27,6 +27,7 @@ MIME_MAP = {
     ".webm": "audio/webm",
 }
 
+
 def get_mime(suffix: str) -> str:
     """Resolve MIME type from file extension."""
     return MIME_MAP.get(suffix.lower(), "audio/mpeg")

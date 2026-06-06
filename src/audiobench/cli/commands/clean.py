@@ -77,7 +77,8 @@ def clean(
     from audiobench.transcribe.refiner import TranscriptRefiner
 
     if interactive_mode:
-        from audiobench.cli.wizard import prompt_transcription, prompt_bool
+        from audiobench.cli.wizard import prompt_bool, prompt_transcription
+
         try:
             target_id = prompt_transcription("Select a transcription to clean")
             ids = (target_id,)
@@ -88,7 +89,11 @@ def clean(
             sys.exit(0)
 
     if not ids and not clean_all:
-        console.print(error_panel("No input", "Provide transcription ID(s) or use --all\nOr use --interactive"))
+        console.print(
+            error_panel(
+                "No input", "Provide transcription ID(s) or use --all\nOr use --interactive"
+            )
+        )
         sys.exit(1)
 
     init_db()
@@ -151,9 +156,7 @@ def clean(
     if not quiet:
         mode_label = "[dim](dry run)[/dim]" if dry_run else ""
         console.print()
-        console.print(
-            f"  [{BOLD} {ACCENT}]AudioBench[/] — Transcript Cleaning {mode_label}"
-        )
+        console.print(f"  [{BOLD} {ACCENT}]AudioBench[/] — Transcript Cleaning {mode_label}")
         console.print(f"  [{DIM}]{'─' * 44}[/]")
         console.print(f"    Model:   [{ACCENT}]{model}[/]")
         console.print(f"    Targets: {len(target_ids)} transcription(s)")
@@ -262,14 +265,10 @@ def clean(
     if not quiet:
         console.print()
         if dry_run:
-            console.print(
-                f"  [{DIM}]Dry run complete. "
-                f"Run without --dry-run to apply changes.[/]"
-            )
+            console.print(f"  [{DIM}]Dry run complete. Run without --dry-run to apply changes.[/]")
         else:
             console.print(
-                f"  [{SUCCESS}]✓[/] Cleaned: {cleaned_count}  |  "
-                f"[{DIM}]Skipped: {skipped_count}[/]"
+                f"  [{SUCCESS}]✓[/] Cleaned: {cleaned_count}  |  [{DIM}]Skipped: {skipped_count}[/]"
             )
 
 

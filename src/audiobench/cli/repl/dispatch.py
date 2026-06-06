@@ -1,6 +1,8 @@
-"""REPL command dispatch — routes user input to Click commands.
+"""REPL command dispatch — routes user input to Click commands or \ handlers.
 
 Provides:
+    - register_backslash(): Decorator to register a \\command handler
+    - dispatch_backslash(): Route \\cmd [args] to a registered handler
     - dispatch_command(): Run a Click command from the REPL
     - try_capture_last_id(): Auto-capture new transcript ID after transcribe
     - print_context_summary(): Compact one-line context display
@@ -8,7 +10,86 @@ Provides:
 
 from __future__ import annotations
 
+import difflib
+from typing import Callable
+
+# ── Backslash Handler Registry ───────────────────────────────
+#
+# Handlers are plain functions: fn(session: ReplSession, args: str) -> None
+# Register them with @register_backslash("name").
+# The registry is module-level so importing backslash_commands.py
+# is enough to populate it.
+
+_BACKSLASH_HANDLERS: dict[str, Callable] = {}
+_RESUME_HANDLERS: dict[str, Callable] = {}
+
+def register_resume(context_name: str) -> Callable:
+    """Decorator to register a resume handler for a specific stack context."""
+
+    def decorator(fn: Callable) -> Callable:
+        _RESUME_HANDLERS[context_name] = fn
+        return fn
+
+    return decorator
+
+
+def register_backslash(name: str) -> Callable:
+    """Decorator to register a \\command handler by name."""
+
+    def decorator(fn: Callable) -> Callable:
+        _BACKSLASH_HANDLERS[name] = fn
+        return fn
+
+    return decorator
+
+
+def _suggest_backslash(cmd: str) -> str | None:
+    """Return the closest registered \\command name, or None."""
+    close = difflib.get_close_matches(
+        cmd, list(_BACKSLASH_HANDLERS.keys()), n=1, cutoff=0.5
+    )
+    return close[0] if close else None
+
+
+def dispatch_backslash(session, line: str) -> bool:
+    """Route a \\command line to the registered handler.
+
+    ``line`` is the text *after* the leading backslash, e.g. ``"focus 42"``.
+    Returns True on success, False on unknown command or error.
+    """
+    from audiobench.cli.display.theme import ACCENT, DIM, WARNING, console
+
+    parts = line.strip().split(None, 1)
+    if not parts:
+        # bare backslash → show help
+        handler = _BACKSLASH_HANDLERS.get("help")
+        if handler:
+            handler(session, "")
+        return True
+
+    cmd = parts[0].lower()
+    args = parts[1] if len(parts) > 1 else ""
+
+    handler = _BACKSLASH_HANDLERS.get(cmd)
+    if handler is None:
+        suggestion = _suggest_backslash(cmd)
+        console.print(f"  [{WARNING}]Unknown: \\{cmd}[/]")
+        if suggestion:
+            console.print(f"  [{DIM}]Did you mean: [{ACCENT}]\\{suggestion}[/]?[/]")
+        else:
+            console.print(f"  [{DIM}]Type [{ACCENT}]\\help[/] for available commands.[/]")
+        return False
+
+    try:
+        handler(session, args)
+        return True
+    except Exception as e:
+        console.print(f"  [{WARNING}]Error in \\{cmd}: {e}[/]")
+        return False
+
 import click
+import json
+import time
 
 from audiobench.cli.display.theme import (
     ACCENT,
@@ -27,6 +108,7 @@ def dispatch_command(session: ReplSession, args: list[str]) -> None:
     args = session.expand_vars(args)
     args = session.auto_inject_id(args)
 
+    t_start = time.monotonic()
     try:
         session.cli_group(args, standalone_mode=False)
 
@@ -35,6 +117,8 @@ def dispatch_command(session: ReplSession, args: list[str]) -> None:
             try_capture_last_id(session)
 
         session._command_count += 1
+        duration_ms = int((time.monotonic() - t_start) * 1000)
+        _log_command_event(session, args, duration_ms)
 
     except click.exceptions.Exit:
         pass
@@ -43,17 +127,42 @@ def dispatch_command(session: ReplSession, args: list[str]) -> None:
     except click.exceptions.UsageError as e:
         msg = str(e)
         console.print(f"  [{WARNING}]{msg}[/]")
-        # Only suggest .use when the missing param is a transcript ID
+        # Only suggest \focus when the missing param is a transcript ID
         if "Missing" in msg and session.last_id is None:
             param_name = msg.lower()
             if any(kw in param_name for kw in ("transcript", "transcription")):
                 console.print(
-                    f"  [{DIM}]Tip: Set context with .use <ID> to auto-fill transcript IDs[/]"
+                    f"  [{DIM}]Tip: Use [{ACCENT}]\\focus <id>[/] to set a transcript context[/]"
                 )
     except SystemExit:
         pass
     except Exception as e:
         console.print(error_panel("Error", str(e)))
+
+
+def _log_command_event(session: ReplSession, args: list[str], duration_ms: int) -> None:
+    """Write one row to command_events. Silent on any failure."""
+    try:
+        from audiobench.core.db_engine import get_engine
+        from sqlalchemy import text
+
+        cmd = args[0] if args else "unknown"
+        args_json = json.dumps(args[1:] if len(args) > 1 else [])
+        file_id = session.focus.id if session.focus and session.focus.type == "file" else None
+        tx_id = session.last_id
+
+        with get_engine().connect() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO command_events "
+                    "(command, args_json, context_file_id, context_tx_id, duration_ms) "
+                    "VALUES (:cmd, :args, :fid, :tid, :dur)"
+                ),
+                {"cmd": cmd, "args": args_json, "fid": file_id, "tid": tx_id, "dur": duration_ms},
+            )
+            conn.commit()
+    except Exception:
+        pass  # Command graph is advisory — never break the REPL
 
 
 def try_capture_last_id(session: ReplSession) -> None:
@@ -67,6 +176,9 @@ def try_capture_last_id(session: ReplSession) -> None:
             print_context_summary(session)
             # Refresh navigation IDs
             session._load_history_ids()
+            # Refresh completion cache
+            from audiobench.cli.repl.completion import _load_transcript_cache
+            _load_transcript_cache(session)
     except Exception:
         pass
 
@@ -75,9 +187,9 @@ def print_context_summary(session: ReplSession) -> None:
     """Print a compact summary when context changes."""
     if not session.focus:
         return
-        
+
     repo = session._get_repo()
-    
+
     if session.focus.type == "file":
         audio_file = repo.get_audio_file(session.focus.id)
         if audio_file:
@@ -87,7 +199,7 @@ def print_context_summary(session: ReplSession) -> None:
                 f"[{ACCENT}]{audio_file.get('file_name', '?')}[/] "
                 f"[{DIM}]({dur_str})[/]"
             )
-            
+
         # Mention transcript if there is one
         tx_id = session.last_id
         if tx_id:
@@ -95,7 +207,7 @@ def print_context_summary(session: ReplSession) -> None:
             if rec:
                 words = rec.get("word_count", 0) or 0
                 console.print(f"      [{DIM}]↳ Active transcript: #{tx_id} ({words:,} words)[/]")
-                
+
     elif session.focus.type == "transcript":
         rec = repo.get_by_id(session.focus.id)
         if rec:

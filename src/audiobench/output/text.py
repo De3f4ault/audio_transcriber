@@ -18,7 +18,9 @@ class TextFormatter(OutputFormatter):
         current_chapter_id: int | None = None
 
         # Build chapter map
-        chapter_map = {c["id"]: c["title"] for c in transcript.chapters} if transcript.chapters else {}
+        chapter_map = (
+            {c["id"]: c["title"] for c in transcript.chapters} if transcript.chapters else {}
+        )
 
         # Insert Markdown TOC if chapters exist
         if chapter_map:
@@ -35,12 +37,12 @@ class TextFormatter(OutputFormatter):
                 if lines and lines[-1] != "":
                     lines.append("")
                 if current_chapter_id is not None:
-                    lines.append("\n---\n") # Separator between chapters
-                
+                    lines.append("\n---\n")  # Separator between chapters
+
                 title = chapter_map.get(seg.chapter_id, f"Chapter {seg.chapter_id}")
                 lines.append(f"## {title}\n")
                 current_chapter_id = seg.chapter_id
-                
+
                 # Reset speaker to force re-printing speaker badge after a chapter heading
                 current_speaker = None
 
@@ -61,7 +63,9 @@ class TextFormatter(OutputFormatter):
                             if chunk_speaker != current_speaker:
                                 if lines:
                                     lines.append("")
-                                display_speaker = transcript.speaker_map.get(chunk_speaker, chunk_speaker)
+                                display_speaker = transcript.speaker_map.get(
+                                    chunk_speaker, chunk_speaker
+                                )
                                 lines.append(f"[{display_speaker}]")
                                 current_speaker = chunk_speaker
                             lines.append(" ".join(current_chunk))

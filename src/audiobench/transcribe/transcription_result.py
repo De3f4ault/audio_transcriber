@@ -66,7 +66,9 @@ class Word(BaseModel):
     start: float = Field(description="Start time in seconds")
     end: float = Field(description="End time in seconds")
     probability: float = Field(default=0.0, ge=0.0, le=1.0, description="Confidence score")
-    speaker: str | None = Field(default=None, description="Speaker label from word-level diarization")
+    speaker: str | None = Field(
+        default=None, description="Speaker label from word-level diarization"
+    )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -149,8 +151,10 @@ class Transcript(BaseModel):
     audio: AudioMetadata | None = Field(default=None, description="Source audio metadata")
     duration_seconds: float = Field(default=0.0, ge=0.0, description="Total audio duration")
     engine: str = Field(default="whisper", description="Engine used for transcription")
-    model_name: str = Field(default="medium", description="Model used")
-    speaker_map: dict[str, str] = Field(default_factory=dict, description="Map generic speakers to real names")
+    model_name: str = Field(default="large-v3-turbo", description="Model used")
+    speaker_map: dict[str, str] = Field(
+        default_factory=dict, description="Map generic speakers to real names"
+    )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     chapters: list[dict] = Field(default_factory=list, description="Associated chapters metadata")
 

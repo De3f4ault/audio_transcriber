@@ -31,6 +31,7 @@ logger = get_logger("engines.whisper")
 
 from audiobench.core.constants import WHISPER_MODELS
 
+
 class WhisperEngine(TranscriptionEngine):
     """Transcription engine using faster-whisper (CTranslate2).
 

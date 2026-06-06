@@ -6,8 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from audiobench.core.logger_factory import get_logger
 from audiobench.chapters.cue_parser import ChapterInfo, CueParser
+from audiobench.core.logger_factory import get_logger
 
 logger = get_logger("chapters.detector")
 
@@ -20,7 +20,7 @@ class ChapterDetector:
 
     def detect(self, file_path: Path) -> list[ChapterInfo]:
         """Detect chapters for a given audio file.
-        
+
         Attempts the following in order:
         1. ffprobe -show_chapters
         2. .cue sidecar file (if ffprobe finds 0 chapters)
@@ -44,7 +44,7 @@ class ChapterDetector:
             chapters = self.cue_parser.parse(cue_path, total_duration)
             if chapters:
                 return chapters
-                
+
         # Also check if there's a cue file with the exact same name but .cue appended
         # e.g. "audio.mp3.cue" instead of "audio.cue"
         alt_cue_path = file_path.with_name(file_path.name + ".cue")
@@ -61,50 +61,46 @@ class ChapterDetector:
                 title="Full Recording",
                 start_time=0.0,
                 end_time=total_duration,
-                is_ghost=False
+                is_ghost=False,
             )
         ]
 
     def _run_ffprobe(self, file_path: Path) -> list[ChapterInfo]:
         """Run ffprobe to extract embedded chapter metadata."""
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_chapters",
-            "-print_format", "json",
-            str(file_path)
-        ]
-        
+        cmd = ["ffprobe", "-v", "error", "-show_chapters", "-print_format", "json", str(file_path)]
+
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             data = json.loads(result.stdout)
-            
+
             raw_chapters = data.get("chapters", [])
             if not raw_chapters:
                 return []
-                
+
             parsed = []
             for i, chap in enumerate(raw_chapters):
                 # ffprobe usually gives start_time/end_time as strings representing floats
                 start_time = float(chap.get("start_time", 0.0))
                 end_time = float(chap.get("end_time", 0.0))
-                
+
                 # Extract title from tags
                 tags = chap.get("tags", {})
-                title = tags.get("title") or tags.get("TITLE") or f"Chapter {i+1}"
-                
-                is_ghost = (end_time <= start_time)
-                
-                parsed.append(ChapterInfo(
-                    index=i,
-                    title=title,
-                    start_time=start_time,
-                    end_time=end_time,
-                    is_ghost=is_ghost
-                ))
-                
+                title = tags.get("title") or tags.get("TITLE") or f"Chapter {i + 1}"
+
+                is_ghost = end_time <= start_time
+
+                parsed.append(
+                    ChapterInfo(
+                        index=i,
+                        title=title,
+                        start_time=start_time,
+                        end_time=end_time,
+                        is_ghost=is_ghost,
+                    )
+                )
+
             return parsed
-            
+
         except subprocess.CalledProcessError as e:
             logger.error("ffprobe failed for %s: %s", file_path.name, e.stderr)
             return []
@@ -119,12 +115,15 @@ class ChapterDetector:
         """Get the total duration of the audio file in seconds."""
         cmd = [
             "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(file_path)
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
         ]
-        
+
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             return float(result.stdout.strip())

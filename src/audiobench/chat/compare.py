@@ -152,9 +152,7 @@ class ModelComparison:
             "elapsed": elapsed,
         }
 
-    def _update_layout(
-        self, layout, t_start: float, streaming: bool = True
-    ) -> None:
+    def _update_layout(self, layout, t_start: float, streaming: bool = True) -> None:
         """Update both panels of the split layout."""
         from rich.console import Group
         from rich.panel import Panel
@@ -186,14 +184,10 @@ class ModelComparison:
             # Stats
             elapsed = time.monotonic() - t_start
             tps = tokens / elapsed if elapsed > 0 else 0
-            parts.append(
-                Text(f"\n{tokens} tok · {tps:.0f} tok/s", style="dim")
-            )
+            parts.append(Text(f"\n{tokens} tok · {tps:.0f} tok/s", style="dim"))
 
             border = "cyan" if side == "left" else "magenta"
             if not streaming:
                 border = "green"
 
-            layout[side].update(
-                Panel(Group(*parts), title=model, border_style=border)
-            )
+            layout[side].update(Panel(Group(*parts), title=model, border_style=border))

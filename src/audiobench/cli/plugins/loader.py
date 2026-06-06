@@ -1,11 +1,13 @@
 """Plugin loader — discover and load user plugins from data/plugins/.
 
-Plugins are Python files that define Click commands. Each plugin file should
-define a function called `register(cli)` that adds commands to the CLI group.
+Plugins are Python files that define Click commands. Each plugin file can:
+  - define ``register(cli)`` to add Click commands
+  - define ``setup_events(bus)`` to subscribe to AudioBench events
 
-Example plugin (data/plugins/my_tool.py):
+Example plugin (data/plugins/my_tool.py)::
 
     import click
+    from audiobench.events import subscribe
 
     @click.command()
     @click.argument("text")
@@ -16,8 +18,12 @@ Example plugin (data/plugins/my_tool.py):
     def register(cli):
         cli.add_command(shout)
 
-Plugins are loaded after all built-in commands are registered, so they can
-override or extend any existing functionality.
+    def setup_events(bus):
+        @bus.on("transcription.complete")
+        def on_done(tx_id, file_path, **kw):
+            print(f"Transcription done: {file_path}")
+
+Plugins are loaded after all built-in commands are registered.
 """
 
 from __future__ import annotations
@@ -86,6 +92,16 @@ def register_plugins(cli: click.Group) -> int:
         module = load_plugin(path)
         if module is None:
             continue
+
+        # Call setup_events(bus) if defined — lets plugins register event handlers
+        setup_fn = getattr(module, "setup_events", None)
+        if callable(setup_fn):
+            try:
+                from audiobench.events import get_bus
+                setup_fn(get_bus())
+                logger.info("Plugin %s registered event handlers", path.name)
+            except Exception as e:
+                logger.warning("Plugin %s setup_events() failed: %s", path.name, e)
 
         # Call register(cli) if defined
         register_fn = getattr(module, "register", None)

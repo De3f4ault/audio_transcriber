@@ -222,6 +222,7 @@ def convert(
 
     if interactive_mode:
         from audiobench.cli.wizard import prompt_file, prompt_string
+
         try:
             if not input_file:
                 input_file = prompt_file("Select input file to convert")
@@ -229,9 +230,11 @@ def convert(
                 output_path = prompt_string("Output path (e.g., output.mp3)")
         except KeyboardInterrupt:
             sys.exit(0)
-            
+
     if not input_file or not output_path:
-        console.print(error_panel("Usage: audiobench convert [INPUT] -o [OUTPUT]\nOr use --interactive"))
+        console.print(
+            error_panel("Usage: audiobench convert [INPUT] -o [OUTPUT]\nOr use --interactive")
+        )
         sys.exit(1)
 
     input_p = Path(input_file).resolve()
@@ -305,16 +308,21 @@ def merge(
 
     if interactive_mode:
         from audiobench.cli.wizard import prompt_file, prompt_string
+
         file_list = list(files)
         try:
             if not file_list:
-                console.print(f"\n  [{BOLD} {ACCENT}]Select files to merge (Ctrl+C to finish selection)[/]")
+                console.print(
+                    f"\n  [{BOLD} {ACCENT}]Select files to merge (Ctrl+C to finish selection)[/]"
+                )
                 while True:
                     try:
                         f = prompt_file(f"File {len(file_list) + 1}")
-                        if f: file_list.append(f)
+                        if f:
+                            file_list.append(f)
                     except KeyboardInterrupt:
-                        if not file_list: sys.exit(0)
+                        if not file_list:
+                            sys.exit(0)
                         break
             files = tuple(file_list)
             if not output_path:
@@ -323,7 +331,11 @@ def merge(
             sys.exit(0)
 
     if len(files) < 2 or not output_path:
-        console.print(error_panel("Usage: audiobench merge [FILE1] [FILE2]... -o [OUTPUT]\nOr use --interactive"))
+        console.print(
+            error_panel(
+                "Usage: audiobench merge [FILE1] [FILE2]... -o [OUTPUT]\nOr use --interactive"
+            )
+        )
         sys.exit(1)
 
     if not quiet:

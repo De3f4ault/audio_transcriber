@@ -5,8 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 
 class TestCollectFiles:
     """Test collect_files() with various input scenarios."""
