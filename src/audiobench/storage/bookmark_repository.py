@@ -77,7 +77,9 @@ class BookmarkRepository:
             session.commit()
             logger.info(
                 "Created bookmark #%d at %s for audio_file #%d",
-                record.id, _format_timestamp(timestamp), audio_file_id,
+                record.id,
+                _format_timestamp(timestamp),
+                audio_file_id,
             )
             return record.id
 
@@ -117,8 +119,10 @@ class BookmarkRepository:
             session.commit()
             logger.info(
                 "Created region #%d %s→%s for audio_file #%d",
-                record.id, _format_timestamp(start),
-                _format_timestamp(end), audio_file_id,
+                record.id,
+                _format_timestamp(start),
+                _format_timestamp(end),
+                audio_file_id,
             )
             return record.id
 
@@ -148,10 +152,7 @@ class BookmarkRepository:
             List of bookmark dicts.
         """
         with get_session() as session:
-            query = (
-                session.query(BookmarkRecord)
-                .filter_by(audio_file_id=audio_file_id)
-            )
+            query = session.query(BookmarkRecord).filter_by(audio_file_id=audio_file_id)
             if type_filter and type_filter in BOOKMARK_TYPES:
                 query = query.filter_by(bookmark_type=type_filter)
             records = query.order_by(asc(BookmarkRecord.timestamp)).all()
@@ -185,21 +186,17 @@ class BookmarkRepository:
             The nearest bookmark dict, or None.
         """
         with get_session() as session:
-            query = session.query(BookmarkRecord).filter_by(
-                audio_file_id=audio_file_id
-            )
+            query = session.query(BookmarkRecord).filter_by(audio_file_id=audio_file_id)
 
             if direction == "next":
                 rec = (
-                    query
-                    .filter(BookmarkRecord.timestamp > current_time + 0.5)
+                    query.filter(BookmarkRecord.timestamp > current_time + 0.5)
                     .order_by(asc(BookmarkRecord.timestamp))
                     .first()
                 )
             else:  # prev
                 rec = (
-                    query
-                    .filter(BookmarkRecord.timestamp < current_time - 0.5)
+                    query.filter(BookmarkRecord.timestamp < current_time - 0.5)
                     .order_by(desc(BookmarkRecord.timestamp))
                     .first()
                 )
@@ -223,16 +220,11 @@ class BookmarkRepository:
         with get_session() as session:
             pattern = f"%{query}%"
             q = session.query(BookmarkRecord).filter(
-                (BookmarkRecord.name.ilike(pattern))
-                | (BookmarkRecord.notes.ilike(pattern))
+                (BookmarkRecord.name.ilike(pattern)) | (BookmarkRecord.notes.ilike(pattern))
             )
             if audio_file_id is not None:
                 q = q.filter_by(audio_file_id=audio_file_id)
-            records = (
-                q.order_by(asc(BookmarkRecord.timestamp))
-                .limit(limit)
-                .all()
-            )
+            records = q.order_by(asc(BookmarkRecord.timestamp)).limit(limit).all()
             return [self._to_dict(r) for r in records]
 
     # ── Update ──────────────────────────────────────────────
@@ -312,14 +304,12 @@ class BookmarkRepository:
             Number of bookmarks deleted.
         """
         with get_session() as session:
-            count = (
-                session.query(BookmarkRecord)
-                .filter_by(audio_file_id=audio_file_id)
-                .delete()
-            )
+            count = session.query(BookmarkRecord).filter_by(audio_file_id=audio_file_id).delete()
             session.commit()
             logger.info(
-                "Deleted %d bookmark(s) for audio_file #%d", count, audio_file_id,
+                "Deleted %d bookmark(s) for audio_file #%d",
+                count,
+                audio_file_id,
             )
             return count
 
@@ -379,14 +369,21 @@ class BookmarkRepository:
 
             if end_ts is not None:
                 self.add_region(
-                    audio_file_id, ts, end_ts,
-                    name=name, bookmark_type=btype, notes=notes,
+                    audio_file_id,
+                    ts,
+                    end_ts,
+                    name=name,
+                    bookmark_type=btype,
+                    notes=notes,
                     transcription_id=transcription_id,
                 )
             else:
                 self.add(
-                    audio_file_id, ts,
-                    name=name, bookmark_type=btype, notes=notes,
+                    audio_file_id,
+                    ts,
+                    name=name,
+                    bookmark_type=btype,
+                    notes=notes,
                     transcription_id=transcription_id,
                 )
             count += 1
@@ -444,20 +441,25 @@ class BookmarkRepository:
 
             if abs(end - start) < 0.01:  # point label
                 self.add(
-                    audio_file_id, start,
+                    audio_file_id,
+                    start,
                     name=name or "Imported",
                     transcription_id=transcription_id,
                 )
             else:
                 self.add_region(
-                    audio_file_id, start, end,
+                    audio_file_id,
+                    start,
+                    end,
                     name=name or "Imported Region",
                     transcription_id=transcription_id,
                 )
             count += 1
 
         logger.info(
-            "Imported %d Audacity label(s) for audio_file #%d", count, audio_file_id,
+            "Imported %d Audacity label(s) for audio_file #%d",
+            count,
+            audio_file_id,
         )
         return count
 
@@ -478,9 +480,7 @@ class BookmarkRepository:
         resolved = str(Path(file_path).resolve())
         with get_session() as session:
             rec = (
-                session.query(AudioFileRecord)
-                .filter(AudioFileRecord.file_path == resolved)
-                .first()
+                session.query(AudioFileRecord).filter(AudioFileRecord.file_path == resolved).first()
             )
             return rec.id if rec else None
 
@@ -500,4 +500,3 @@ class BookmarkRepository:
             "is_region": rec.is_region,
             "created_at": rec.created_at.isoformat() if rec.created_at else "",
         }
-

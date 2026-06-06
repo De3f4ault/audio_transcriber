@@ -8,8 +8,8 @@ Provides a clean interface over SQLAlchemy for:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 
 from sqlalchemy import desc
 
@@ -34,9 +34,10 @@ class TranscriptionRepository:
 
         Also moves any .cue / .srt / .vtt sidecars alongside the audio file.
         """
-        from pathlib import Path
-        import shutil
         import hashlib
+        import shutil
+        from pathlib import Path
+
         from audiobench.core.settings import get_settings
 
         settings = get_settings()
@@ -108,9 +109,10 @@ class TranscriptionRepository:
             # Find or create audio file record
             audio_record = None
             chapter_record = None
-            
+
             if chapter_id:
                 from audiobench.storage.models import ChapterRecord
+
                 chapter_record = session.query(ChapterRecord).get(chapter_id)
                 if chapter_record:
                     audio_record = session.query(AudioFileRecord).get(chapter_record.audio_file_id)
@@ -124,7 +126,7 @@ class TranscriptionRepository:
             if audio_record is None and audio_metadata and not chapter_id:
                 # Import file to library
                 new_path = self._import_to_library(audio_metadata.file_path)
-                
+
                 audio_record = AudioFileRecord(
                     file_path=new_path,
                     file_name=audio_metadata.file_name,
@@ -139,9 +141,10 @@ class TranscriptionRepository:
                 session.flush()  # Get the ID
 
                 # Auto-detect chapters
-                from audiobench.chapters.detector import ChapterDetector
                 from pathlib import Path
-                
+
+                from audiobench.chapters.detector import ChapterDetector
+
                 try:
                     detector = ChapterDetector()
                     chapters_info = detector.detect(Path(new_path))
@@ -165,10 +168,17 @@ class TranscriptionRepository:
                         session.commit()
 
                         from audiobench.storage.chapter_repository import get_chapter_repo
+
                         get_chapter_repo().save_chapters(audio_record.id, chap_dicts)
-                        logger.info("Auto-detected and saved %d chapters for %s", len(chapters_info), audio_record.file_name)
+                        logger.info(
+                            "Auto-detected and saved %d chapters for %s",
+                            len(chapters_info),
+                            audio_record.file_name,
+                        )
                 except Exception as e:
-                    logger.warning("Failed to auto-detect chapters for %s: %s", audio_record.file_name, e)
+                    logger.warning(
+                        "Failed to auto-detect chapters for %s: %s", audio_record.file_name, e
+                    )
 
             # Create transcription record
             tx_record = TranscriptionRecord(
@@ -201,7 +211,7 @@ class TranscriptionRepository:
                     chapter_id=chapter_id,
                 )
                 session.add(seg_record)
-                
+
             if chapter_record:
                 chapter_record.transcription_id = tx_record.id
                 chapter_record.transcription_status = "completed"
@@ -215,21 +225,20 @@ class TranscriptionRepository:
             try:
                 self._register_expressions(tx_record.id, transcript, chapter_id)
             except Exception as e:
-                logger.error("Failed to register expressions for transcription %d: %s", tx_record.id, e)
+                logger.error(
+                    "Failed to register expressions for transcription %d: %s", tx_record.id, e
+                )
 
             return tx_record.id
 
     def _register_expressions(
-        self,
-        transcription_id: int,
-        transcript: Transcript,
-        chapter_id: int | None
+        self, transcription_id: int, transcript: Transcript, chapter_id: int | None
     ) -> None:
         """Process transcription text through daemon and register semantic expressions."""
         from audiobench.daemon.factory import get_daemon_client
+        from audiobench.memory.chunking import Chunk, _clean_text, parent_child_grouper
+        from audiobench.memory.enums import RelationType, SourceType
         from audiobench.storage.expression_repository import ExpressionRepository
-        from audiobench.memory.enums import SourceType, RelationType
-        from audiobench.memory.chunking import Chunk, parent_child_grouper, _clean_text
 
         try:
             daemon = get_daemon_client()
@@ -245,11 +254,16 @@ class TranscriptionRepository:
         if diarized:
             for seg in transcript.segments:
                 segments_for_daemon.append({"speaker": seg.speaker, "text": seg.text})
-                
-        chunk_results = daemon.chunk(transcript.text, transcription_id, diarized, segments_for_daemon)
-        
+
+        chunk_results = daemon.chunk(
+            transcript.text, transcription_id, diarized, segments_for_daemon
+        )
+
         # Convert chunk dicts to Chunk objects for grouper
-        chunks = [Chunk(content=c["content"], uuid=c["uuid"], tier=c["tier"], speaker=c.get("speaker")) for c in chunk_results]
+        chunks = [
+            Chunk(content=c["content"], uuid=c["uuid"], tier=c["tier"], speaker=c.get("speaker"))
+            for c in chunk_results
+        ]
 
         # Step 2. Group into parents
         parent_groups = parent_child_grouper(chunks)
@@ -259,9 +273,9 @@ class TranscriptionRepository:
         t1_expr = expr_repo.register(
             content=cleaned_text,
             source_type=SourceType.AUDIO_TRANSCRIPT.value,
-            source_id=transcription_id
+            source_id=transcription_id,
         )
-        
+
         # Send Tier 1 to daemon for embedding
         daemon.embed(t1_expr.id, cleaned_text, SourceType.AUDIO_TRANSCRIPT)
 
@@ -271,9 +285,11 @@ class TranscriptionRepository:
             t2_expr = expr_repo.register(
                 content=pg.parent_text,
                 source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                source_id=transcription_id
+                source_id=transcription_id,
             )
-            expr_repo.link(from_id=t2_expr.id, to_id=t1_expr.id, relation_type=RelationType.SOURCE.value)
+            expr_repo.link(
+                from_id=t2_expr.id, to_id=t1_expr.id, relation_type=RelationType.SOURCE.value
+            )
             daemon.embed(t2_expr.id, pg.parent_text, SourceType.AUDIO_TRANSCRIPT)
 
             # Tier 3 children
@@ -282,10 +298,14 @@ class TranscriptionRepository:
                     content=child.content,
                     source_type=SourceType.AUDIO_TRANSCRIPT.value,
                     source_id=transcription_id,
-                    speaker=child.speaker
+                    speaker=child.speaker,
                 )
-                expr_repo.link(from_id=t3_expr.id, to_id=t2_expr.id, relation_type=RelationType.SOURCE.value)
-                daemon.embed(t3_expr.id, child.content, SourceType.AUDIO_TRANSCRIPT, speaker=child.speaker)
+                expr_repo.link(
+                    from_id=t3_expr.id, to_id=t2_expr.id, relation_type=RelationType.SOURCE.value
+                )
+                daemon.embed(
+                    t3_expr.id, child.content, SourceType.AUDIO_TRANSCRIPT, speaker=child.speaker
+                )
 
         logger.info("Registered semantic expressions for transcription %d", transcription_id)
 
@@ -334,7 +354,9 @@ class TranscriptionRepository:
             try:
                 self._register_expressions(tx_record.id, transcript, None)
             except Exception as e:
-                logger.error("Failed to register expressions for live session %d: %s", tx_record.id, e)
+                logger.error(
+                    "Failed to register expressions for live session %d: %s", tx_record.id, e
+                )
 
             return tx_record.id
 
@@ -355,7 +377,9 @@ class TranscriptionRepository:
                 .first()
             )
 
-    def get_history(self, limit: int = 20, offset: int = 0, chapter_mode: bool | None = None) -> list[dict]:
+    def get_history(
+        self, limit: int = 20, offset: int = 0, chapter_mode: bool | None = None
+    ) -> list[dict]:
         """Get recent transcription history.
 
         Args:
@@ -366,7 +390,10 @@ class TranscriptionRepository:
         with get_session() as session:
             query = session.query(TranscriptionRecord)
             from audiobench.storage.models import ChapterRecord
-            subquery = session.query(ChapterRecord.transcription_id).filter(ChapterRecord.transcription_id.isnot(None))
+
+            subquery = session.query(ChapterRecord.transcription_id).filter(
+                ChapterRecord.transcription_id.isnot(None)
+            )
             if chapter_mode is True:
                 query = query.filter(TranscriptionRecord.id.in_(subquery))
             elif chapter_mode is False:
@@ -414,11 +441,18 @@ class TranscriptionRepository:
         """Get audio files that have no transcription record (Awaiting Transcription)."""
         with get_session() as session:
             # Subquery to find audio_file_ids that HAVE transcriptions
-            subq = session.query(TranscriptionRecord.audio_file_id).filter(TranscriptionRecord.audio_file_id.isnot(None))
-            
+            subq = session.query(TranscriptionRecord.audio_file_id).filter(
+                TranscriptionRecord.audio_file_id.isnot(None)
+            )
+
             # Find audio files NOT in that subquery
-            records = session.query(AudioFileRecord).filter(~AudioFileRecord.id.in_(subq)).order_by(desc(AudioFileRecord.created_at)).all()
-            
+            records = (
+                session.query(AudioFileRecord)
+                .filter(~AudioFileRecord.id.in_(subq))
+                .order_by(desc(AudioFileRecord.created_at))
+                .all()
+            )
+
             return [
                 {
                     "id": rec.id,
@@ -434,18 +468,23 @@ class TranscriptionRepository:
 
     def get_idle_transcripts(self) -> list[dict]:
         """Get transcripts that have not been semantically chunked (Idle Transcripts)."""
-        from audiobench.storage.expression_repository import ExpressionRepository
         with get_session() as session:
-            # In a real scenario we'd check ExpressionRecord source_id, but we can approximate 
+            # In a real scenario we'd check ExpressionRecord source_id, but we can approximate
             # by looking for completed transcriptions. If they exist but have no expressions.
             # For now, let's just query completed transcriptions. The Library UI will handle the logic.
             # Actually, audiobench doesn't have an easy ExpressionRecord join here since it's in a different module.
             # Let's just return all completed transcripts and let the UI query the daemon/expression repo.
-            records = session.query(TranscriptionRecord).filter_by(status="completed").order_by(desc(TranscriptionRecord.created_at)).all()
+            records = (
+                session.query(TranscriptionRecord)
+                .filter_by(status="completed")
+                .order_by(desc(TranscriptionRecord.created_at))
+                .all()
+            )
             return [
                 {
                     "id": rec.id,
-                    "file_name": rec.file_name or (rec.audio_file.file_name if rec.audio_file else "unknown"),
+                    "file_name": rec.file_name
+                    or (rec.audio_file.file_name if rec.audio_file else "unknown"),
                     "audio_file_id": rec.audio_file_id,
                     "created_at": rec.created_at.isoformat() if rec.created_at else "",
                 }
@@ -455,6 +494,7 @@ class TranscriptionRepository:
     def get_file_by_path(self, file_path: str) -> dict | None:
         """Find an audio file record by its absolute path."""
         from pathlib import Path
+
         abs_path = str(Path(file_path).absolute())
         with get_session() as session:
             rec = session.query(AudioFileRecord).filter_by(file_path=abs_path).first()
@@ -476,10 +516,12 @@ class TranscriptionRepository:
             rec = session.query(AudioFileRecord).filter_by(id=audio_file_id).first()
             if not rec:
                 return None
-            
+
             # Count transcriptions
-            tx_count = session.query(TranscriptionRecord).filter_by(audio_file_id=audio_file_id).count()
-            
+            tx_count = (
+                session.query(TranscriptionRecord).filter_by(audio_file_id=audio_file_id).count()
+            )
+
             return {
                 "id": rec.id,
                 "file_path": rec.file_path,
@@ -493,21 +535,21 @@ class TranscriptionRepository:
 
     def get_or_create_file(self, file_path: str) -> int:
         """Find an audio file record by path, or create a stub if it doesn't exist."""
-        from pathlib import Path
         import os
-        
+        from pathlib import Path
+
         # Import to library first
         abs_path = self._import_to_library(file_path)
-        
+
         with get_session() as session:
             rec = session.query(AudioFileRecord).filter_by(file_path=abs_path).first()
             if rec:
                 return rec.id
-                
+
             # Create a stub record. It will be filled in properly when transcribed.
             path_obj = Path(abs_path)
             file_size = os.path.getsize(abs_path) if path_obj.exists() else 0
-            
+
             new_rec = AudioFileRecord(
                 file_path=abs_path,
                 file_name=path_obj.name,
@@ -611,6 +653,7 @@ class TranscriptionRepository:
             # Fetch chapters if we have an audio file ID
             if rec.audio_file_id:
                 from audiobench.storage.chapter_repository import get_chapter_repo
+
                 chapter_records = get_chapter_repo().get_chapters(rec.audio_file_id)
                 data["chapters"] = [c.to_dict() for c in chapter_records]
 

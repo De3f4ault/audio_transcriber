@@ -145,8 +145,12 @@ class AudioBenchSettings(BaseSettings):
         default=Path("/tmp/audiobench-daemon.pid"),
         description="Path to daemon PID file",
     )
-    daemon_warmup_timeout: float = Field(default=120.0, description="Seconds to wait for daemon startup")
-    daemon_ping_timeout: float = Field(default=0.1, description="Seconds to wait for daemon health check (fail fast)")
+    daemon_warmup_timeout: float = Field(
+        default=120.0, description="Seconds to wait for daemon startup"
+    )
+    daemon_ping_timeout: float = Field(
+        default=0.1, description="Seconds to wait for daemon health check (fail fast)"
+    )
     embedding_model: str = Field(
         default="nomic-ai/nomic-embed-text-v1.5",
         description="Primary embedding model for vector storage",
@@ -165,12 +169,22 @@ class AudioBenchSettings(BaseSettings):
         description="Percentile threshold for semantic chunk boundaries",
     )
     chunk_max_tokens: int = Field(default=350, description="Max tokens per chunk fallback guard")
-    chunk_sentence_group_size: int = Field(default=3, description="Number of sentences per boundary comparison block")
-    chunk_short_threshold: int = Field(default=600, description="Characters below which to skip chunking entirely")
-    chunk_long_threshold: int = Field(default=10_000, description="Characters above which to enforce max_tokens guard")
-    retrieval_top_k: int = Field(default=15, description="Initial candidates to retrieve from LanceDB")
+    chunk_sentence_group_size: int = Field(
+        default=3, description="Number of sentences per boundary comparison block"
+    )
+    chunk_short_threshold: int = Field(
+        default=600, description="Characters below which to skip chunking entirely"
+    )
+    chunk_long_threshold: int = Field(
+        default=10_000, description="Characters above which to enforce max_tokens guard"
+    )
+    retrieval_top_k: int = Field(
+        default=15, description="Initial candidates to retrieve from LanceDB"
+    )
     rerank_top_k: int = Field(default=5, description="Candidates to keep after reranking")
-    summary_min_turns: int = Field(default=3, description="Minimum chat turns required to trigger session summary")
+    summary_min_turns: int = Field(
+        default=3, description="Minimum chat turns required to trigger session summary"
+    )
     lancedb_path: Path = Field(
         default_factory=lambda: _DATA_DIR / "lancedb",
         description="Path to embedded LanceDB directory",
@@ -256,35 +270,45 @@ class AudioBenchSettings(BaseSettings):
     @classmethod
     def validate_model_name(cls, v: str) -> str:
         if v not in WHISPER_MODELS:
-            raise ValueError(f"Invalid model: {v}. Choose from: {', '.join(sorted(WHISPER_MODELS))}")
+            raise ValueError(
+                f"Invalid model: {v}. Choose from: {', '.join(sorted(WHISPER_MODELS))}"
+            )
         return v
 
     @field_validator("device")
     @classmethod
     def validate_device(cls, v: str) -> str:
         if v not in COMPUTE_DEVICES:
-            raise ValueError(f"Invalid device: {v}. Choose from: {', '.join(sorted(COMPUTE_DEVICES))}")
+            raise ValueError(
+                f"Invalid device: {v}. Choose from: {', '.join(sorted(COMPUTE_DEVICES))}"
+            )
         return v
 
     @field_validator("compute_type")
     @classmethod
     def validate_compute_type(cls, v: str) -> str:
         if v not in COMPUTE_TYPES:
-            raise ValueError(f"Invalid compute_type: {v}. Choose from: {', '.join(sorted(COMPUTE_TYPES))}")
+            raise ValueError(
+                f"Invalid compute_type: {v}. Choose from: {', '.join(sorted(COMPUTE_TYPES))}"
+            )
         return v
 
     @field_validator("output_format")
     @classmethod
     def validate_output_format(cls, v: str) -> str:
         if v not in OUTPUT_FORMATS:
-            raise ValueError(f"Invalid output_format: {v}. Choose from: {', '.join(sorted(OUTPUT_FORMATS))}")
+            raise ValueError(
+                f"Invalid output_format: {v}. Choose from: {', '.join(sorted(OUTPUT_FORMATS))}"
+            )
         return v
 
     @field_validator("speed_preset")
     @classmethod
     def validate_speed_preset(cls, v: str) -> str:
         if v not in SPEED_PRESETS:
-            raise ValueError(f"Invalid speed_preset: {v}. Choose from: {', '.join(sorted(SPEED_PRESETS))}")
+            raise ValueError(
+                f"Invalid speed_preset: {v}. Choose from: {', '.join(sorted(SPEED_PRESETS))}"
+            )
         return v
 
     def ensure_dirs(self) -> None:
@@ -365,16 +389,16 @@ class AudioBenchSettings(BaseSettings):
 def get_settings() -> AudioBenchSettings:
     """Get cached application settings (singleton), loading from settings.json if present."""
     import json
-    
+
     json_path = _DATA_DIR / "settings.json"
     json_data = {}
-    
+
     if json_path.exists():
         try:
-            with open(json_path, "r", encoding="utf-8") as f:
+            with open(json_path, encoding="utf-8") as f:
                 json_data = json.load(f)
         except Exception as e:
             # Fallback to default loading if JSON is corrupted
             print(f"Warning: Could not parse settings.json: {e}")
-            
+
     return AudioBenchSettings(**json_data)

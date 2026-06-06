@@ -42,8 +42,9 @@ class AudioFileRecord(Base):
 
     # Relationships
     chapters: Mapped[list[ChapterRecord]] = relationship(
-        back_populates="audio_file", cascade="all, delete-orphan",
-        order_by="ChapterRecord.chapter_index"
+        back_populates="audio_file",
+        cascade="all, delete-orphan",
+        order_by="ChapterRecord.chapter_index",
     )
     transcriptions: Mapped[list[TranscriptionRecord]] = relationship(
         back_populates="audio_file", cascade="all, delete-orphan"
@@ -112,6 +113,7 @@ class ChapterRecord(Base):
     def tags_list(self) -> list[str]:
         """Deserialise the JSON tags column to a Python list."""
         import json as _json
+
         try:
             return _json.loads(self.tags) if self.tags else []
         except Exception:
@@ -147,6 +149,7 @@ class TranscriptionRecord(Base):
     status: Mapped[str] = mapped_column(String(20), default="completed")
     speaker_map: Mapped[str] = mapped_column(Text, default="{}")
     refined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    is_indexed: Mapped[int] = mapped_column(Integer, default=0, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC), index=True
     )
@@ -259,12 +262,16 @@ class BookmarkRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     audio_file_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("audio_files.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        Integer,
+        ForeignKey("audio_files.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     transcription_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("transcriptions.id", ondelete="SET NULL"),
-        nullable=True, index=True,
+        Integer,
+        ForeignKey("transcriptions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     timestamp: Mapped[float] = mapped_column(Float, nullable=False)
     end_timestamp: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -276,7 +283,8 @@ class BookmarkRecord(Base):
         Integer, ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(UTC),
+        DateTime,
+        default=lambda: datetime.now(UTC),
     )
 
     # Relationships
@@ -291,10 +299,7 @@ class BookmarkRecord(Base):
 
     def __repr__(self) -> str:
         kind = "Region" if self.is_region else "Point"
-        return (
-            f"<Bookmark(id={self.id}, {kind}, "
-            f"t={self.timestamp:.1f}, name='{self.name[:30]}')>"
-        )
+        return f"<Bookmark(id={self.id}, {kind}, t={self.timestamp:.1f}, name='{self.name[:30]}')>"
 
 
 class JobRecord(Base):
@@ -305,7 +310,9 @@ class JobRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     command: Mapped[str] = mapped_column(Text, nullable=False)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="running")  # running, done, failed, cancelled
+    status: Mapped[str] = mapped_column(
+        String(20), default="running"
+    )  # running, done, failed, cancelled
     log_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     events_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     audio_file: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -330,6 +337,9 @@ class ExpressionRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str | None] = mapped_column(
+        String(64), index=True, nullable=True
+    )
     source_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     source_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     session_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -337,7 +347,9 @@ class ExpressionRecord(Base):
     speaker: Mapped[str | None] = mapped_column(String(64), nullable=True)
     inference_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     inference_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), index=True
+    )
 
     # Relationships
     relations_from: Mapped[list[ExpressionRelation]] = relationship(
@@ -402,7 +414,9 @@ class AskLog(Base):
     )
 
     # Relationships
-    entries: Mapped[list[AskEntry]] = relationship("AskEntry", back_populates="log", cascade="all, delete-orphan")
+    entries: Mapped[list[AskEntry]] = relationship(
+        "AskEntry", back_populates="log", cascade="all, delete-orphan"
+    )
     audio_file: Mapped[AudioFileRecord] = relationship()
 
     def __repr__(self) -> str:
@@ -444,7 +458,10 @@ class ConversationSummary(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("chat_conversations.id", ondelete="CASCADE"), unique=True, nullable=False
+        Integer,
+        ForeignKey("chat_conversations.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
     )
     narrative: Mapped[str] = mapped_column(Text, nullable=False)
     drift_phases: Mapped[str] = mapped_column(Text, default="[]")  # JSON
@@ -462,3 +479,129 @@ class ConversationSummary(Base):
 
     def __repr__(self) -> str:
         return f"<ConversationSummary(id={self.id}, conv_id={self.conversation_id})>"
+
+
+class StagingCartItem(Base):
+    """A persisted item in the user's transcription staging cart."""
+
+    __tablename__ = "staging_cart"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    audio_file_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("audio_files.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    engine: Mapped[str] = mapped_column(String(64), default="gemini")
+    model_name: Mapped[str] = mapped_column(String(64), default="medium")
+    speed_preset: Mapped[str] = mapped_column(String(64), default="balanced")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationships
+    audio_file: Mapped[AudioFileRecord] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<StagingCartItem(id={self.id}, audio_id={self.audio_file_id}, engine='{self.engine}')>"
+
+
+class JobQueueItem(Base):
+    """A persistent background job for sequential execution."""
+
+    __tablename__ = "job_queue"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    engine: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    speed_preset: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending"
+    )  # pending, processing, done, failed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    def __repr__(self) -> str:
+        return f"<JobQueueItem(id={self.id}, status='{self.status}')>"
+
+
+class CommandEvent(Base):
+    """Append-only log of every REPL command dispatch.
+
+    Powers the intelligence layer: pattern detection, proactive suggestions,
+    and named workflow capture. Written after every successful dispatch_command()
+    call — one row, sub-millisecond, always-on.
+    """
+
+    __tablename__ = "command_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    command: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    args_json: Mapped[str] = mapped_column(Text, default="[]")       # JSON list of args
+    context_file_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    context_tx_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), index=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<CommandEvent(id={self.id}, cmd='{self.command}', ts={self.created_at})>"
+
+
+class Workflow(Base):
+    """A named, replayable sequence of REPL commands.
+
+    Created via \\workflow save <name>. Replayed via \\workflow run <name>.
+    The steps field is a JSON array of {"command": str, "args": list[str]} objects.
+    """
+
+    __tablename__ = "workflows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    steps_json: Mapped[str] = mapped_column(Text, default="[]")      # JSON list of steps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Workflow(id={self.id}, name='{self.name}')>"
+
+
+class NoteRecord(Base):
+    """A user-authored note — the intake pipe for direct understanding into the namespace.
+    
+    The note is the only place where the user's understanding enters the expression
+    namespace in their own voice, unmediated by AI or transcription. Everything else
+    in the system receives the world and gives back understanding. The note is where
+    the user gives the system their understanding directly.
+    
+    Lifecycle:
+        draft    → ExpressionRecord not yet created. Not searchable.
+        active   → ExpressionRecord exists and is embedded. Searchable via .search.
+        archived → Hidden from default listings but preserved in the namespace.
+    """
+    __tablename__ = "notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False, default="Untitled Note")
+    body: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="draft")  # draft | active | archived
+    expression_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    audio_file_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audio_files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
+    )
+
+    # Relationships
+    audio_file: Mapped[AudioFileRecord | None] = relationship()
+    expression: Mapped[ExpressionRecord | None] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<NoteRecord(id={self.id}, title='{self.title}', status='{self.status}')>"

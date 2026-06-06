@@ -15,10 +15,7 @@ logger = get_logger("storage.migrations.008")
 
 
 def _table_exists(cursor: sqlite3.Cursor, table: str) -> bool:
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table,)
-    )
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cursor.fetchone() is not None
 
 
@@ -65,24 +62,36 @@ def migrate(db_path: str) -> None:
             logger.info("chapters table already exists — skipping")
 
         # 2. Add chapter_id to segments
-        if _table_exists(cursor, "segments") and not _column_exists(cursor, "segments", "chapter_id"):
-            cursor.execute("ALTER TABLE segments ADD COLUMN chapter_id INTEGER REFERENCES chapters(id) ON DELETE SET NULL")
+        if _table_exists(cursor, "segments") and not _column_exists(
+            cursor, "segments", "chapter_id"
+        ):
+            cursor.execute(
+                "ALTER TABLE segments ADD COLUMN chapter_id INTEGER REFERENCES chapters(id) ON DELETE SET NULL"
+            )
             cursor.execute("CREATE INDEX ix_segments_chapter_id ON segments(chapter_id)")
             logger.info("Added chapter_id to segments")
 
         # 3. Add chapter_id to bookmarks
-        if _table_exists(cursor, "bookmarks") and not _column_exists(cursor, "bookmarks", "chapter_id"):
-            cursor.execute("ALTER TABLE bookmarks ADD COLUMN chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE")
+        if _table_exists(cursor, "bookmarks") and not _column_exists(
+            cursor, "bookmarks", "chapter_id"
+        ):
+            cursor.execute(
+                "ALTER TABLE bookmarks ADD COLUMN chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE"
+            )
             cursor.execute("CREATE INDEX ix_bookmarks_chapter_id ON bookmarks(chapter_id)")
             logger.info("Added chapter_id to bookmarks")
 
         # 4. Add chapter_id to jobs
         if _table_exists(cursor, "jobs") and not _column_exists(cursor, "jobs", "chapter_id"):
-            cursor.execute("ALTER TABLE jobs ADD COLUMN chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE")
+            cursor.execute(
+                "ALTER TABLE jobs ADD COLUMN chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE"
+            )
             logger.info("Added chapter_id to jobs")
-            
+
         # 5. Add tags to audio_files
-        if _table_exists(cursor, "audio_files") and not _column_exists(cursor, "audio_files", "tags"):
+        if _table_exists(cursor, "audio_files") and not _column_exists(
+            cursor, "audio_files", "tags"
+        ):
             cursor.execute("ALTER TABLE audio_files ADD COLUMN tags TEXT DEFAULT '[]'")
             logger.info("Added tags to audio_files")
 

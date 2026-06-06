@@ -31,9 +31,7 @@ def migrate(db_path: str) -> None:
     try:
         # ── transcriptions.refined_at ──
         if not _column_exists(cursor, "transcriptions", "refined_at"):
-            cursor.execute(
-                "ALTER TABLE transcriptions ADD COLUMN refined_at DATETIME"
-            )
+            cursor.execute("ALTER TABLE transcriptions ADD COLUMN refined_at DATETIME")
             logger.info("Added refined_at column to transcriptions")
         else:
             logger.info("refined_at column already exists — skipping")

@@ -36,8 +36,7 @@ def migrate(db_path: str) -> None:
             )
         """)
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS ix_bookmarks_audio_file_id "
-            "ON bookmarks(audio_file_id)"
+            "CREATE INDEX IF NOT EXISTS ix_bookmarks_audio_file_id ON bookmarks(audio_file_id)"
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS ix_bookmarks_transcription_id "

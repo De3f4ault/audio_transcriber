@@ -68,8 +68,7 @@ def migrate(db_path: str) -> None:
 
         # Recreate the index that was on the old table
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS ix_segments_transcription_id "
-            "ON segments (transcription_id)"
+            "CREATE INDEX IF NOT EXISTS ix_segments_transcription_id ON segments (transcription_id)"
         )
 
         conn.commit()

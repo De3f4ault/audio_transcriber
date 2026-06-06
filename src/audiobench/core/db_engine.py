@@ -13,7 +13,9 @@ Usage:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+from sqlalchemy import Engine
 from sqlalchemy import create_engine as _create_engine
 
 from audiobench.core.logger_factory import get_logger
@@ -25,7 +27,7 @@ logger = get_logger("core.db_engine")
 _engine = None
 
 
-def get_engine():
+def get_engine() -> Engine:
     """Get or create the SQLAlchemy engine."""
     global _engine
     if _engine is None:
@@ -51,7 +53,7 @@ def get_engine():
             from sqlalchemy import event
 
             @event.listens_for(_engine, "connect")
-            def _set_sqlite_pragmas(dbapi_conn, _connection_record):
+            def _set_sqlite_pragmas(dbapi_conn: Any, _connection_record: Any) -> None:
                 cursor = dbapi_conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA synchronous=NORMAL")
@@ -135,5 +137,34 @@ def init_db() -> None:
                 migrate_008(db_path)
             except Exception as e:
                 logger.warning("Migration m008 failed (non-fatal): %s", e)
+
+            try:
+                from audiobench.storage.migrations.m009_rag_indexing import (
+                    migrate as migrate_009,
+                )
+
+                migrate_009(db_path)
+            except Exception as e:
+                logger.warning("Migration m009 failed (non-fatal): %s", e)
+
+            try:
+                from audiobench.storage.migrations.m010_command_graph import (
+                    migrate as migrate_010,
+                )
+
+                migrate_010(db_path)
+            except Exception as e:
+                logger.warning("Migration m010 failed (non-fatal): %s", e)
+
+            # Run the new idempotent SQL migrations (Phase 0/1)
+            try:
+                from pathlib import Path
+
+                from audiobench.storage.migrate import run_migrations
+
+                run_migrations(Path(db_path))
+            except Exception as e:
+                logger.error("SQL migrations failed: %s", e)
+                raise
 
     logger.info("Database tables created")

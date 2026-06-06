@@ -32,16 +32,12 @@ def migrate(db_path: str) -> None:
     try:
         # ── chat_messages.model_name ──
         if not _column_exists(cursor, "chat_messages", "model_name"):
-            cursor.execute(
-                "ALTER TABLE chat_messages ADD COLUMN model_name VARCHAR(128)"
-            )
+            cursor.execute("ALTER TABLE chat_messages ADD COLUMN model_name VARCHAR(128)")
             logger.info("Added model_name column to chat_messages")
 
         # ── transcriptions.raw_text ──
         if not _column_exists(cursor, "transcriptions", "raw_text"):
-            cursor.execute(
-                "ALTER TABLE transcriptions ADD COLUMN raw_text TEXT"
-            )
+            cursor.execute("ALTER TABLE transcriptions ADD COLUMN raw_text TEXT")
             logger.info("Added raw_text column to transcriptions")
 
         conn.commit()
