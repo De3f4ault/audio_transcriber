@@ -5,6 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TypeVar
 
+try:
+    import readline  # enables arrow keys and editing for standard input()
+except ImportError:
+    pass
+
 from audiobench.cli.display.theme import ACCENT, BOLD, DIM, WARNING, console
 
 T = TypeVar("T")
