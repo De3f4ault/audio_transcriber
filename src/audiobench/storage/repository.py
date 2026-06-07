@@ -57,8 +57,12 @@ class TranscriptionRepository:
         try:
             if not target_path.exists():
                 if move:
-                    shutil.move(str(orig), str(target_path))
-                    moved_pairs.append((target_path, orig))
+                    try:
+                        shutil.move(str(orig), str(target_path))
+                        moved_pairs.append((target_path, orig))
+                    except OSError as e:
+                        logger.warning("Failed to move %s, falling back to copy: %s", orig, e)
+                        shutil.copy2(str(orig), str(target_path))
                 else:
                     shutil.copy2(str(orig), str(target_path))
 
@@ -69,8 +73,11 @@ class TranscriptionRepository:
                     sidecar_target = target_path.with_suffix(ext)
                     if not sidecar_target.exists():
                         if move:
-                            shutil.move(str(sidecar), str(sidecar_target))
-                            moved_pairs.append((sidecar_target, sidecar))
+                            try:
+                                shutil.move(str(sidecar), str(sidecar_target))
+                                moved_pairs.append((sidecar_target, sidecar))
+                            except OSError:
+                                shutil.copy2(str(sidecar), str(sidecar_target))
                         else:
                             shutil.copy2(str(sidecar), str(sidecar_target))
 
