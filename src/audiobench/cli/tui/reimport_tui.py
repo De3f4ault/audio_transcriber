@@ -100,6 +100,11 @@ class ReimportTUI:
                 self._draw_screen_1b(stdscr)
             elif self.screen == 12:
                 self._draw_screen_2b(stdscr)
+            elif self.screen == 13:
+                self._draw_screen_3b(stdscr)
+            elif self.screen == 14:
+                self._draw_screen_4b(stdscr)
+                break
                 
             key = stdscr.getch()
             self._handle_input(key)
@@ -137,11 +142,43 @@ class ReimportTUI:
                 self.cancelled = True
         elif self.screen == 11:
             self._nav_input(key, self.tx_nav, on_enter=self._on_tx_dir_selected)
+            if key in (10, 13):
+                self.transcript_dir = self.tx_nav.current_path
+                self.screen = 12
         elif self.screen == 12:
-            pass # TODO batch match review input
-            
+            self._nav_input(key, self.audio_nav, on_enter=lambda p: None)
+            if key in (10, 13):
+                self.audio_dir = self.audio_nav.current_path
+                self._match_batch()
+                self.screen = 13
+        elif self.screen == 13:
+            if key in (ord('s'), ord('S')):
+                self.screen = 14
+            elif key in (ord('q'), ord('Q')):
+                self.cancelled = True
+                
         if key in (ord('q'), ord('Q')) and self.screen < 5:
             self.cancelled = True
+        elif key in (ord('q'), ord('Q')) and self.screen in (11, 12):
+            self.cancelled = True
+
+    def _match_batch(self):
+        self.batch_pairs = []
+        import json
+        for tx_file in self.transcript_dir.glob("*.json"):
+            # read JSON to find original audio file name
+            try:
+                data = json.loads(tx_file.read_text(encoding="utf-8"))
+                audio_name = data.get("audio", {}).get("file_name")
+                if audio_name:
+                    audio_path = self.audio_dir / audio_name
+                    if audio_path.exists():
+                        self.batch_pairs.append({"tx": tx_file, "audio": audio_path})
+                    else:
+                        self.batch_pairs.append({"tx": tx_file, "audio": None})
+            except Exception:
+                pass
+
             
     def _nav_input(self, key, nav, on_enter):
         if key in (curses.KEY_RIGHT, 10, 13, ord("l")):
@@ -306,6 +343,87 @@ class ReimportTUI:
         stdscr.getch()
 
     def _draw_screen_1b(self, stdscr):
-        pass # stub
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, " 📂 Batch Reimport: Select Transcript Folder ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
+        
+        items = self.tx_nav.list_items()
+        for i, item in enumerate(items[:h-4]):
+            y = i + 2
+            is_sel = (i == self.tx_nav.selected)
+            attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
+            icon = "📁" if (self.tx_nav.current_path / item).is_dir() else "📄"
+            stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w-2], attr)
+            
+        stdscr.addstr(h-2, 0, f" Current Folder: {self.tx_nav.current_path}".ljust(w), curses.color_pair(5))
+        stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w), curses.color_pair(1))
+
+    def _on_tx_dir_selected(self, path):
+        # path is actually the selected item, but we want the current directory for batch
+        pass # we handle it directly in handle_input for 1b
+
     def _draw_screen_2b(self, stdscr):
-        pass # stub
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, " 📂 Batch Reimport: Select Audio Folder ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
+        
+        items = self.audio_nav.list_items()
+        for i, item in enumerate(items[:h-4]):
+            y = i + 2
+            is_sel = (i == self.audio_nav.selected)
+            attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
+            icon = "📁" if (self.audio_nav.current_path / item).is_dir() else "🎵"
+            stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w-2], attr)
+            
+        stdscr.addstr(h-2, 0, f" Current Folder: {self.audio_nav.current_path}".ljust(w), curses.color_pair(5))
+        stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w), curses.color_pair(1))
+
+    def _draw_screen_3b(self, stdscr):
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, f" 🚀 Batch Ready: {len(self.batch_pairs)} pairs matched ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
+        
+        for i, pair in enumerate(self.batch_pairs[:h-4]):
+            y = i + 2
+            tx = pair["tx"].name
+            au = pair["audio"].name if pair["audio"] else "???"
+            stdscr.addstr(y, 2, f"{tx} <--> {au}"[:w-4])
+            
+        stdscr.addstr(h-1, 0, " S: Start Batch | q: Quit ".ljust(w), curses.color_pair(1))
+        
+    def _draw_screen_4b(self, stdscr):
+        stdscr.clear()
+        stdscr.addstr(2, 2, "Batch Importing...", curses.color_pair(5))
+        stdscr.refresh()
+        
+        success = 0
+        failed = 0
+        
+        for idx, pair in enumerate(self.batch_pairs):
+            stdscr.addstr(4, 2, f"Processing {idx+1}/{len(self.batch_pairs)}: {pair['tx'].name}                  ")
+            stdscr.refresh()
+            
+            if not pair["audio"]:
+                failed += 1
+                continue
+                
+            try:
+                parsed_tx, raw_audio = parse_transcript_file(pair["tx"])
+                audio_meta = build_audio_metadata(pair["audio"], raw_audio)
+                
+                init_db()
+                repo = TranscriptionRepository()
+                
+                tx_id = repo.save_transcription(parsed_tx, audio_meta, on_phase=lambda p, pct: None)
+                with repo.get_session() as session:
+                    rec = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
+                    if rec:
+                        rec.source = "reimport"
+                        session.commit()
+                success += 1
+            except Exception:
+                failed += 1
+
+        stdscr.clear()
+        stdscr.addstr(2, 2, f"✅ Batch Complete! {success} succeeded, {failed} failed.", curses.color_pair(3))
+        stdscr.addstr(4, 2, "Press any key to exit.")
+        stdscr.refresh()
+        stdscr.timeout(-1)
+        stdscr.getch()
