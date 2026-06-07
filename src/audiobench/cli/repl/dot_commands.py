@@ -2,7 +2,7 @@
 
 Dot-commands (prefixed with `.`) are the semantic layer — they reach into the
 unified expression namespace via LanceDB. They differ from backslash commands
-(`\`) in that they query meaning, not structure.
+(`\\`) in that they query meaning, not structure.
 
   \search "keyword"     → SQLite FTS5  — instant, exact text match
   .search "concept"     → LanceDB ANN  — semantic, cross-source, no LLM

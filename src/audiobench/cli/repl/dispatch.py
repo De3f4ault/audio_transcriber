@@ -1,4 +1,4 @@
-"""REPL command dispatch — routes user input to Click commands or \ handlers.
+"""REPL command dispatch — routes user input to Click commands or \\ handlers.
 
 Provides:
     - register_backslash(): Decorator to register a \\command handler
