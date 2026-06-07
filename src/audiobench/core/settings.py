@@ -482,4 +482,15 @@ def get_settings() -> AudioBenchSettings:
             # Fallback to default loading if JSON is corrupted
             print(f"Warning: Could not parse settings.json: {e}")
 
+    # Remove keys from json_data if they exist in the environment,
+    # so that environment variables take priority over settings.json
+    for key in list(json_data.keys()):
+        env_key = f"AUDIOBENCH_{key.upper()}"
+        if env_key in os.environ:
+            del json_data[key]
+            
+    # Also explicitly check for HF_TOKEN
+    if "HF_TOKEN" in os.environ and "hf_token" in json_data:
+        del json_data["hf_token"]
+
     return AudioBenchSettings(**json_data)
