@@ -141,7 +141,7 @@ def run_import_flow(session=None, restore_state=None) -> list[int]:
 
 
 @click.command(name="import")
-@click.option("--transcript", is_flag=True, help="Reverse import: select transcript file first")
+@click.option("-T", "--transcript", is_flag=True, help="Reverse import: select transcript file first")
 @click.option("--batch", is_flag=True, help="Batch mode for --transcript (folder-to-folder mapping)")
 def import_cmd(transcript: bool, batch: bool):
     """Import audio files into the internal library.
