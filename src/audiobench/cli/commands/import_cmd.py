@@ -141,11 +141,26 @@ def run_import_flow(session=None, restore_state=None) -> list[int]:
 
 
 @click.command(name="import")
-def import_cmd():
+@click.option("--transcript", is_flag=True, help="Reverse import: select transcript file first")
+@click.option("--batch", is_flag=True, help="Batch mode for --transcript (folder-to-folder mapping)")
+def import_cmd(transcript: bool, batch: bool):
     """Import audio files into the internal library.
 
     \b
     Examples:
       audiobench import
+      audiobench import --transcript
+      audiobench import --transcript --batch
     """
+    if transcript:
+        from audiobench.cli.tui.reimport_tui import ReimportTUI
+        tui = ReimportTUI(batch=batch)
+        if not tui.run():
+            console.print(f"\n  [{DIM}]Reimport cancelled.[/]")
+        return
+        
+    if batch and not transcript:
+        console.print(error_panel("Error", "--batch is only supported with --transcript"))
+        return
+
     run_import_flow()
