@@ -80,13 +80,19 @@ class PhaseTracker:
     def start(self) -> None:
         """Start the Rich Live display. Call before first update."""
         if not self.quiet:
-            self._live = Live(
-                self,
-                console=console,
-                refresh_per_second=10,
-                transient=True,  # Frame vanishes when stopped
-            )
-            self._live.start()
+            import os
+            import sys
+            
+            is_kaggle = "KAGGLE_KERNEL_RUN_TYPE" in os.environ or "KAGGLE_CONTAINER_NAME" in os.environ
+            
+            if sys.stdout.isatty() and not is_kaggle:
+                self._live = Live(
+                    self,
+                    console=console,
+                    refresh_per_second=10,
+                    transient=True,  # Frame vanishes when stopped
+                )
+                self._live.start()
 
     def _enter_streaming(self) -> None:
         """Transition from Live mode to streaming mode.
@@ -104,16 +110,16 @@ class PhaseTracker:
             self._live.stop()
             self._live = None
 
-        # Print phases statically at the top
-        for phase in self._visible_phases:
-            label = self.LABELS.get(phase, phase)
-            if phase in self.phase_times:
-                elapsed_str = format_duration(self.phase_times[phase])
-                console.print(f"  [{SUCCESS}]✓[/]  {label:<24} [{DIM}]{elapsed_str}[/]")
-            elif phase == self._current_phase:
-                console.print(f"  [{ACCENT}]◐[/]  {label}...")
-            else:
-                console.print(f"  [{DIM}]·  {label}[/]")
+            # Print phases statically at the top ONLY if we had a Live display that was cleared
+            for phase in self._visible_phases:
+                label = self.LABELS.get(phase, phase)
+                if phase in self.phase_times:
+                    elapsed_str = format_duration(self.phase_times[phase])
+                    console.print(f"  [{SUCCESS}]✓[/]  {label:<24} [{DIM}]{elapsed_str}[/]")
+                elif phase == self._current_phase:
+                    console.print(f"  [{ACCENT}]◐[/]  {label}...")
+                else:
+                    console.print(f"  [{DIM}]·  {label}[/]")
 
         # Blank line separating phases from transcript text
         console.print()
@@ -147,6 +153,10 @@ class PhaseTracker:
         if phase != self._current_phase:
             self._current_phase = phase
             self._phase_start = time.perf_counter()
+            # Static fallback for environments without Live
+            if not self._live and not self._streaming:
+                label = self.LABELS.get(phase, phase)
+                console.print(f"  [{ACCENT}]▶[/]  {label}...")
 
         if progress is not None:
             self._last_progress = progress
@@ -200,21 +210,25 @@ class PhaseTracker:
             self._live.stop()
             self._live = None
 
-        # If we never entered streaming mode, print everything now.
-        # This covers two cases:
-        #   1. No segments at all (e.g. error before transcription)
-        #   2. Segments arrived all at once (Gemini) — on_segment added
-        #      them to self.segments but _enter_streaming's console.print
-        #      got swallowed by the Live display's transient cleanup.
+        # If we never entered streaming mode AND we had a Live display, print everything now.
+        # This covers cases like Gemini where segments arrive all at once.
+        # If we didn't have a Live display, phases were already printed statically in update().
         if not self._streaming:
-            # Print phase status lines
-            for phase in self._visible_phases:
-                label = self.LABELS.get(phase, phase)
-                if phase in self.phase_times:
-                    elapsed_str = format_duration(self.phase_times[phase])
-                    console.print(f"  [{SUCCESS}]✓[/]  {label:<24} [{DIM}]{elapsed_str}[/]")
-                else:
-                    console.print(f"  [{DIM}]·  {label}[/]")
+            if self._live:
+                # Print phase status lines
+                for phase in self._visible_phases:
+                    label = self.LABELS.get(phase, phase)
+                    if phase in self.phase_times:
+                        elapsed_str = format_duration(self.phase_times[phase])
+                        console.print(f"  [{SUCCESS}]✓[/]  {label:<24} [{DIM}]{elapsed_str}[/]")
+                    else:
+                        console.print(f"  [{DIM}]·  {label}[/]")
+            else:
+                # We just need to mark the final phase as completed if we used static prints
+                if self._current_phase in self.phase_times:
+                    elapsed_str = format_duration(self.phase_times[self._current_phase])
+                    label = self.LABELS.get(self._current_phase, self._current_phase)
+                    console.print(f"  [{SUCCESS}]✓[/]  {label} finished in {elapsed_str}")
 
             # Print transcript text if we have any
             if self.segments:
