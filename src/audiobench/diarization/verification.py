@@ -18,12 +18,16 @@ from audiobench.core.settings import get_settings
 
 logger = get_logger("diarization.verification")
 
-_classifier = None
+_classifiers = {}
 
-def get_speaker_classifier():
-    """Lazy load the SpeechBrain ECAPA-TDNN classifier."""
-    global _classifier
-    if _classifier is None:
+def get_speaker_classifier(device: str | None = None):
+    """Lazy load the SpeechBrain ECAPA-TDNN classifier on a specific device."""
+    global _classifiers
+    
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+    if device not in _classifiers:
         try:
             from speechbrain.inference.speaker import EncoderClassifier
         except ImportError:
@@ -32,28 +36,27 @@ def get_speaker_classifier():
         settings = get_settings()
         is_offline = settings.offline_mode or os.environ.get("HF_HUB_OFFLINE") == "1"
         
-        logger.info("Loading SpeechBrain ECAPA-TDNN model [offline=%s]...", is_offline)
+        logger.info("Loading SpeechBrain ECAPA-TDNN model on %s [offline=%s]...", device, is_offline)
         t0 = time.time()
         
-        # Determine device
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
         # Load the model
-        _classifier = EncoderClassifier.from_hparams(
+        classifier = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir="pretrained_models/spkrec-ecapa-voxceleb",
             run_opts={"device": device}
         )
         logger.info("SpeechBrain model loaded in %.2fs on %s", time.time() - t0, device)
+        _classifiers[device] = classifier
         
-    return _classifier
+    return _classifiers[device]
 
 
 class SpeakerVerificationEngine:
     """Extracts voice prints from audio segments and matches them globally."""
     
-    def __init__(self):
+    def __init__(self, device: str | None = None):
         self.sample_rate = 16000  # ECAPA-TDNN expects 16kHz
+        self.device = device
         
     def extract_voice_print(self, audio_path: str | Path, start: float, end: float) -> list[float] | None:
         """Extract a 192-D voice print from a specific time segment."""
@@ -62,7 +65,7 @@ class SpeakerVerificationEngine:
             return None
 
         try:
-            classifier = get_speaker_classifier()
+            classifier = get_speaker_classifier(self.device)
             
             # Load audio segment
             signal, fs = torchaudio.load(

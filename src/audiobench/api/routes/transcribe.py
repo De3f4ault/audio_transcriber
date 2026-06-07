@@ -31,6 +31,7 @@ def process_audio(job_id: str, audio_path: str, engine_name: str, language: str 
             device=settings.resolve_device(),
             compute_type=settings.resolve_compute_type(),
             cpu_threads=settings.resolve_cpu_threads(),
+            device_index=settings.resolve_device_index(),
         )
     except Exception as e:
         job.status = "error"

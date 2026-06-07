@@ -34,8 +34,9 @@ class SpeakerTurn:
 class LightweightDiarizer:
     """Fast diarization using Whisper segments, SpeechBrain ECAPA-TDNN, and AHC clustering."""
 
-    def __init__(self, distance_threshold: float = 0.65) -> None:
+    def __init__(self, distance_threshold: float = 0.65, device: str | None = None) -> None:
         self.distance_threshold = distance_threshold
+        self.device = device
 
     def diarize(self, audio_path: str | Path, transcript: Transcript) -> Transcript:
         """Run clustering on existing transcript segments."""
@@ -46,7 +47,7 @@ class LightweightDiarizer:
         from sklearn.cluster import AgglomerativeClustering
         import numpy as np
 
-        engine = SpeakerVerificationEngine()
+        engine = SpeakerVerificationEngine(device=self.device)
         embeddings = []
         valid_indices = []
 
@@ -153,8 +154,9 @@ class PyannoteDiarizer:
     - Accept user conditions at https://hf.co/pyannote/speaker-diarization-3.1
     """
 
-    def __init__(self, hf_token: str | None = None) -> None:
+    def __init__(self, hf_token: str | None = None, device: str | None = None) -> None:
         self._hf_token = hf_token
+        self._device = device
         self._pipeline = None
 
     def _load_pipeline(self) -> None:
@@ -186,7 +188,12 @@ class PyannoteDiarizer:
                 "pyannote/speaker-diarization-3.1",
                 token=self._hf_token,
             )
-            logger.info("Diarization pipeline loaded")
+            if self._device:
+                import torch
+                self._pipeline.to(torch.device(self._device))
+                logger.info("Diarization pipeline loaded on %s", self._device)
+            else:
+                logger.info("Diarization pipeline loaded")
         except Exception as e:
             raise DiarizationError(
                 "Failed to load diarization pipeline",

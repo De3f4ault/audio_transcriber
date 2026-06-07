@@ -246,47 +246,76 @@ class TranscriptionPipeline:
 
             # Transcribe
             task = "translate" if translate else "transcribe"
-            emit(
-                "transcribing", "Translating to English..." if translate else "Transcribing...", 0.0
-            )
+            emit("transcribing", "Translating to English..." if translate else "Transcribing...", 0.0)
             logger.info("Pipeline: transcribing with %s (preset=%s)", engine.engine_name, preset)
 
             def _progress(pct: float) -> None:
                 emit("transcribing", "Transcribing...", pct)
 
-            audio_input = wav_path
-            if is_gemini:
-                transcript = engine.transcribe(
-                    audio_input,
-                    language=language or self._settings.language,
-                    task=task,
-                    word_timestamps=word_ts,
-                    on_phase=emit,
-                    diarize=enable_diarization,
-                )
-            else:
-                transcript = engine.transcribe(
-                    audio_input,
-                    language=language or self._settings.language,
-                    task=task,
-                    word_timestamps=word_ts,
-                    beam_size=beam,
-                    batch_size=batch,
-                    temperature=temperature,
-                    compression_ratio_threshold=2.4,
-                    no_speech_threshold=0.6,
-                    log_prob_threshold=-1.0,
-                    condition_on_previous_text=condition_on_prev,
-                    repetition_penalty=1.1,
-                    initial_prompt=initial_prompt,
-                    progress_callback=_progress,
-                    on_segment=on_segment,
-                )
-            transcript.audio = metadata
+            def _do_transcribe():
+                if is_gemini:
+                    return engine.transcribe(
+                        wav_path,
+                        language=language or self._settings.language,
+                        task=task,
+                        word_timestamps=word_ts,
+                        on_phase=emit,
+                        diarize=enable_diarization,
+                    )
+                else:
+                    return engine.transcribe(
+                        wav_path,
+                        language=language or self._settings.language,
+                        task=task,
+                        word_timestamps=word_ts,
+                        beam_size=beam,
+                        batch_size=batch,
+                        temperature=temperature,
+                        compression_ratio_threshold=2.4,
+                        no_speech_threshold=0.6,
+                        log_prob_threshold=-1.0,
+                        condition_on_previous_text=condition_on_prev,
+                        repetition_penalty=1.1,
+                        initial_prompt=initial_prompt,
+                        progress_callback=_progress,
+                        on_segment=on_segment,
+                    )
 
-            # Diarization
-            if enable_diarization and not is_gemini:
-                transcript = self._run_diarization(wav_path, transcript, emit, diarize_mode, diarize_threshold)
+            diarize_device = self._settings.resolve_diarization_device()
+            whisper_device_index = self._settings.resolve_device_index()
+            whisper_dev = f"cuda:{whisper_device_index}" if isinstance(whisper_device_index, int) else f"cuda:{whisper_device_index[0]}"
+            
+            is_concurrent_capable = (
+                enable_diarization 
+                and not is_gemini
+                and diarize_mode == "accurate"
+                and diarize_device.startswith("cuda")
+                and (whisper_dev != diarize_device)
+            )
+
+            if is_concurrent_capable:
+                logger.info("Running transcription and diarization concurrently on separate GPUs")
+                from audiobench.diarization.engine import PyannoteDiarizer
+                diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token, device=diarize_device)
+                
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    ft = ex.submit(_do_transcribe)
+                    fd = ex.submit(diarizer.get_speaker_turns, wav_path)
+                    
+                    transcript = ft.result()
+                    transcript.audio = metadata
+                    
+                    try:
+                        turns = fd.result()
+                        transcript = diarizer.assign_speakers(transcript, turns, audio_path=wav_path)
+                        logger.info("Pipeline: diarization complete")
+                    except Exception as e:
+                        logger.warning("Concurrent diarization failed (continuing without): %s", e)
+            else:
+                transcript = _do_transcribe()
+                transcript.audio = metadata
+                if enable_diarization and not is_gemini:
+                    transcript = self._run_diarization(wav_path, transcript, emit, diarize_mode, diarize_threshold)
 
             # Speaker naming
             self._apply_speaker_naming(
@@ -471,24 +500,73 @@ class TranscriptionPipeline:
                             cm.save_checkpoint(c.index, res)
             
             elif strategy == "concurrent":
+                # Producer-Consumer pipeline for multi-GPU
+                import queue
+                import threading
                 import torch
-                # Limit Pyannote CPU usage to prevent fighting with Whisper
-                torch.set_num_threads(1)
                 
-                def _process_concurrent(idx: int, c: ChapterInfo, p: Path) -> Transcript | None:
-                    # Whisper
-                    r = _process_chunk(idx, c, p, do_diarize=False)
-                    if not r: return None
+                diarize_device = self._settings.resolve_diarization_device()
+                whisper_device_index = self._settings.resolve_device_index()
+                whisper_dev = f"cuda:{whisper_device_index}" if isinstance(whisper_device_index, int) else f"cuda:{whisper_device_index[0]}"
+                
+                is_concurrent = (
+                    enable_diarization
+                    and diarize_mode == "accurate"
+                    and diarize_device.startswith("cuda")
+                    and (whisper_dev != diarize_device)
+                )
+
+                if is_concurrent:
+                    logger.info("Using true producer-consumer concurrent chapter pipeline")
+                    q = queue.Queue()
+                    results = [None] * len(chapters_to_process)
                     
-                    # Pyannote
-                    if enable_diarization and p and p.exists() and not any(s.speaker for s in r.segments):
-                        r = self._run_diarization(p, r, emit, diarize_mode, diarize_threshold)
-                        cm.save_checkpoint(c.index, r)
-                    return r
-                
-                with ThreadPoolExecutor(max_workers=pipeline_workers) as ex:
-                    futures = [ex.submit(_process_concurrent, i, c, p) for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths))]
-                    results = [f.result() for f in futures if f.result() is not None]
+                    def producer():
+                        for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths)):
+                            r = _process_chunk(i, c, p, do_diarize=False)
+                            q.put((i, c, p, r))
+                        q.put(None)  # Sentinel
+                        
+                    def consumer():
+                        while True:
+                            item = q.get()
+                            if item is None:
+                                break
+                            i, c, p, r = item
+                            if r is not None:
+                                if enable_diarization and p and p.exists() and not any(s.speaker for s in r.segments):
+                                    emit("diarizing", f"Diarizing chapter {c.index}...", float(i) / len(chapters_to_process))
+                                    r = self._run_diarization(p, r, emit, diarize_mode, diarize_threshold)
+                                    cm.save_checkpoint(c.index, r)
+                                results[i] = r
+                            q.task_done()
+                            
+                    t1 = threading.Thread(target=producer)
+                    t2 = threading.Thread(target=consumer)
+                    t1.start()
+                    t2.start()
+                    t1.join()
+                    t2.join()
+                    results = [r for r in results if r is not None]
+                else:
+                    # Single-GPU sequential fallback but using threads to share memory/IO efficiently
+                    torch.set_num_threads(1)
+                    
+                    def _process_concurrent(idx: int, c: ChapterInfo, p: Path) -> Transcript | None:
+                        # Whisper
+                        r = _process_chunk(idx, c, p, do_diarize=False)
+                        if not r: return None
+                        
+                        # Pyannote
+                        if enable_diarization and p and p.exists() and not any(s.speaker for s in r.segments):
+                            emit("diarizing", f"Diarizing chapter {c.index}...", float(idx) / len(chapters_to_process))
+                            r = self._run_diarization(p, r, emit, diarize_mode, diarize_threshold)
+                            cm.save_checkpoint(c.index, r)
+                        return r
+                    
+                    with ThreadPoolExecutor(max_workers=pipeline_workers) as ex:
+                        futures = [ex.submit(_process_concurrent, i, c, p) for i, (c, p) in enumerate(zip(chapters_to_process, chunk_paths))]
+                        results = [f.result() for f in futures if f.result() is not None]
                     
             else:
                 # strategy == "chunk"
@@ -569,10 +647,10 @@ class TranscriptionPipeline:
         try:
             if diarize_mode == "accurate":
                 from audiobench.diarization.engine import PyannoteDiarizer
-                diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token)
+                diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token, device=self._settings.resolve_diarization_device())
             else:
                 from audiobench.diarization.engine import LightweightDiarizer
-                diarizer = LightweightDiarizer(distance_threshold=diarize_threshold)
+                diarizer = LightweightDiarizer(distance_threshold=diarize_threshold, device=self._settings.resolve_diarization_device())
                 
             result = diarizer.diarize(wav_path, transcript)
             logger.info("Pipeline: diarization complete")
@@ -638,6 +716,7 @@ class TranscriptionPipeline:
                 device=self._settings.resolve_device(),
                 compute_type=self._settings.resolve_compute_type(),
                 cpu_threads=self._settings.resolve_cpu_threads(),
+                device_index=self._settings.resolve_device_index(),
             )
         return self._engine
 

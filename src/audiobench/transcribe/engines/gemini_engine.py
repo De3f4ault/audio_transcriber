@@ -78,9 +78,10 @@ class GeminiEngine(TranscriptionEngine):
 
     def load_model(
         self,
-        model_name: str = "gemini-2.5-pro",
+        model_name: str,
         device: str = "cpu",
         compute_type: str = "int8",
+        device_index: int | list[int] = 0,
         **kwargs,
     ) -> None:
         """Initialize the Gemini client.

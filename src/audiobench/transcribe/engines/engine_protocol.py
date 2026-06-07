@@ -29,6 +29,7 @@ class TranscriptionEngine(ABC):
         model_name: str,
         device: str = "cpu",
         compute_type: str = "int8",
+        device_index: int | list[int] = 0,
         **kwargs,
     ) -> None:
         """Load a transcription model.
@@ -37,6 +38,7 @@ class TranscriptionEngine(ABC):
             model_name: Model identifier (e.g., 'medium', 'large-v3').
             device: Compute device ('cpu' or 'cuda').
             compute_type: Quantization type ('int8', 'float16', 'float32').
+            device_index: CUDA device index or list of indices for multi-GPU.
 
         Raises:
             ModelNotFoundError: If the model cannot be found.

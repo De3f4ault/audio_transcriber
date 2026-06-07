@@ -1,6 +1,5 @@
-from audiobench.cli.repl.dispatch import dispatch_command
-from audiobench.cli.repl.session import ReplSession
 from audiobench.cli.app import cli
+from audiobench.cli.repl.session import ReplSession
 from audiobench.core.focused_entity import FocusedEntity
 
 session = ReplSession(cli)

@@ -52,11 +52,12 @@ def _ensure_registered() -> None:
 
 
 def create_engine(
-    engine_name: str = "whisper",
-    model_name: str = "large-v3-turbo",
+    engine_name: str,
+    model_name: str,
     device: str = "cpu",
     compute_type: str = "int8",
     cpu_threads: int = 4,
+    device_index: int | list[int] = 0,
 ) -> TranscriptionEngine:
     """Create and initialize a transcription engine.
 
@@ -66,6 +67,7 @@ def create_engine(
         device: Compute device ('cpu' or 'cuda').
         compute_type: Quantization ('int8', 'float16', 'float32').
         cpu_threads: CPU threads for CTranslate2.
+        device_index: CUDA device index or list of indices.
 
     Returns:
         Initialized TranscriptionEngine ready for transcription.
@@ -83,17 +85,24 @@ def create_engine(
         )
 
     logger.info(
-        "Creating engine: %s (model=%s, device=%s, compute=%s, threads=%d)",
+        "Creating engine: %s (model=%s, device=%s, index=%s, compute=%s, threads=%d)",
         engine_name,
         model_name,
         device,
+        device_index,
         compute_type,
         cpu_threads,
     )
 
     engine_class = _ENGINE_REGISTRY[engine_name]
     engine = engine_class()
-    engine.load_model(model_name, device, compute_type, cpu_threads=cpu_threads)
+    engine.load_model(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+        device_index=device_index,
+    )
 
     return engine
 

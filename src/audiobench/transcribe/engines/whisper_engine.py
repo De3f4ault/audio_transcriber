@@ -55,6 +55,8 @@ class WhisperEngine(TranscriptionEngine):
         device: str = "cpu",
         compute_type: str = "int8",
         cpu_threads: int = 4,
+        device_index: int | list[int] = 0,
+        **kwargs,
     ) -> None:
         """Load a Whisper model with optimized threading.
 
@@ -63,14 +65,16 @@ class WhisperEngine(TranscriptionEngine):
             device: 'cpu' or 'cuda'.
             compute_type: 'int8' (CPU), 'float16' (CUDA), 'float32'.
             cpu_threads: Number of CPU threads for CTranslate2.
+            device_index: CUDA device index or list of indices.
         """
         if model_name not in WHISPER_MODELS:
             raise ModelNotFoundError(model_name)
 
         logger.info(
-            "Loading Whisper model: %s (device=%s, compute=%s, threads=%d)",
+            "Loading Whisper model: %s (device=%s, index=%s, compute=%s, threads=%d)",
             model_name,
             device,
+            device_index,
             compute_type,
             cpu_threads,
         )
@@ -81,6 +85,7 @@ class WhisperEngine(TranscriptionEngine):
             self._model = WhisperModel(
                 model_name,
                 device=device,
+                device_index=device_index,
                 compute_type=compute_type,
                 cpu_threads=cpu_threads,
             )

@@ -61,6 +61,20 @@ class AudioBenchSettings(BaseSettings):
         default=None,
         description="ISO 639-1 language code or None for auto-detect",
     )
+    device_index: str = Field(
+        default="auto",
+        description=(
+            "GPU index for Whisper: 'auto' (uses GPU 0 by default, or all GPUs if >1), "
+            "'0', '1', or comma-separated '0,1'. Ignored on CPU."
+        ),
+    )
+    diarization_device: str = Field(
+        default="auto",
+        description=(
+            "Device for pyannote: 'auto' (GPU:N-1 if multi-GPU, GPU:0 if single-GPU, "
+            "cpu if no GPU). Accepts 'cpu', 'cuda:0', 'cuda:1', etc."
+        ),
+    )
 
     # --- Performance ---
     speed_preset: str = Field(
@@ -343,6 +357,73 @@ class AudioBenchSettings(BaseSettings):
         if resolved_device == "cuda":
             return "float16"
         return "int8"
+
+    def resolve_device_index(self) -> int | list[int]:
+        """Resolve 'auto' device index to actual device indices."""
+        try:
+            import torch
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        except ImportError:
+            n_gpus = 0
+
+        if self.device_index != "auto":
+            if isinstance(self.device_index, str) and "," in self.device_index:
+                indices = [int(x.strip()) for x in self.device_index.split(",")]
+                valid_indices = [i for i in indices if i < n_gpus]
+                if not valid_indices:
+                    return 0
+                return valid_indices if len(valid_indices) > 1 else valid_indices[0]
+            elif isinstance(self.device_index, str) and self.device_index.isdigit():
+                idx = int(self.device_index)
+                return idx if idx < n_gpus else 0
+            return self.device_index if isinstance(self.device_index, int) and self.device_index < n_gpus else 0
+
+        # Auto resolution
+        resolved_device = self.resolve_device()
+        if resolved_device == "cuda":
+            if n_gpus > 1:
+                return 0  # Default to 0 for Whisper to leave GPU 1 for Pyannote
+            return 0
+        return 0
+
+    def resolve_diarization_device(self) -> str:
+        """Resolve 'auto' diarization device to actual device."""
+        try:
+            import torch
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        except ImportError:
+            n_gpus = 0
+
+        if self.diarization_device != "auto":
+            if self.diarization_device.startswith("cuda:") and n_gpus > 0:
+                try:
+                    idx = int(self.diarization_device.split(":")[1])
+                    if idx < n_gpus:
+                        return self.diarization_device
+                    return f"cuda:{n_gpus - 1}"
+                except ValueError:
+                    pass
+            elif self.diarization_device == "cpu":
+                return "cpu"
+
+        if n_gpus == 0:
+            return "cpu"
+        elif n_gpus == 1:
+            # Warn if VRAM is tight (e.g. < 8GB)
+            try:
+                import torch
+                total_memory = torch.cuda.get_device_properties(0).total_memory
+                if total_memory < 8 * 1024 * 1024 * 1024:
+                    from audiobench.core.logger_factory import get_logger
+                    get_logger("settings").warning(
+                        "Single GPU with < 8GB VRAM detected. Running Whisper and Pyannote "
+                        "sequentially may cause OutOfMemory errors."
+                    )
+            except Exception:
+                pass
+            return "cuda:0"
+        else:
+            return f"cuda:{n_gpus - 1}"
 
     def resolve_cpu_threads(self) -> int:
         """Resolve CPU thread count (0 = auto-detect physical cores)."""
