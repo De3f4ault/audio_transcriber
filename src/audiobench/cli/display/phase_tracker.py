@@ -16,8 +16,14 @@ Usage:
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 from pathlib import Path
+
+# Detect non-interactive environments that need forced flushing
+_IS_KAGGLE = "KAGGLE_KERNEL_RUN_TYPE" in os.environ or "KAGGLE_CONTAINER_NAME" in os.environ
+_FORCE_FLUSH = _IS_KAGGLE or not sys.stdout.isatty()
 
 from rich.live import Live
 from rich.text import Text
@@ -80,12 +86,7 @@ class PhaseTracker:
     def start(self) -> None:
         """Start the Rich Live display. Call before first update."""
         if not self.quiet:
-            import os
-            import sys
-            
-            is_kaggle = "KAGGLE_KERNEL_RUN_TYPE" in os.environ or "KAGGLE_CONTAINER_NAME" in os.environ
-            
-            if sys.stdout.isatty() and not is_kaggle:
+            if sys.stdout.isatty() and not _IS_KAGGLE:
                 self._live = Live(
                     self,
                     console=console,
@@ -157,6 +158,8 @@ class PhaseTracker:
             if not self._live and not self._streaming:
                 label = self.LABELS.get(phase, phase)
                 console.print(f"  [{ACCENT}]▶[/]  {label}...")
+                if _FORCE_FLUSH:
+                    sys.stdout.flush()
 
         if progress is not None:
             self._last_progress = progress
@@ -244,6 +247,8 @@ class PhaseTracker:
         if text:
             ts = self._format_ts(start, end)
             console.print(f"  [{DIM}]{ts}[/]  {text}", highlight=False)
+            if _FORCE_FLUSH:
+                sys.stdout.flush()
 
     @staticmethod
     def _format_ts(start: float, end: float) -> str:
