@@ -28,6 +28,13 @@ def run_import_flow(session=None, restore_state=None) -> list[int]:
         session.navigation_stack[-1].state = state
         session._persist_stack()
 
+    if selected_files == "LAUNCH_TRANSCRIPT_IMPORT":
+        from audiobench.cli.tui.reimport_tui import ReimportTUI
+        tui = ReimportTUI(batch=False)
+        if not tui.run():
+            console.print(f"\n  [{DIM}]Reimport cancelled.[/]")
+        return []
+
     if not selected_files:
         console.print(f"\n  [{DIM}]Import cancelled or no files selected.[/]")
         return []

@@ -121,7 +121,7 @@ class ImportFileManager:
 
             # Footer
             footer_1 = "↑↓/k j: Move | →/l/ENTER: Enter Dir | ←/h: Go Up | SPACE: Select File"
-            footer_2 = "t: Toggle Hidden | s: Confirm & Import | q: Cancel"
+            footer_2 = "t: Toggle Hidden | s: Confirm & Import | r: Reverse Import (Transcript) | q: Cancel"
 
             if height > 2:
                 stdscr.addstr(height - 2, 0, footer_1[:width], curses.color_pair(1))
@@ -133,6 +133,9 @@ class ImportFileManager:
                 break
             elif key == ord("s"):
                 self.confirmed_files = list(self.navigator.selected_files)
+                break
+            elif key in (ord("r"), ord("R")):
+                self.launch_transcript_mode = True
                 break
             elif key in (curses.KEY_RIGHT, 10, 13, ord("l")):
                 self.navigator.enter()
@@ -148,7 +151,10 @@ class ImportFileManager:
                 self.navigator.toggle_hidden_visibility()
 
     def run(self):
+        self.launch_transcript_mode = False
         curses.wrapper(self.draw)
+        if self.launch_transcript_mode:
+            return "LAUNCH_TRANSCRIPT_IMPORT"
         return self.confirmed_files if not self.cancelled else None
 
 
