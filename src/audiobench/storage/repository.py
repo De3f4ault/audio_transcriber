@@ -67,7 +67,7 @@ class TranscriptionRepository:
                     shutil.copy2(str(orig), str(target_path))
 
             # Move sidecars alongside the audio file
-            for ext in (".cue", ".srt", ".vtt"):
+            for ext in (".cue", ".srt", ".vtt", ".json"):
                 sidecar = orig.with_suffix(ext)
                 if sidecar.exists():
                     sidecar_target = target_path.with_suffix(ext)
@@ -439,6 +439,9 @@ class TranscriptionRepository:
                     label = rec.file_name
                 elif rec.source == "live":
                     label = "🎤 Live session"
+                elif rec.source == "reimport":
+                    audio = rec.audio_file
+                    label = "📥 " + (audio.file_name if audio else "Imported transcript")
                 else:
                     audio = rec.audio_file
                     label = audio.file_name if audio else "unknown"
@@ -645,7 +648,11 @@ class TranscriptionRepository:
                 or (
                     "🎤 Live session"
                     if rec.source == "live"
-                    else (rec.audio_file.file_name if rec.audio_file else "unknown")
+                    else (
+                        "📥 " + (rec.audio_file.file_name if rec.audio_file else "Imported transcript")
+                        if rec.source == "reimport"
+                        else (rec.audio_file.file_name if rec.audio_file else "unknown")
+                    )
                 ),
                 "file_path": (rec.audio_file.file_path if rec.audio_file else None),
                 "audio_file_id": rec.audio_file_id,

@@ -135,6 +135,7 @@ class TranscriptionRecord(Base):
     audio_file_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("audio_files.id"), nullable=True, index=True
     )
+    # Provenance of the transcription. Valid values: "file" | "live" | "reimport"
     source: Mapped[str] = mapped_column(String(20), default="file")
     file_name: Mapped[str] = mapped_column(String(256), default="", nullable=False)
     full_text: Mapped[str] = mapped_column(Text, default="")

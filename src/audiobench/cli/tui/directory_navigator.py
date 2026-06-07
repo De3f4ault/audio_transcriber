@@ -2,11 +2,12 @@ from pathlib import Path
 
 
 class DirectoryNavigator:
-    def __init__(self, start_path="."):
+    def __init__(self, start_path=".", allowed_extensions: set[str] | None = None):
         self.current_path = Path(start_path).resolve()
         self.selected = 0
         self.show_hidden = False
         self.selected_files = set()  # Set of Paths
+        self.allowed_extensions = allowed_extensions
 
     def toggle_hidden_visibility(self):
         """Toggle visibility of hidden files and directories"""
@@ -22,8 +23,10 @@ class DirectoryNavigator:
                     continue
 
                 from audiobench.transcribe.audio_converter import ALL_SUPPORTED_FORMATS
+                
+                filter_exts = self.allowed_extensions if self.allowed_extensions is not None else ALL_SUPPORTED_FORMATS
 
-                if item.is_file() and item.suffix.lstrip(".").lower() not in ALL_SUPPORTED_FORMATS:
+                if item.is_file() and item.suffix.lstrip(".").lower() not in filter_exts:
                     continue
 
                 all_items.append(item)
