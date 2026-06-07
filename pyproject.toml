@@ -47,6 +47,7 @@ memory = [
     "llama-index-vector-stores-lancedb>=0.1.0",
     "llama-index-embeddings-huggingface>=0.2.0",
     "sentence-transformers>=3.0.0",
+    "rerankers>=0.0.4",
 ]
 streaming = ["RealtimeSTT>=0.3.0"]
 diarization = ["pyannote.audio>=3.3.0", "torch>=2.0.0", "torchaudio>=2.0.0"]
