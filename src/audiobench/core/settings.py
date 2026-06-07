@@ -258,7 +258,7 @@ class AudioBenchSettings(BaseSettings):
 
     # --- Diarization ---
     hf_token: str | None = Field(
-        default=None,
+        default_factory=lambda: os.environ.get("HF_TOKEN"),
         description="HuggingFace token for pyannote model download",
     )
 
