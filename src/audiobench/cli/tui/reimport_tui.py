@@ -256,7 +256,10 @@ class ReimportTUI:
             icon = "📁" if (self.tx_nav.current_path / item).is_dir() else "📄"
             stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w//2], attr)
             
-        stdscr.addstr(h-1, 0, " ENTER: Select | b: Batch Mode | q: Quit ".ljust(w), curses.color_pair(1))
+        try:
+            stdscr.addstr(h-1, 0, " ENTER: Select | b: Batch Mode | q: Quit ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
 
     def _draw_screen_2(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -270,7 +273,10 @@ class ReimportTUI:
             icon = "📁" if (self.audio_nav.current_path / item).is_dir() else "🎵"
             stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w//2], attr)
             
-        stdscr.addstr(h-1, 0, " ENTER: Select | q: Quit ".ljust(w), curses.color_pair(1))
+        try:
+            stdscr.addstr(h-1, 0, " ENTER: Select | q: Quit ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
 
     def _draw_screen_3(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -287,7 +293,10 @@ class ReimportTUI:
             stdscr.addstr(5, 3, f"Existing audio record found with {self.existing_transcriptions_count} transcriptions.")
             stdscr.addstr(7, 3, "[O]verwrite | [A]dd new transcription | [S]kip", curses.color_pair(2) | curses.A_BOLD)
             
-        stdscr.addstr(h-1, 0, " q: Quit ".ljust(w), curses.color_pair(1))
+        try:
+            stdscr.addstr(h-1, 0, " q: Quit ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
 
     def _draw_screen_4(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -303,7 +312,10 @@ class ReimportTUI:
         stdscr.addstr(9, 2, " [4] Save TranscriptionRecord & Segments")
         stdscr.addstr(10, 2," [5] Semantic chunk & embed")
         
-        stdscr.addstr(h-1, 0, " ENTER: Start Import | q: Cancel ".ljust(w), curses.color_pair(1))
+        try:
+            stdscr.addstr(h-1, 0, " ENTER: Start Import | q: Cancel ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
 
     def _draw_screen_5(self, stdscr):
         stdscr.clear()
@@ -355,7 +367,10 @@ class ReimportTUI:
             stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w-2], attr)
             
         stdscr.addstr(h-2, 0, f" Current Folder: {self.tx_nav.current_path}".ljust(w), curses.color_pair(5))
-        stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w), curses.color_pair(1))
+        try:
+            stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
 
     def _on_tx_dir_selected(self, path):
         # path is actually the selected item, but we want the current directory for batch
@@ -374,7 +389,10 @@ class ReimportTUI:
             stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w-2], attr)
             
         stdscr.addstr(h-2, 0, f" Current Folder: {self.audio_nav.current_path}".ljust(w), curses.color_pair(5))
-        stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w), curses.color_pair(1))
+        try:
+            stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
 
     def _draw_screen_3b(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -386,7 +404,10 @@ class ReimportTUI:
             au = pair["audio"].name if pair["audio"] else "???"
             stdscr.addstr(y, 2, f"{tx} <--> {au}"[:w-4])
             
-        stdscr.addstr(h-1, 0, " S: Start Batch | q: Quit ".ljust(w), curses.color_pair(1))
+        try:
+            stdscr.addstr(h-1, 0, " S: Start Batch | q: Quit ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
         
     def _draw_screen_4b(self, stdscr):
         stdscr.clear()
