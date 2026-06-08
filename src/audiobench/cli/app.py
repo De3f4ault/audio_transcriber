@@ -8,9 +8,18 @@ from __future__ import annotations
 
 import click
 
+import warnings
+
 from audiobench.cli.display.theme import APP_VERSION
 from audiobench.cli.plugins.custom_group import DefaultGroup
 from audiobench.core.logger_factory import setup_logging
+
+# Suppress upstream transformers deprecation warnings that pollute the CLI REPL
+warnings.filterwarnings(
+    "ignore", 
+    message=".*get_extended_attention_mask.*", 
+    category=FutureWarning
+)
 
 
 @click.group(cls=DefaultGroup, default_command="repl", invoke_without_command=True)

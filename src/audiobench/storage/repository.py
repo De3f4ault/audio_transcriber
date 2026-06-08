@@ -24,11 +24,11 @@ logger = get_logger("storage.repository")
 class TranscriptionRepository:
     """CRUD operations for transcription persistence."""
 
-    def _import_to_library(self, original_path: str, move: bool = True) -> str:
+    def _import_to_library(self, original_path: str, move: bool = False) -> str:
         """Import an audio file into the managed data/library directory.
 
-        If ``move=True`` (default) the original file is moved, not copied,
-        making the library the single source of truth. If the move succeeds
+        If ``move=True`` the original file is moved. By default (``move=False``),
+        the file is copied, leaving the original intact. If a move succeeds
         but a later step raises, the file is moved back before re-raising so
         the caller never loses the original.
 
@@ -99,16 +99,17 @@ class TranscriptionRepository:
         audio_metadata: AudioMetadata | None = None,
         chapter_id: int | None = None,
         on_phase: object | None = None,
+        overwrite: bool = False,
     ) -> int:
-        """Save a transcription result to the database.
-
-        If the same audio file (by hash) was already transcribed, the audio
-        record is reused and a new transcription is linked to it.
-
+        """
+        Save a complete transcription to the database.
+        
         Args:
-            transcript: The transcription result.
+            transcript: The transcript to save.
             audio_metadata: Source audio metadata (for dedup by hash).
             chapter_id: Optional chapter ID if this is a chapter transcription.
+            on_phase: Optional callback for phase progress.
+            overwrite: If True, deletes any existing transcription for this audio.
 
         Returns:
             The transcription record ID.
@@ -130,6 +131,39 @@ class TranscriptionRepository:
                     .filter_by(file_hash=audio_metadata.file_hash)
                     .first()
                 )
+
+            # --- DEDUPLICATION ENFORCEMENT ---
+            if audio_record and not chapter_id:
+                existing_txs = session.query(TranscriptionRecord).filter_by(audio_file_id=audio_record.id).all()
+                if existing_txs:
+                    if not overwrite:
+                        raise ValueError("Transcription already exists for this audio file.")
+                    
+                    # Delete old transcriptions and their semantic vectors
+                    from audiobench.daemon.factory import get_daemon_client
+                    from audiobench.storage.models import ExpressionRecord
+                    
+                    daemon_client = None
+                    try:
+                        daemon_client = get_daemon_client()
+                    except Exception as e:
+                        logger.warning("Could not connect to daemon to delete expressions: %s", e)
+                        
+                    from audiobench.memory.enums import SourceType
+                    for old_tx in existing_txs:
+                        if daemon_client:
+                            old_exprs = session.query(ExpressionRecord).filter_by(
+                                source_type=SourceType.AUDIO_TRANSCRIPT.value, 
+                                source_id=old_tx.id
+                            ).all()
+                            for expr in old_exprs:
+                                try:
+                                    daemon_client.delete(expr.id)
+                                except Exception as e:
+                                    logger.warning("Failed to delete expression %d from daemon: %s", expr.id, e)
+                        
+                        session.delete(old_tx)
+                    session.commit()
 
             if audio_record is None and audio_metadata and not chapter_id:
                 # Import file to library
@@ -279,8 +313,9 @@ class TranscriptionRepository:
         # Step 2. Group into parents
         parent_groups = parent_child_grouper(chunks)
 
-        # Calculate exact total of vector embeddings to be generated
-        total_embeds = 1 + len(parent_groups) + sum(len(pg.children) for pg in parent_groups)
+        # Only Tier 3 sentence chunks are embedded in LanceDB (true parent-child retrieval).
+        # Tier 1 and Tier 2 live in SQLite only for graph-expansion during search.
+        total_embeds = sum(len(pg.children) for pg in parent_groups)
         current_embed = 0
 
         def _update_progress():
@@ -292,7 +327,8 @@ class TranscriptionRepository:
         if on_phase:
             on_phase("embedding", "Generating embeddings...", 0.0)
 
-        # Step 3. Register Tier 1 (full cleaned text)
+        # Step 3. Register Tier 1 (full cleaned text) in SQLite only — NOT embedded in LanceDB.
+        # Tier 1 serves as the root anchor for the SQLite expression graph.
         cleaned_text = _clean_text(transcript.text)
         t1_expr = expr_repo.register(
             content=cleaned_text,
@@ -300,13 +336,10 @@ class TranscriptionRepository:
             source_id=transcription_id,
         )
 
-        # Send Tier 1 to daemon for embedding
-        daemon.embed(t1_expr.id, cleaned_text, SourceType.AUDIO_TRANSCRIPT)
-        _update_progress()
-
-        # Step 4. Register Tier 2 and Tier 3
+        # Step 4. Register Tier 2 (SQLite only) and Tier 3 (SQLite + LanceDB)
         for pg in parent_groups:
-            # Tier 2 parent
+            # Tier 2 parent — registered in SQLite only, NOT embedded in LanceDB.
+            # During search, Tier 3 hits walk up to this node for rich context.
             t2_expr = expr_repo.register(
                 content=pg.parent_text,
                 source_type=SourceType.AUDIO_TRANSCRIPT.value,
@@ -315,8 +348,6 @@ class TranscriptionRepository:
             expr_repo.link(
                 from_id=t2_expr.id, to_id=t1_expr.id, relation_type=RelationType.SOURCE.value
             )
-            daemon.embed(t2_expr.id, pg.parent_text, SourceType.AUDIO_TRANSCRIPT)
-            _update_progress()
 
             # Tier 3 children
             for child in pg.children:
@@ -614,10 +645,14 @@ class TranscriptionRepository:
             List of matching transcription dicts.
         """
         with get_session() as session:
-            pattern = f"%{query}%"
+            from sqlalchemy import and_
+            
+            tokens = [t.strip() for t in query.split() if t.strip()]
+            filters = [TranscriptionRecord.full_text.ilike(f"%{t}%") for t in tokens]
+            
             records = (
                 session.query(TranscriptionRecord)
-                .filter(TranscriptionRecord.full_text.ilike(pattern))
+                .filter(and_(*filters) if filters else True)
                 .order_by(desc(TranscriptionRecord.created_at))
                 .limit(limit)
                 .all()

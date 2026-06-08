@@ -163,3 +163,86 @@ def reindex_daemon() -> None:
         console.print(
             f"[bold green]✓ Reindexed {len(expressions)} expression(s) successfully.[/bold green]"
         )
+
+
+@daemon_group.command(name="index")
+@click.option("--tx-id", type=int, default=None, help="Transcription ID to index. Omit for all unindexed.")
+def index_transcripts(tx_id: int | None) -> None:
+    """Register and embed unindexed transcripts into the semantic memory store.
+
+    Runs the consistency sweep in-process — works even if the daemon is busy
+    or not running. Use --tx-id to target a single transcript.
+    """
+    from audiobench.core.db_session import get_session
+    from audiobench.memory.chunking import content_aware_router
+    from audiobench.memory.enums import SourceType
+    from audiobench.memory.memory_store import MemoryStore
+    from audiobench.memory.singletons import pre_warm_retrieval_pipeline
+    from audiobench.storage.expression_repository import ExpressionRepository
+    from audiobench.storage.models import TranscriptionRecord
+
+    with get_session() as session:
+        if tx_id is not None:
+            records = session.query(TranscriptionRecord).filter_by(id=tx_id).all()
+            if not records:
+                console.print(f"[red]Transcription #{tx_id} not found.[/red]")
+                return
+        else:
+            records = (
+                session.query(TranscriptionRecord)
+                .filter(TranscriptionRecord.is_indexed == 0)
+                .all()
+            )
+
+        if not records:
+            console.print("[green]All transcripts are already indexed.[/green]")
+            return
+
+        console.print(f"[bold]Loading embedding model…[/bold]")
+        pre_warm_retrieval_pipeline()
+        store = MemoryStore()
+        expr_repo = ExpressionRepository()
+
+        console.print(f"[bold]Indexing {len(records)} transcript(s)…[/bold]")
+        from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Indexing", total=len(records))
+            success = 0
+            for rec in records:
+                try:
+                    text = rec.full_text or ""
+                    if not text.strip():
+                        rec.is_indexed = 1
+                        progress.advance(task)
+                        continue
+                    progress.update(task, description=f"[dim]{rec.file_name[:40]}[/dim]")
+                    chunks = content_aware_router(text)
+                    for chunk in chunks:
+                        expr = expr_repo.register(
+                            content=chunk.content,
+                            source_type=SourceType.AUDIO_TRANSCRIPT.value,
+                            source_id=rec.id,
+                            speaker=chunk.speaker,
+                        )
+                        store.write_node(
+                            expression_id=expr.id,
+                            content=expr.content,
+                            source_type=SourceType.AUDIO_TRANSCRIPT.value,
+                            speaker=chunk.speaker,
+                        )
+                    rec.is_indexed = 1
+                    success += 1
+                except Exception as e:
+                    logger.error("Failed to index transcript %d: %s", rec.id, e)
+                    console.print(f"  [red]✗ #{rec.id} {rec.file_name}: {e}[/red]")
+                finally:
+                    progress.advance(task)
+            session.commit()
+
+        console.print(f"[bold green]✓ Indexed {success}/{len(records)} transcript(s).[/bold green]")

@@ -99,6 +99,29 @@ class AudioBenchSettings(BaseSettings):
     )
     word_timestamps: bool = Field(default=True, description="Enable word-level timestamps")
 
+    # --- Play UI ---
+    play_mode: str = Field(
+        default="default", description="Active display mode: 'default' or 'enhanced'"
+    )
+    play_karaoke: bool = Field(
+        default=False, description="Karaoke word highlight (linear interpolation)"
+    )
+    play_focus_gradient: bool = Field(
+        default=True, description="4-level focus gradient dimming"
+    )
+    play_center_lock: bool = Field(
+        default=True, description="Pin active line to vertical center"
+    )
+    play_speaker_badges: bool = Field(
+        default=True, description="Show speaker change labels"
+    )
+    play_timestamps: bool = Field(
+        default=False, description="Show [HH:MM:SS] gutter on each line"
+    )
+    play_show_remaining: bool = Field(
+        default=False, description="Show remaining time on progress bar"
+    )
+
     # --- Features ---
     enable_diarization: bool = Field(default=False, description="Enable speaker diarization")
 

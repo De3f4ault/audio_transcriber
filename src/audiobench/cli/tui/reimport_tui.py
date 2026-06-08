@@ -62,7 +62,10 @@ class ReimportTUI:
         return not self.cancelled
 
     def _run_loop(self, stdscr):
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
         stdscr.nodelay(0)
         stdscr.timeout(100)
         stdscr.clear()
@@ -105,6 +108,8 @@ class ReimportTUI:
             elif self.screen == 14:
                 self._draw_screen_4b(stdscr)
                 break
+            elif self.screen == 15:
+                self._draw_screen_15(stdscr)
                 
             key = stdscr.getch()
             self._handle_input(key)
@@ -150,34 +155,143 @@ class ReimportTUI:
             if key in (10, 13):
                 self.audio_dir = self.audio_nav.current_path
                 self._match_batch()
-                self.screen = 13
+                
+                existing = self._get_existing_basenames()
+                self.conflict_pairs = [p for p in self.batch_pairs if p["tx"].stem in existing]
+                
+                if self.conflict_pairs:
+                    self.screen = 15
+                else:
+                    self.batch_overwrite = False
+                    self.screen = 13
         elif self.screen == 13:
             if key in (ord('s'), ord('S')):
                 self.screen = 14
             elif key in (ord('q'), ord('Q')):
                 self.cancelled = True
+        elif self.screen == 15:
+            if key in (ord('s'), ord('S')):
+                existing = self._get_existing_basenames()
+                self.batch_pairs = [p for p in self.batch_pairs if p["tx"].stem not in existing]
+                self.batch_overwrite = False
+                self.screen = 13
+            elif key in (ord('r'), ord('R'), ord('o'), ord('O'), ord('0')):
+                self.batch_overwrite = True
+                self.screen = 13
+            elif key in (ord('q'), ord('Q')):
+                self.cancelled = True
                 
         if key in (ord('q'), ord('Q')) and self.screen < 5:
             self.cancelled = True
-        elif key in (ord('q'), ord('Q')) and self.screen in (11, 12):
+        elif key in (ord('q'), ord('Q')) and self.screen in (11, 12, 15):
             self.cancelled = True
+
+    def _get_existing_basenames(self):
+        if hasattr(self, "_existing_basenames"):
+            return self._existing_basenames
+            
+        from audiobench.core.db_engine import init_db
+        from audiobench.storage.repository import TranscriptionRepository
+        init_db()
+        repo = TranscriptionRepository()
+        from audiobench.core.db_session import get_session
+        self._existing_basenames = set()
+        with get_session() as session:
+            from audiobench.storage.models import TranscriptionRecord
+            from pathlib import Path
+            for (fname,) in session.query(TranscriptionRecord.file_name).all():
+                if fname:
+                    self._existing_basenames.add(Path(fname).stem)
+        return self._existing_basenames
 
     def _match_batch(self):
         self.batch_pairs = []
         import json
-        for tx_file in self.transcript_dir.glob("*.json"):
-            # read JSON to find original audio file name
+        import re
+        
+        from audiobench.transcribe.audio_converter import ALL_SUPPORTED_FORMATS
+        
+        # Pre-index all supported audio files in the audio directory recursively
+        # to avoid scanning the disk thousands of times
+        available_audio_files = []
+        try:
+            for ext in ALL_SUPPORTED_FORMATS:
+                available_audio_files.extend(list(self.audio_dir.rglob(f"*.{ext}")))
+        except Exception:
+            pass
+
+        def normalize_name(name: str) -> str:
+            # Lowercase, remove non-alphanumeric (except spaces), collapse spaces
+            s = re.sub(r'[^a-z0-9\s]', '', name.lower())
+            return re.sub(r'\s+', ' ', s).strip()
+
+        # If the user selected specific files with spacebar, use those. 
+        # Otherwise, default to all JSON files in the confirmed directory.
+        if self.tx_nav.selected_files:
+            tx_files = list(self.tx_nav.selected_files)
+        else:
+            tx_files = list(self.transcript_dir.glob("*.json"))
+            
+        for tx_file in tx_files:
+            if not tx_file.name.endswith(".json"):
+                continue
+            
+            matched_audio = None
+            
+            # 1. Try to read JSON to find exact original audio file name
             try:
                 data = json.loads(tx_file.read_text(encoding="utf-8"))
                 audio_name = data.get("audio", {}).get("file_name")
                 if audio_name:
-                    audio_path = self.audio_dir / audio_name
-                    if audio_path.exists():
-                        self.batch_pairs.append({"tx": tx_file, "audio": audio_path})
-                    else:
-                        self.batch_pairs.append({"tx": tx_file, "audio": None})
+                    # Check recursively
+                    for audio_cand in available_audio_files:
+                        if audio_cand.name == audio_name:
+                            matched_audio = audio_cand
+                            break
             except Exception:
                 pass
+                
+            # 2. If not found via JSON metadata, try matching by base filename (fuzzy & recursive)
+            if not matched_audio:
+                tx_stem_norm = normalize_name(tx_file.stem)
+                best_match = None
+                best_ratio = 0.0
+                
+                for audio_cand in available_audio_files:
+                    audio_stem_norm = normalize_name(audio_cand.stem)
+                    
+                    if tx_stem_norm == audio_stem_norm:
+                        best_match = audio_cand
+                        best_ratio = 1.0
+                        break
+                    else:
+                        ratio = SequenceMatcher(None, tx_stem_norm, audio_stem_norm).ratio()
+                        if ratio > best_ratio:
+                            best_ratio = ratio
+                            best_match = audio_cand
+                
+                # Threshold for fuzzy matching, e.g., 0.85
+                if best_ratio > 0.85:
+                    matched_audio = best_match
+                        
+            # 3. Fallback: check if the audio file is already in the database library
+            if not matched_audio:
+                try:
+                    from audiobench.core.db_session import get_session
+                    from audiobench.storage.models import AudioFileRecord
+                    with get_session() as session:
+                        stem = tx_file.stem
+                        for ext in ALL_SUPPORTED_FORMATS:
+                            query_name = f"{stem}.{ext}"
+                            rec = session.query(AudioFileRecord).filter_by(file_name=query_name).first()
+                            if rec and Path(rec.file_path).exists():
+                                matched_audio = Path(rec.file_path)
+                                break
+                except Exception:
+                    pass
+                        
+            # Append pair
+            self.batch_pairs.append({"tx": tx_file, "audio": matched_audio})
 
             
     def _nav_input(self, key, nav, on_enter):
@@ -195,6 +309,8 @@ class ReimportTUI:
             nav.select_next()
         elif key in (ord("t"), ord("H")):
             nav.toggle_hidden_visibility()
+        elif key == ord(" "):
+            nav.toggle_selection()
             
     def _on_tx_selected(self, path):
         self.transcript_path = path
@@ -223,18 +339,16 @@ class ReimportTUI:
             
             init_db()
             repo = TranscriptionRepository()
-            session = repo.get_session()
-            
-            # Check DB for audio
-            from sqlalchemy.orm import Session
-            rec = session.query(AudioFileRecord).filter_by(file_hash=self.audio_metadata.file_hash).first()
-            if rec:
-                self.db_check_result = "exists"
-                self.existing_transcriptions_count = session.query(TranscriptionRecord).filter_by(audio_file_id=rec.id).count()
-            else:
-                self.db_check_result = "new"
-                
-            session.close()
+            from audiobench.core.db_session import get_session
+            with get_session() as session:
+                # Check DB for audio
+                from sqlalchemy.orm import Session
+                rec = session.query(AudioFileRecord).filter_by(file_hash=self.audio_metadata.file_hash).first()
+                if rec:
+                    self.db_check_result = "exists"
+                    self.existing_transcriptions_count = session.query(TranscriptionRecord).filter_by(audio_file_id=rec.id).count()
+                else:
+                    self.db_check_result = "new"
         except HashMismatchError as e:
             self.hash_error = str(e)
         except Exception as e:
@@ -337,7 +451,8 @@ class ReimportTUI:
             )
             
             # update source to reimport
-            with repo.get_session() as session:
+            from audiobench.core.db_session import get_session
+            with get_session() as session:
                 rec = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
                 if rec:
                     rec.source = "reimport"
@@ -358,17 +473,31 @@ class ReimportTUI:
         h, w = stdscr.getmaxyx()
         stdscr.addstr(0, 0, " 📂 Batch Reimport: Select Transcript Folder ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
         
+        existing = self._get_existing_basenames()
         items = self.tx_nav.list_items()
         for i, item in enumerate(items[:h-4]):
             y = i + 2
             is_sel = (i == self.tx_nav.selected)
+            item_path = self.tx_nav.current_path / item
+            is_checked = item_path in self.tx_nav.selected_files
             attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
-            icon = "📁" if (self.tx_nav.current_path / item).is_dir() else "📄"
-            stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w-2], attr)
             
-        stdscr.addstr(h-2, 0, f" Current Folder: {self.tx_nav.current_path}".ljust(w), curses.color_pair(5))
+            if item_path.is_dir():
+                icon = "📁"
+                prefix = f"{'>' if is_sel else ' '} "
+                suffix = ""
+            else:
+                icon = "📄"
+                prefix = f"{'>' if is_sel else ' '} {'[x]' if is_checked else '[ ]'}"
+                suffix = " [Transcribed]" if item_path.stem in existing else ""
+                if suffix:
+                    attr = curses.color_pair(5) | curses.A_BOLD if is_sel else curses.color_pair(5)
+                
+            stdscr.addstr(y, 1, f"{prefix} {icon} {item}{suffix}"[:w-2], attr)
+            
+        stdscr.addstr(h-2, 0, f" Current Folder: {self.tx_nav.current_path} ({len(self.tx_nav.selected_files)} selected)".ljust(w), curses.color_pair(5))
         try:
-            stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w-1), curses.color_pair(1))
+            stdscr.addstr(h-1, 0, " SPACE: Select File | ENTER: Confirm Folder/Files | q: Quit ".ljust(w-1), curses.color_pair(1))
         except curses.error:
             pass
 
@@ -394,9 +523,26 @@ class ReimportTUI:
         except curses.error:
             pass
 
+    def _draw_screen_15(self, stdscr):
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, f" ⚠️ Conflict: {len(self.conflict_pairs)} files already exist ".ljust(w), curses.color_pair(7) | curses.A_BOLD)
+        
+        for i, pair in enumerate(self.conflict_pairs[:h-4]):
+            y = i + 2
+            tx = pair["tx"].name
+            stdscr.addstr(y, 2, f"- {tx}"[:w-4], curses.color_pair(5))
+            
+        try:
+            stdscr.addstr(h-1, 0, " [S]kip Existing | [R]eplace Existing | q: Cancel ".ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
+
     def _draw_screen_3b(self, stdscr):
         h, w = stdscr.getmaxyx()
-        stdscr.addstr(0, 0, f" 🚀 Batch Ready: {len(self.batch_pairs)} pairs matched ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
+        msg = f" 🚀 Batch Ready: {len(self.batch_pairs)} pairs matched "
+        if getattr(self, "batch_overwrite", False):
+            msg += "(OVERWRITE ON) "
+        stdscr.addstr(0, 0, msg.ljust(w), curses.color_pair(1) | curses.A_BOLD)
         
         for i, pair in enumerate(self.batch_pairs[:h-4]):
             y = i + 2
@@ -432,8 +578,14 @@ class ReimportTUI:
                 init_db()
                 repo = TranscriptionRepository()
                 
-                tx_id = repo.save_transcription(parsed_tx, audio_meta, on_phase=lambda p, pct: None)
-                with repo.get_session() as session:
+                tx_id = repo.save_transcription(
+                    parsed_tx, 
+                    audio_meta, 
+                    on_phase=lambda *args, **kwargs: None,
+                    overwrite=getattr(self, "batch_overwrite", False)
+                )
+                from audiobench.core.db_session import get_session
+                with get_session() as session:
                     rec = session.query(TranscriptionRecord).filter_by(id=tx_id).first()
                     if rec:
                         rec.source = "reimport"

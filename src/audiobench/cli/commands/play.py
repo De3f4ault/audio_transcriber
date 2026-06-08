@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
@@ -27,6 +28,23 @@ from audiobench.cli.display.theme import (
     console,
     error_panel,
 )
+
+@dataclass
+class PlayState:
+    mode: str                     # 'default' or 'enhanced'
+    karaoke: bool
+    focus_gradient: bool
+    center_lock: bool
+    speaker_badges: bool
+    timestamps: bool
+    show_remaining: bool
+    show_help: bool = False       # True while ? overlay is visible
+    settings_dirty: bool = False  # True when any toggle changed — triggers save on exit
+
+    @property
+    def enhanced(self) -> bool:
+        """True when Enhanced mode is active."""
+        return self.mode == "enhanced"
 
 # ── Engine priority for smart transcript selection ──
 # Higher = preferred. Google transcripts are generally more accurate.
@@ -248,6 +266,18 @@ def _play_with_lyrics(
 
     # cbreak mode: read individual keypresses while preserving output processing
     # (setraw breaks ANSI escape handling needed by Rich Live)
+    from audiobench.core.settings import get_settings
+    _s = get_settings()
+    state = PlayState(
+        mode=_s.play_mode,
+        karaoke=_s.play_karaoke,
+        focus_gradient=_s.play_focus_gradient,
+        center_lock=_s.play_center_lock,
+        speaker_badges=_s.play_speaker_badges,
+        timestamps=_s.play_timestamps,
+        show_remaining=_s.play_show_remaining,
+    )
+
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
@@ -256,6 +286,8 @@ def _play_with_lyrics(
 
         with Live(console=console, refresh_per_second=4, transient=True) as live:
             current_idx = -1  # track segment index across loop iterations
+            import bisect
+            segment_starts = [seg.get("start", 0) for seg in segments]
             while mpv.is_running():
                 # ── Handle keypresses (non-blocking) ──
                 # Keybindings follow mpv defaults
@@ -380,21 +412,40 @@ def _play_with_lyrics(
                             emoji = BOOKMARK_TYPES.get(new_type, "🔖")
                             _set_flash(f"{emoji} Type → {new_type}")
 
+                    # ── Mode & display toggles ──
+                    elif key == "\t":  # Tab — cycle mode
+                        state.mode = "enhanced" if state.mode == "default" else "default"
+                        state.settings_dirty = True
+                    elif key == "k":
+                        state.karaoke = not state.karaoke
+                        state.settings_dirty = True
+                    elif key == "f":
+                        state.focus_gradient = not state.focus_gradient
+                        state.settings_dirty = True
+                    elif key == "c":
+                        state.center_lock = not state.center_lock
+                        state.settings_dirty = True
+                    elif key == "d":
+                        state.speaker_badges = not state.speaker_badges
+                        state.settings_dirty = True
+                    elif key == "t":
+                        state.timestamps = not state.timestamps
+                        state.settings_dirty = True
+                    elif key == "r":
+                        state.show_remaining = not state.show_remaining
+                        state.settings_dirty = True
+                    elif key == "?":
+                        state.show_help = not state.show_help
+
                 # ── Read state from mpv (batch for low latency) ──
                 current_time, current_speed, paused = mpv.get_playback_state()
 
-                # Find current segment
-                current_idx = -1
-                for i, seg in enumerate(segments):
-                    if seg.get("start", 0) <= current_time <= seg.get("end", 0):
-                        current_idx = i
-                        break
-                    if seg.get("start", 0) > current_time:
-                        current_idx = max(0, i - 1)
-                        break
-
-                if current_idx == -1 and segments:
-                    current_idx = len(segments) - 1
+                # Find current segment using binary search (O(log N))
+                if segment_starts:
+                    idx = bisect.bisect_right(segment_starts, current_time) - 1
+                    current_idx = max(0, idx)
+                else:
+                    current_idx = -1
 
                 # ── Build display ──
                 from rich.align import Align
@@ -409,51 +460,199 @@ def _play_with_lyrics(
                         return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
                     return f"{s // 60:02d}:{s % 60:02d}"
 
-                # Progress bar (centered)
-                pause_icon = "⏸" if paused else "▶"
-                speed_str = f"  {current_speed:.2g}x" if current_speed != 1.0 else ""
+                def _build_progress_bar() -> Text:
+                    pause_icon = "⏸" if paused else "▶"
+                    bar_width = 28
+                    pct = min(current_time / total_duration, 1.0) if total_duration > 0 else 0
+                    filled = int(pct * bar_width)
+                    # Playhead dot sits at the fill boundary
+                    if filled < bar_width:
+                        bar = "━" * filled + "●" + "─" * (bar_width - filled - 1)
+                    else:
+                        bar = "━" * bar_width
+
+                    time_str = f"{pause_icon}  {_fmt(current_time)} / {_fmt(total_duration)}"
+
+                    if state.show_remaining and total_duration > 0:
+                        remaining = total_duration - current_time
+                        time_str += f"  -{_fmt(remaining)}"
+
+                    speed_str = ""
+                    if current_speed != 1.0:
+                        speed_str = f"  {current_speed:.2g}×"
+
+                    line = f"{time_str}   {bar}{speed_str}"
+                    t = Text(line)
+                    t.stylize("bold cyan" if paused else "white")
+                    # Amber tint for the speed indicator when non-1x
+                    if current_speed != 1.0:
+                        start = len(line) - len(speed_str)
+                        t.stylize("yellow", start=start)
+                    return t
+
+                def _estimate_word_times(seg: dict) -> list[tuple[str, str]]:
+                    raw_words = (seg.get("text") or "").strip().split()
+                    n = len(raw_words)
+                    if n == 0:
+                        return []
+                    seg_start = seg.get("start", 0.0)
+                    seg_end   = seg.get("end", seg_start + 0.01)
+                    seg_dur   = max(seg_end - seg_start, 0.01)
+                    word_dur  = seg_dur / n
+                    result = []
+                    for i, w in enumerate(raw_words):
+                        w_start = seg_start + i * word_dur
+                        w_end   = w_start + word_dur
+                        if current_time < w_start:
+                            style = "dim"
+                        elif current_time > w_end:
+                            style = "white"
+                        else:
+                            style = "bold cyan on grey11"
+                        result.append((w + " ", style))
+                    return result
+
+                def _build_segment_window() -> Text:
+                    # ── Default mode: exact original behavior, zero changes ──
+                    if not state.enhanced:
+                        out = Text()
+                        win_start = max(0, current_idx - 3)
+                        win_end   = min(len(segments), current_idx + 4)
+                        if win_start > 0:
+                            out.append("⋮\n", style="dim")
+                        for i in range(win_start, win_end):
+                            seg  = segments[i]
+                            text = (seg.get("text") or "").strip()
+                            if not text:
+                                continue
+                            if i == current_idx:
+                                out.append(f"▸ {text}\n", style="bold")
+                            elif i < current_idx:
+                                out.append(f"  {text}\n", style="dim")
+                            else:
+                                out.append(f"  {text}\n", style="dim italic")
+                        if win_end < len(segments):
+                            out.append("⋮\n", style="dim")
+                        return out
+
+                    # ── Enhanced mode: all feature toggles apply ──
+                    term_h = console.size.height
+                    # How many lines we can show (leave room for progress bar + hints)
+                    visible_lines = max(5, term_h - 8)
+
+                    if state.center_lock:
+                        half = visible_lines // 2
+                        win_start = max(0, current_idx - half)
+                        win_end   = min(len(segments), current_idx + half + 1)
+                    else:
+                        win_start = max(0, current_idx - 3)
+                        win_end   = min(len(segments), current_idx + 4)
+
+                    out = Text()
+
+                    if win_start > 0:
+                        out.append("  ⋮\n", style="dim color(240)")
+
+                    prev_speaker = None
+
+                    for i in range(win_start, win_end):
+                        seg     = segments[i]
+                        text    = (seg.get("text") or "").strip()
+                        speaker = seg.get("speaker")
+                        if not text:
+                            continue
+
+                        # ── Speaker badge ──
+                        if state.speaker_badges and speaker and speaker != prev_speaker:
+                            badge = f"  ── {speaker} " + "─" * max(0, 28 - len(speaker))
+                            out.append(badge + "\n", style="bold magenta")
+                        prev_speaker = speaker
+
+                        # ── Distance-based style ──
+                        distance = abs(i - current_idx)
+                        if i == current_idx:
+                            line_style = "bold cyan"
+                        elif state.focus_gradient:
+                            if distance == 1:
+                                line_style = "white"
+                            elif distance == 2:
+                                line_style = "dim"
+                            else:
+                                line_style = "dim italic color(240)"
+                        else:
+                            if i < current_idx:
+                                line_style = "dim"
+                            else:
+                                line_style = "dim italic"
+
+                        # ── Timestamp gutter ──
+                        prefix = ""
+                        if state.timestamps:
+                            ts = _fmt(seg.get("start", 0.0))
+                            prefix = f"[{ts}] "
+
+                        # ── Karaoke word rendering (active segment only) ──
+                        if i == current_idx and state.karaoke:
+                            if prefix:
+                                out.append("  " + prefix, style="dim cyan")
+                            else:
+                                out.append("▸ ", style="bold cyan")
+                            for word_text, word_style in _estimate_word_times(seg):
+                                out.append(word_text, style=word_style)
+                            out.append("\n")
+                        else:
+                            # Normal line rendering
+                            indicator = "▸ " if i == current_idx else "  "
+                            out.append(f"{indicator}{prefix}{text}\n", style=line_style)
+
+                    if win_end < len(segments):
+                        out.append("  ⋮\n", style="dim color(240)")
+
+                    return out
+
+                def _build_help_overlay() -> Text:
+                    def _row(key: str, label: str, on: bool, dim: bool = False) -> str:
+                        indicator = "[bold green]  ON [/]" if on else "[dim]  OFF[/]"
+                        row = f"  {key}  {label:<34} {indicator}\n"
+                        return f"[dim]{row}[/]" if dim else row
+
+                    mode_indicator = "[bold cyan]ENHANCED[/]" if state.enhanced else "[bold]DEFAULT[/]"
+
+                    out = Text.from_markup(
+                        "\n"
+                        f"  [bold]Player Settings[/]  ·  Mode: {mode_indicator}  "
+                        "[dim]Tab to switch · ? to close[/]\n"
+                        "  [dim]" + "─" * 52 + "[/]\n"
+                        "  [dim]Tab  Switch Default ↔ Enhanced mode[/]\n"
+                        "  [dim]" + "─" * 52 + "[/]\n"
+                    )
+                    # Individual toggles shown dimmed when in Default mode (they have no effect)
+                    in_default = not state.enhanced
+                    rows = [
+                        ("k", "Karaoke word highlight",   state.karaoke),
+                        ("f", "Focus gradient",           state.focus_gradient),
+                        ("c", "Center-lock scroll",       state.center_lock),
+                        ("d", "Speaker badges",           state.speaker_badges),
+                        ("t", "Timestamps in gutter",     state.timestamps),
+                        ("r", "Show remaining time",      state.show_remaining),
+                    ]
+                    for key, label, enabled in rows:
+                        out.append_text(Text.from_markup(_row(key, label, enabled, dim=in_default)))
+                    if in_default:
+                        out.append_text(Text.from_markup(
+                            "  [dim italic]  (switch to Enhanced to activate these)[/]\n"
+                        ))
+                    return out
 
                 if total_duration > 0:
-                    pct = min(current_time / total_duration, 1.0)
-                    bar_width = 30
-                    filled = int(pct * bar_width)
-                    bar = "━" * filled + "░" * (bar_width - filled)
-                    progress_line = (
-                        f"{pause_icon}  {_fmt(current_time)} / {_fmt(total_duration)}"
-                        f"  {bar}{speed_str}"
-                    )
-                    progress_text = Text(progress_line)
-                    progress_text.stylize("bold cyan" if paused else "dim")
                     parts.append(Text(""))
-                    parts.append(Align.center(progress_text))
+                    parts.append(Align.center(_build_progress_bar()))
                     parts.append(Text(""))
 
-                # Segment window — subtitle-style (no timestamps)
-                win_start = max(0, current_idx - 3)
-                win_end = min(len(segments), current_idx + 4)
-
-                segment_text = Text()
-
-                if win_start > 0:
-                    segment_text.append("⋮\n", style="dim")
-
-                for i in range(win_start, win_end):
-                    seg = segments[i]
-                    text = (seg.get("text", "") or "").strip()
-                    if not text:
-                        continue
-
-                    if i == current_idx:
-                        segment_text.append(f"▸ {text}\n", style="bold")
-                    elif i < current_idx:
-                        segment_text.append(f"  {text}\n", style="dim")
-                    else:
-                        segment_text.append(f"  {text}\n", style="dim italic")
-
-                if win_end < len(segments):
-                    segment_text.append("⋮\n", style="dim")
-
-                parts.append(segment_text)
+                if state.show_help:
+                    parts.append(_build_help_overlay())
+                else:
+                    parts.append(_build_segment_window())
 
                 # ── Bookmark flash / region indicator ──
                 flash_text = None
@@ -486,14 +685,16 @@ def _play_with_lyrics(
                         parts.append(Align.center(marker_line))
 
                 # Controls hint (centered)
+                mode_label = "ENHANCED" if state.enhanced else "DEFAULT"
                 if bookmark_repo:
                     ctrl_str = (
-                        "␣ pause  ←→ ±5s  ↑↓ ±60s  b mark  B region  "
-                        "n/p jump  l type  [ ] speed  q quit"
+                        f"[{mode_label}]  Tab mode  ␣ pause  ←→ ±5s  ↑↓ ±60s  "
+                        "b mark  B region  n/p jump  [ ]speed  9/0vol  ? settings  q quit"
                     )
                 else:
                     ctrl_str = (
-                        "␣ pause  ←→ ±5s  ↑↓ ±60s  [ ] speed  9/0 vol  m mute  ⌫ reset  q quit"
+                        f"[{mode_label}]  Tab mode  ␣ pause  ←→ ±5s  ↑↓ ±60s  "
+                        "[ ]speed  9/0vol  m mute  ⌫ reset  ? settings  q quit"
                     )
                 controls = Text(ctrl_str, style="dim")
                 parts.append(Text(""))
@@ -516,6 +717,21 @@ def _play_with_lyrics(
         mpv.terminate()
         _show_listen_stats(listen_start, current_time, listen_start_pos, total_duration)
     finally:
+        if state.settings_dirty:
+            from audiobench.core.settings import get_settings
+            s = get_settings()
+            updated = s.model_copy(update={
+                "play_mode":           state.mode,
+                "play_karaoke":        state.karaoke,
+                "play_focus_gradient": state.focus_gradient,
+                "play_center_lock":    state.center_lock,
+                "play_speaker_badges": state.speaker_badges,
+                "play_timestamps":     state.timestamps,
+                "play_show_remaining": state.show_remaining,
+            })
+            updated.save()
+            get_settings.cache_clear()
+
         # Restore terminal
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 

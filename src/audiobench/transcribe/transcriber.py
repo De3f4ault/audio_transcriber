@@ -324,7 +324,13 @@ class TranscriptionPipeline:
 
             # Save
             emit("saving", "Saving to database...")
-            tx_id = self._repository.save_transcription(transcript, metadata, chapter_id=chapter_id, on_phase=emit)
+            tx_id = self._repository.save_transcription(
+                transcript, 
+                metadata, 
+                chapter_id=chapter_id, 
+                on_phase=emit, 
+                overwrite=skip_cache
+            )
             logger.info("Pipeline: saved as transcription #%d", tx_id)
 
             # Fire plugin hook

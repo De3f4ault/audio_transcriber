@@ -419,10 +419,16 @@ def cmd_summarize(session: ReplSession, args: str) -> None:
 def cmd_import(session: ReplSession, args: str) -> None:
     """Import audio files into the internal library."""
     from audiobench.cli.repl.session import NavigationFrame
+    from audiobench.cli.repl.dispatch import dispatch_command
+    import shlex
+    
     session.push_frame(NavigationFrame(context="import", state={}, intent="import files"))
     
-    from audiobench.cli.commands.import_cmd import run_import_flow
-    run_import_flow(session=session)
+    if not args.strip():
+        dispatch_command(session, ["import"])
+    else:
+        parsed_args = shlex.split(args)
+        dispatch_command(session, ["import"] + parsed_args)
 
 @register_backslash("transcribe")
 def cmd_transcribe(session: ReplSession, args: str) -> None:
