@@ -607,9 +607,10 @@ class TranscriptionPipeline:
             _, metadata = loader.load(file_path)
 
         if metadata and metadata.file_hash:
-            record = self._repository.find_by_hash(metadata.file_hash)
-            if record:
-                return record
+            with get_session() as session:
+                record = session.query(AudioFileRecord).filter_by(file_hash=metadata.file_hash).first()
+                if record:
+                    return record
 
         # New file — import to library and detect chapters
         new_path = self._repository._import_to_library(str(file_path))
