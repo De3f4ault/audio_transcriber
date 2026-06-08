@@ -15,7 +15,7 @@ from audiobench.memory.enums import SourceType
 logger = get_logger("daemon.client")
 
 # Timeout for normal requests (seconds)
-_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_TIMEOUT = 300.0
 
 
 class DaemonClient:
@@ -40,7 +40,7 @@ class DaemonClient:
             "/home/de3f4ault/Desktop/Projects/audiobench/data/logs/daemon_autostart.log", "w"
         )
         subprocess.Popen(
-            [sys.executable, "-m", "audiobench.cli.main", "daemon", "start"],
+            [sys.executable, "-m", "audiobench", "daemon", "start"],
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=log_file,

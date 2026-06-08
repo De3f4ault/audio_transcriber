@@ -179,9 +179,18 @@ def get_colbert_reranker() -> Any:
                     _colbert_reranker = ColbertReranker(
                         model_name="answerdotai/answerai-colbert-small-v1", column="content"
                     )
+                    logger.info("ColBERT reranker loaded in %.2fs", time.time() - t0)
+                except (ImportError, ModuleNotFoundError) as e:
+                    # rerankers package not installed — ColBERT is optional
+                    logger.warning(
+                        "ColBERT reranker unavailable (%s). "
+                        "Install with: pip install rerankers[transformers]. "
+                        "Falling back to cross-encoder only.",
+                        e,
+                    )
+                    _colbert_reranker = None  # sentinel: skip ColBERT in search
                 except Exception as e:
                     _handle_load_error(e, "answerdotai/answerai-colbert-small-v1")
-                logger.info("ColBERT reranker loaded in %.2fs", time.time() - t0)
     return _colbert_reranker
 
 
@@ -195,7 +204,7 @@ def pre_warm_retrieval_pipeline() -> None:
 
     get_boundary_embedder()
     get_primary_embedder()
-    get_colbert_reranker()
     get_reranker()
+    get_colbert_reranker()  # optional — won't crash if rerankers pkg is absent
 
     logger.info("Retrieval pipeline fully warmed in %.2fs", time.time() - t0)

@@ -42,7 +42,7 @@ class MemoryQueryEngine:
     def query(
         self,
         text: str,
-        top_k: int = 15,
+        top_k: int = 20,  # Increased to ensure enough Tier 3 candidates to fill 5 unique parents
         speaker_filter: str | None = None,
         preset: str = "balanced",
         enable_hyde: bool | None = None,
@@ -88,11 +88,11 @@ class MemoryQueryEngine:
         hyde_document = None
         if final_hyde:
             hyde_prompt = (
-                f"Please write a realistic hypothetical excerpt from a meeting transcript, personal voice note, "
-                f"or podcast that directly answers or provides context for the following query. "
-                f"Limit your response to approximately 100 to 150 words. Do not exceed 150 words. "
-                f"Do not include any preambles, facts you are unsure about, or meta-commentary, just produce "
-                f"the raw hypothetical text.\n\nQuery: {text}"
+                f"Please write a realistic hypothetical excerpt from a spoken recording, such as an audiobook, "
+                f"podcast, interview, or personal reflection, that directly answers or provides context for the "
+                f"following query. Limit your response to approximately 100 to 150 words. Do not exceed 150 words. "
+                f"Do not include any preambles, greetings, facts you are unsure about, or meta-commentary. Just "
+                f"produce the raw hypothetical text as if it were a direct transcript.\n\nQuery: {text}"
             )
             try:
                 logger.info("Generating HyDE document via Ollama...")
@@ -133,40 +133,41 @@ class MemoryQueryEngine:
                 query=text, answer="No relevant memory found in database.", sources=[]
             )
 
-        # Step 3: CrossEncoder Reranking
+        # Step 2.5: Parent-Child Expansion + Deduplication
+        # Walk each Tier 3 sentence hit up to its Tier 2 parent paragraph in SQLite.
+        # Collapse multiple Tier 3 siblings that share the same Tier 2 parent.
+        # This ensures we rerank contextually complete paragraphs, not fragments.
+        expanded: dict[int, tuple[object, float]] = {}  # parent_id -> (parent_expr, best_score)
+        for expr, score in candidates:
+            parent = self.expr_repo.walk_to_parent(expr.id)
+            if parent is not None:
+                # Use the Tier 2 parent as the retrieval unit
+                if parent.id not in expanded or score > expanded[parent.id][1]:
+                    expanded[parent.id] = (parent, score)
+            else:
+                # expr has no parent (e.g. non-transcript, or already a top-level node)
+                if expr.id not in expanded:
+                    expanded[expr.id] = (expr, score)
+
+        # Sort collapsed parents by best child score descending
+        expanded_candidates = sorted(expanded.values(), key=lambda x: x[1], reverse=True)
+
+        # Step 3: CrossEncoder Reranking over the deduplicated parent paragraphs
         if final_cross:
             try:
-                docs = [c[0].content for c in candidates]
+                docs = [c[0].content for c in expanded_candidates]
                 scores = self.daemon.rerank(text, docs)
 
                 # Sort by reranker score descending
                 scored_candidates = sorted(
-                    zip(candidates, scores), key=lambda x: x[1], reverse=True
+                    zip(expanded_candidates, scores), key=lambda x: x[1], reverse=True
                 )
-                # Deduplicate by expression ID while maintaining order
-                seen_expr_ids = set()
-                top_candidates = []
-                for c, score in scored_candidates:
-                    expr = c[0]
-                    if expr.id not in seen_expr_ids:
-                        seen_expr_ids.add(expr.id)
-                        top_candidates.append((expr, float(score)))
-                    if len(top_candidates) == 5:
-                        break
+                top_candidates = [(c[0], float(score)) for c, score in scored_candidates[:5]]
             except Exception as e:
-                logger.warning("Reranking via daemon failed: %s. Using original vector scores.", e)
-                top_candidates = [c[0] for c in candidates[:5]]
+                logger.warning("Reranking via daemon failed: %s. Using vector scores.", e)
+                top_candidates = list(expanded_candidates[:5])
         else:
-            # If cross-encoder is disabled, we already have high quality scores from ColBERT or RRF
-            seen_expr_ids = set()
-            top_candidates = []
-            for c in candidates:
-                expr, score = c
-                if expr.id not in seen_expr_ids:
-                    seen_expr_ids.add(expr.id)
-                    top_candidates.append((expr, float(score)))
-                if len(top_candidates) == 5:
-                    break
+            top_candidates = list(expanded_candidates[:5])
 
         # Step 4: Graph Traversal for Enriched Context
         context_blocks = []

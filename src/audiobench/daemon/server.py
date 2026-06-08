@@ -239,6 +239,8 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
         await writer.drain()
     except TimeoutError:
         logger.warning("Connection from %s timed out", peer)
+    except (ConnectionResetError, BrokenPipeError):
+        logger.warning("Client %s disconnected before response could be sent", peer)
     except Exception:
         logger.exception("Unexpected error for connection from %s", peer)
     finally:
@@ -350,7 +352,11 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     _start_time = time.time()
     _write_pid_file(pid_path)
 
-    server = await asyncio.start_unix_server(_handle_connection, path=str(socket_path))
+    server = await asyncio.start_unix_server(
+        _handle_connection, 
+        path=str(socket_path), 
+        limit=104857600  # 100MB limit for massive transcript JSON payloads
+    )
     logger.info("Daemon listening on %s (pid=%d)", socket_path, os.getpid())
 
     # Start background RAG sync task
