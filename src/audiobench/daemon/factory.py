@@ -30,9 +30,10 @@ from audiobench.daemon.local_client import LocalRetrievalClient
 logger = get_logger("daemon.factory")
 
 # How long get_daemon_client() will wait for the socket after a recent
-# ensure_daemon_running() call. Short — the REPL startup gives the daemon
-# plenty of lead time, so we just need a quick confirmation window.
-_FAST_PATH_TIMEOUT = 5.0  # seconds
+# ensure_daemon_running() call. Needs to be long enough for Kaggle and other
+# cloud environments to download models from HF and load them into GPU VRAM
+# during cold starts.
+_FAST_PATH_TIMEOUT = 180.0  # seconds
 
 
 def _is_socket_alive(socket_path: Path) -> bool:
