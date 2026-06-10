@@ -79,11 +79,19 @@ def get_boundary_embedder() -> Any:
                 from sentence_transformers import SentenceTransformer
 
                 try:
+                    # Prefer local cache to avoid unauthenticated/slow HF pings
                     _boundary_embedder = SentenceTransformer(
-                        "sentence-transformers/all-MiniLM-L6-v2", local_files_only=is_offline
+                        "sentence-transformers/all-MiniLM-L6-v2", local_files_only=True
                     )
-                except Exception as e:
-                    _handle_load_error(e, "sentence-transformers/all-MiniLM-L6-v2")
+                except Exception:
+                    if is_offline:
+                        raise
+                    try:
+                        _boundary_embedder = SentenceTransformer(
+                            "sentence-transformers/all-MiniLM-L6-v2", local_files_only=False
+                        )
+                    except Exception as e:
+                        _handle_load_error(e, "sentence-transformers/all-MiniLM-L6-v2")
                 logger.info("Boundary embedder loaded in %.2fs", time.time() - t0)
     return _boundary_embedder
 
@@ -106,13 +114,23 @@ def get_primary_embedder() -> Any:
                 from sentence_transformers import SentenceTransformer
 
                 try:
+                    # Prefer local cache
                     _primary_embedder = SentenceTransformer(
                         "nomic-ai/nomic-embed-text-v1.5",
                         trust_remote_code=True,
-                        local_files_only=is_offline,
+                        local_files_only=True,
                     )
-                except Exception as e:
-                    _handle_load_error(e, "nomic-ai/nomic-embed-text-v1.5")
+                except Exception:
+                    if is_offline:
+                        raise
+                    try:
+                        _primary_embedder = SentenceTransformer(
+                            "nomic-ai/nomic-embed-text-v1.5",
+                            trust_remote_code=True,
+                            local_files_only=False,
+                        )
+                    except Exception as e:
+                        _handle_load_error(e, "nomic-ai/nomic-embed-text-v1.5")
                 logger.info("Primary embedder loaded in %.2fs", time.time() - t0)
     return _primary_embedder
 
@@ -135,11 +153,19 @@ def get_reranker() -> Any:
                 from sentence_transformers import CrossEncoder
 
                 try:
+                    # Prefer local cache
                     _reranker = CrossEncoder(
-                        "cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=is_offline
+                        "cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=True
                     )
-                except Exception as e:
-                    _handle_load_error(e, "cross-encoder/ms-marco-MiniLM-L-6-v2")
+                except Exception:
+                    if is_offline:
+                        raise
+                    try:
+                        _reranker = CrossEncoder(
+                            "cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=False
+                        )
+                    except Exception as e:
+                        _handle_load_error(e, "cross-encoder/ms-marco-MiniLM-L-6-v2")
                 logger.info("Reranker loaded in %.2fs", time.time() - t0)
     return _reranker
 
@@ -176,9 +202,33 @@ def get_colbert_reranker() -> Any:
 
                     ColBERTModel.__init__ = patched_init
 
-                    _colbert_reranker = ColbertReranker(
-                        model_name="answerdotai/answerai-colbert-small-v1", column="content"
-                    )
+                    # Temporarily force HF_HUB_OFFLINE to prevent network ping if cached
+                    original_hf_offline = os.environ.get("HF_HUB_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    try:
+                        _colbert_reranker = ColbertReranker(
+                            model_name="answerdotai/answerai-colbert-small-v1", column="content"
+                        )
+                    except Exception:
+                        if original_hf_offline is not None:
+                            os.environ["HF_HUB_OFFLINE"] = original_hf_offline
+                        else:
+                            del os.environ["HF_HUB_OFFLINE"]
+                        
+                        if is_offline:
+                            raise
+                            
+                        # Retry online
+                        _colbert_reranker = ColbertReranker(
+                            model_name="answerdotai/answerai-colbert-small-v1", column="content"
+                        )
+                    finally:
+                        # Restore original environment if we had to retry
+                        if original_hf_offline is not None:
+                            os.environ["HF_HUB_OFFLINE"] = original_hf_offline
+                        elif "HF_HUB_OFFLINE" in os.environ and original_hf_offline is None and not is_offline:
+                            del os.environ["HF_HUB_OFFLINE"]
+                            
                     logger.info("ColBERT reranker loaded in %.2fs", time.time() - t0)
                 except (ImportError, ModuleNotFoundError) as e:
                     # rerankers package not installed — ColBERT is optional

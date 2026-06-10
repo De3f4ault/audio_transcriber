@@ -61,12 +61,19 @@ def _fork_daemon(socket_path: Path) -> bool:
 
     Returns True if the fork succeeded, False on error.
     """
+    import os
     settings = get_settings()
     log_dir = settings.data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file_path = log_dir / "daemon_startup.log"
 
     try:
+        env = os.environ.copy()
+        # Ensure the 'src' directory is in PYTHONPATH so the -m audiobench command works
+        # even if not pip-installed (e.g. in Kaggle kernels where sys.path is hacked).
+        src_path = str(Path(__file__).resolve().parent.parent.parent)
+        env["PYTHONPATH"] = f"{src_path}:{env.get('PYTHONPATH', '')}"
+
         log_file = open(str(log_file_path), "a")
         subprocess.Popen(
             [sys.executable, "-m", "audiobench", "daemon", "start"],
@@ -74,6 +81,7 @@ def _fork_daemon(socket_path: Path) -> bool:
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=log_file,
+            env=env,
         )
         logger.info("Daemon process forked (background), log: %s", log_file_path)
         return True

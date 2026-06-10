@@ -1,4 +1,4 @@
-"""Dot-commands for the AudioBench REPL.
+r"""Dot-commands for the AudioBench REPL.
 
 Dot-commands (prefixed with `.`) are the semantic layer — they reach into the
 unified expression namespace via LanceDB. They differ from backslash commands
