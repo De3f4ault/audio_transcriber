@@ -99,7 +99,21 @@ class MemoryQueryEngine:
                 hyde_document = self.llm.generate(hyde_prompt, temperature=0.7)
                 logger.debug("HyDE Document: %s", hyde_document)
             except Exception as e:
-                logger.warning("HyDE generation failed: %s", e)
+                logger.warning("HyDE generation via Ollama failed: %s, falling back to Gemini", e)
+                try:
+                    if self.settings.gemini_api_key:
+                        from google import genai
+                        client = genai.Client(api_key=self.settings.gemini_api_key)
+                        response = client.models.generate_content(
+                            model="gemini-2.5-flash", contents=hyde_prompt
+                        )
+                        if response and response.text:
+                            hyde_document = response.text.strip()
+                            logger.debug("HyDE Document (Gemini fallback): %s", hyde_document)
+                    else:
+                        logger.warning("No Gemini API key for HyDE fallback")
+                except Exception as fallback_e:
+                    logger.warning("HyDE generation completely failed: %s", fallback_e)
 
         # Step 2: Vector search via Daemon
         try:
@@ -245,8 +259,25 @@ class MemoryQueryEngine:
             # Write to Cache on successful synthesis
             self.daemon.write_cache(text, answer, hyde_document=hyde_document)
         except Exception as e:
-            logger.error("Synthesis failed: %s", e)
-            answer = "Failed to synthesize answer."
+            logger.warning("Synthesis via Ollama failed: %s, falling back to Gemini", e)
+            try:
+                if self.settings.gemini_api_key:
+                    from google import genai
+                    client = genai.Client(api_key=self.settings.gemini_api_key)
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash", contents=prompt
+                    )
+                    if response and response.text:
+                        answer = response.text.strip()
+                        # Write to Cache on successful synthesis
+                        self.daemon.write_cache(text, answer, hyde_document=hyde_document)
+                    else:
+                        raise ValueError("Empty response from Gemini")
+                else:
+                    raise ValueError("No Gemini API key configured for fallback")
+            except Exception as fallback_e:
+                logger.error("Synthesis failed completely: %s", fallback_e)
+                answer = "Failed to synthesize answer due to LLM API errors."
 
         query_time = time.time() - t0
         return QueryResult(

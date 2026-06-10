@@ -43,6 +43,7 @@ from audiobench.cli.display.theme import (
     is_flag=True,
     help="Preview changes without writing to the database",
 )
+@click.option("--gemini", is_flag=True, help="Use Gemini (gemini-2.5-flash) instead of Ollama")
 @click.option("-q", "--quiet", is_flag=True, help="Quiet mode (no progress output)")
 @click.option("-i", "--interactive", "interactive_mode", is_flag=True, help="Interactive wizard")
 def clean(
@@ -51,6 +52,7 @@ def clean(
     force: bool,
     model_override: str | None,
     dry_run: bool,
+    gemini: bool,
     quiet: bool,
     interactive_mode: bool = False,
 ) -> None:
@@ -68,8 +70,10 @@ def clean(
       audiobench clean --all                  Clean all unrefined transcriptions
       audiobench clean --all --force          Re-clean everything
       audiobench clean 3 --dry-run            Preview changes only
-      audiobench clean 3 --model qwen3:8b     Use a different model
+      audiobench clean 3 --model qwen4:14b    Use a different model
+      audiobench clean 3 --gemini             Use Gemini instead of Ollama
     """
+    from audiobench.chat.providers.gemini_provider import GeminiClient
     from audiobench.chat.providers.ollama_provider import OllamaClient
     from audiobench.core.db_engine import init_db
     from audiobench.core.settings import get_settings
@@ -84,6 +88,7 @@ def clean(
             ids = (target_id,)
             clean_all = False
             force = prompt_bool("Re-clean even if already refined?", default=False)
+            gemini = prompt_bool("Use Gemini instead of local Ollama?", default=False)
             dry_run = prompt_bool("Preview changes only (dry-run)?", default=False)
         except KeyboardInterrupt:
             sys.exit(0)
@@ -100,7 +105,10 @@ def clean(
     repo = TranscriptionRepository()
     settings = get_settings()
 
-    model = model_override or settings.clean_model
+    if gemini:
+        model = model_override or "gemini-2.5-flash"
+    else:
+        model = model_override or settings.clean_model
 
     # ── Resolve which IDs to clean ──
     if clean_all:
@@ -137,19 +145,30 @@ def clean(
         return
 
     # ── Set up client ──
-    client = OllamaClient(
-        base_url=settings.ollama_base_url,
-        model=model,
-    )
-    if not client.is_available():
-        console.print(
-            error_panel(
-                "Ollama not available",
-                f"Cannot reach {settings.ollama_base_url}. "
-                "Is Ollama running with cloud routing enabled?",
+    if gemini:
+        client = GeminiClient(model=model)
+        if not client.is_available():
+            console.print(
+                error_panel(
+                    "Gemini not available",
+                    "Please set GEMINI_API_KEY in your environment or config.",
+                )
             )
+            sys.exit(1)
+    else:
+        client = OllamaClient(
+            base_url=settings.ollama_base_url,
+            model=model,
         )
-        sys.exit(1)
+        if not client.is_available():
+            console.print(
+                error_panel(
+                    "Ollama not available",
+                    f"Cannot reach {settings.ollama_base_url}. "
+                    "Is Ollama running with cloud routing enabled?",
+                )
+            )
+            sys.exit(1)
 
     refiner = TranscriptRefiner(client, model=model)
 
@@ -217,7 +236,7 @@ def clean(
         if not quiet and not _is_tty:
             console.print(f"  Cleaning [bold]#{_tid}[/] {_fname}", end="", flush=True)
 
-        cleaned_texts = refiner.refine_segments(
+        cleaned_texts, has_failures = refiner.refine_segments(
             seg_texts,
             on_progress=on_progress,
             on_token=on_token,
@@ -247,14 +266,20 @@ def clean(
             # Apply to DB
             ok_segs = repo.update_segments(tid, cleaned_texts)
             if ok_segs:
-                # Preserve existing raw_text if already set (--force re-clean path)
-                # raw_text from get_by_id() is "" on first clean, original Whisper on subsequent
-                existing_raw = data.get("raw_text", "")
-                raw_text = existing_raw if existing_raw else data.get("full_text", "")
                 refined_full = " ".join(t.strip() for t in cleaned_texts if t.strip())
-                repo.update_full_text(tid, refined_full, raw_text)
-                if not quiet:
-                    console.print(f"[{SUCCESS}]✓ {changed} segment(s) cleaned[/]")
+                if not has_failures:
+                    # Preserve existing raw_text if already set (--force re-clean path)
+                    # raw_text from get_by_id() is "" on first clean, original Whisper on subsequent
+                    existing_raw = data.get("raw_text", "")
+                    raw_text = existing_raw if existing_raw else data.get("full_text", "")
+                    repo.update_full_text(tid, refined_full, raw_text)
+                    if not quiet:
+                        console.print(f"[{SUCCESS}]✓ {changed} segment(s) cleaned[/]")
+                else:
+                    # Don't set refined_at, so it will be retried next time without --force
+                    repo.update_text(tid, refined_full)
+                    if not quiet:
+                        console.print(f"[{DIM}]~ {changed} segment(s) cleaned (incomplete, will retry)[/]")
                 cleaned_count += 1
             else:
                 if not quiet:

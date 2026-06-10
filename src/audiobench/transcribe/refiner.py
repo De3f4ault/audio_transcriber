@@ -8,7 +8,7 @@ Two modes:
   non-segment use cases but not called by the main pipeline).
 
 Designed for models accessible via OllamaClient, including cloud variants
-(e.g. ``qwen3-next:80b-cloud``).
+(e.g. ``qwen4-next:110b-cloud``).
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ class TranscriptRefiner:
         batch_size: int = 20,
         on_progress: Callable[[int, int], None] | None = None,
         on_token: Callable[[str], None] | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], bool]:
         """Clean segment texts in numbered batches via streaming.
 
         Sends batches of up to ``batch_size`` segments as numbered lines to the
@@ -92,35 +92,38 @@ class TranscriptRefiner:
                 token received. Useful for showing live activity dots.
 
         Returns:
-            List of cleaned segment texts, same length as input.
+            Tuple of (cleaned_texts, has_failures)
         """
         if not segment_texts:
-            return segment_texts
+            return segment_texts, False
 
         result: list[str] = []
+        has_failures = False
         total = len(segment_texts)
         total_batches = (total + batch_size - 1) // batch_size
         batch_num = 0
 
         for batch_start in range(0, total, batch_size):
             batch = segment_texts[batch_start : batch_start + batch_size]
-            cleaned = self._refine_batch(batch, batch_start, on_token=on_token)
+            cleaned, batch_failed = self._refine_batch(batch, batch_start, on_token=on_token)
+            if batch_failed:
+                has_failures = True
             result.extend(cleaned)
             batch_num += 1
             if on_progress:
                 on_progress(batch_num, total_batches)
 
-        return result
+        return result, has_failures
 
     def _refine_batch(
         self,
         batch: list[str],
         offset: int,
         on_token: Callable[[str], None] | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], bool]:
         """Send one numbered batch to the LLM via streaming and return cleaned texts.
 
-        Uses chat_stream() with think=True so Qwen3 reasons before answering.
+        Uses chat_stream() with think=True so Qwen4 reasons before answering.
         The on_token callback fires for each content token received, enabling
         real-time activity display in the CLI.
         On any failure or line-count mismatch, returns the original batch.
@@ -128,7 +131,7 @@ class TranscriptRefiner:
         numbered_input = "\n".join(f"{i + 1}. {text.strip()}" for i, text in enumerate(batch))
 
         try:
-            # think=True: Qwen3 uses its reasoning chain first then returns clean segments
+            # think=True: Qwen4 uses its reasoning chain first then returns clean segments
             # chat_stream: 300s read timeout (vs 120s for non-streaming)
             chunks = self._client.chat_stream(
                 messages=[
@@ -147,6 +150,11 @@ class TranscriptRefiner:
                     if on_token:
                         on_token(token)
             raw_output = raw_output.strip()
+            # If Qwen's thinking logic leaked into the raw stream content, strip it out.
+            if "<think>" in raw_output:
+                import re
+                raw_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL).strip()
+                
             parsed = self._parse_numbered_lines(raw_output)
 
             if len(parsed) != len(batch):
@@ -157,15 +165,15 @@ class TranscriptRefiner:
                     len(parsed),
                     len(batch),
                 )
-                return batch
+                return batch, True
 
-            return parsed
+            return parsed, False
 
         except Exception as e:
             logger.warning(
                 "Segment refiner: batch at offset %d failed (%s). Keeping originals.", offset, e
             )
-            return batch
+            return batch, True
 
     @staticmethod
     def _parse_numbered_lines(text: str) -> list[str]:

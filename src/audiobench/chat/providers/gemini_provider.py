@@ -113,3 +113,50 @@ class GeminiClient:
                     yield chunk.text
         except Exception as e:
             raise AIError("Gemini API stream failed", str(e)) from e
+
+    def chat_stream(
+        self,
+        messages: list[dict],
+        model: str | None = None,
+        temperature: float = 0.3,
+        num_ctx: int | None = None,
+        think: bool = True,
+    ) -> Iterator[dict]:
+        """Stream chat response tokens."""
+        if not self._is_available:
+            raise AIError(
+                "Gemini not available", "google-genai SDK not installed or missing API key."
+            )
+
+        model_name = model or self._model
+
+        system_instruction = None
+        user_content = ""
+        for m in messages:
+            if m.get("role") == "system":
+                system_instruction = m.get("content")
+            else:
+                user_content += m.get("content", "") + "\n"
+
+        from google.genai import types
+
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+        )
+        if system_instruction:
+            config.system_instruction = system_instruction
+
+        logger.info("Streaming chat with %s", model_name)
+
+        try:
+            response_stream = self._client.models.generate_content_stream(
+                model=model_name,
+                contents=user_content.strip(),
+                config=config,
+            )
+            for chunk in response_stream:
+                if chunk.text:
+                    yield {"content": chunk.text, "done": False}
+            yield {"content": "", "done": True}
+        except Exception as e:
+            raise AIError("Gemini API stream failed", str(e)) from e

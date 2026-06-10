@@ -10,7 +10,7 @@ Usage:
 
     client = OllamaClient()
     repo = ChatRepository()
-    session = ChatSession(client, repo, model="qwen3-next:80b-cloud")
+    session = ChatSession(client, repo, model="qwen4-next:110b-cloud")
     session.load_transcripts([transcript_dict])
 
     for chunk in session.send("What was discussed?"):

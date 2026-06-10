@@ -351,8 +351,9 @@ class TranscriptionPipeline:
                 self._spawn_refinement(
                     tx_id, raw_text=transcript.text, segments=transcript.segments
                 )
-                if chapter_id is None:
-                    self._spawn_auto_naming(tx_id, str(file_path), transcript)
+                if chapter_id is None and transcript.segments:
+                    from audiobench.transcribe.rename_service import spawn_auto_naming
+                    spawn_auto_naming(tx_id)
 
             emit("done", "Complete!")
             self._emit_event(
@@ -849,132 +850,6 @@ class TranscriptionPipeline:
         thread = threading.Thread(target=_refine, name=f"refine-{tx_id}", daemon=True)
         thread.start()
         logger.info("Spawned background refinement thread for #%d", tx_id)
-
-    def _spawn_auto_naming(self, tx_id: int, file_path: str, transcript: Transcript) -> None:
-        """Spawn a background thread to generate a semantic title and rename the file."""
-        import threading
-
-        def _rename() -> None:
-            try:
-                import re
-                from pathlib import Path
-
-                from google import genai
-
-                from audiobench.core.db_session import get_session
-                from audiobench.storage.models import AudioFileRecord, TranscriptionRecord
-
-                # Get first ~5 minutes of text to generate title
-                intro_segments = [s for s in transcript.segments if s.end <= 300][:50]
-                intro_text = " ".join([s.text for s in intro_segments])
-
-                if not intro_text.strip():
-                    return
-
-                prompt = (
-                    "Based on the following transcript excerpt, generate a concise, highly semantic 3-5 word title for this audio file.\n"
-                    "Do NOT use quotes, special characters, or prefixes like 'Title:'. Just the raw title text.\n\n"
-                    f"{intro_text}"
-                )
-
-                new_title = ""
-                try:
-                    if self._settings.gemini_api_key:
-                        client = genai.Client(api_key=self._settings.gemini_api_key)
-                        response = client.models.generate_content(
-                            model="gemini-2.5-pro", contents=prompt
-                        )
-                        new_title = response.text.strip()
-                    else:
-                        raise ValueError("No Gemini API key configured")
-                except Exception as e:
-                    logger.warning(
-                        "Gemini auto-rename failed/unavailable (%s), falling back to Ollama", e
-                    )
-                    from audiobench.chat.providers.ollama_provider import OllamaClient
-
-                    ollama = OllamaClient(
-                        base_url=self._settings.ollama_base_url,
-                        model=self._settings.clean_model,
-                    )
-                    if not ollama.is_available():
-                        logger.warning("Ollama not available for fallback rename")
-                        return
-
-                    response = ollama.chat([{"role": "user", "content": prompt}], think=False)
-                    new_title = response.get("content", "").strip()
-
-                if not new_title:
-                    # BOTH FAILED! Tag the file for later retry.
-                    with get_session() as session:
-                        tx_record = session.query(TranscriptionRecord).get(tx_id)
-                        if tx_record:
-                            audio_record = session.query(AudioFileRecord).get(
-                                tx_record.audio_file_id
-                            )
-                            if audio_record:
-                                import json
-
-                                try:
-                                    tags_list = (
-                                        json.loads(audio_record.tags) if audio_record.tags else []
-                                    )
-                                except Exception:
-                                    tags_list = []
-                                if "pending_auto_rename" not in tags_list:
-                                    tags_list.append("pending_auto_rename")
-                                    audio_record.tags = json.dumps(tags_list)
-                        session.commit()
-                    logger.info(
-                        "Auto-rename failed completely. Tagged #%d with pending_auto_rename", tx_id
-                    )
-                    return
-
-                # Clean up title for filesystem
-                new_title = re.sub(r"[^\w\s-]", " ", new_title).strip()
-                new_title = re.sub(r"\s+", " ", new_title)
-
-                if not new_title or len(new_title.split()) > 15:
-                    logger.warning("Auto-rename generated invalid title: %s", new_title)
-                    return
-
-                old_path = Path(file_path)
-                if not old_path.exists():
-                    logger.warning("Original file missing, skipping rename: %s", old_path)
-                    return
-
-                new_filename = f"{new_title}{old_path.suffix}"
-                new_path = old_path.parent / new_filename
-
-                # Handle collisions
-                counter = 1
-                while new_path.exists() and new_path != old_path:
-                    new_path = old_path.parent / f"{new_title}_{counter}{old_path.suffix}"
-                    new_filename = new_path.name
-                    counter += 1
-
-                if new_path != old_path:
-                    old_path.rename(new_path)
-
-                    # Update DB
-                    with get_session() as session:
-                        tx_record = session.query(TranscriptionRecord).get(tx_id)
-                        if tx_record:
-                            audio_record = session.query(AudioFileRecord).get(
-                                tx_record.audio_file_id
-                            )
-                            if audio_record:
-                                audio_record.file_name = new_filename
-                                audio_record.file_path = str(new_path)
-                        session.commit()
-
-                    logger.info("Auto-renamed file to %s", new_filename)
-            except Exception as e:
-                logger.warning("Background auto-rename failed for #%d: %s", tx_id, e)
-
-        thread = threading.Thread(target=_rename, name=f"rename-{tx_id}", daemon=True)
-        thread.start()
-        logger.info("Spawned background auto-rename thread for #%d", tx_id)
 
     def _reconstruct_transcript(self, data: dict, metadata: AudioMetadata) -> Transcript:
         """Reconstruct a Transcript from cached DB data."""

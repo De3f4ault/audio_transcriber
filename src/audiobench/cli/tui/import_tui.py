@@ -9,6 +9,8 @@ class ImportFileManager:
         self.navigator = DirectoryNavigator(start_path=Path(start_path).expanduser())
         self.confirmed_files = []
         self.cancelled = False
+        self.next_mode = None
+        self.ui_offset = 0
         
         if start_state:
             self.state_import(start_state)
@@ -65,19 +67,31 @@ class ImportFileManager:
             info_text = f" Selected Files: {len(self.navigator.selected_files)}"
             if self.navigator.show_hidden:
                 info_text += " | [HIDDEN VISIBLE]"
+                
+            items = self.navigator.list_items()
+            if items:
+                info_text += f" | {self.navigator.selected + 1}/{len(items)}"
+
             stdscr.addstr(1, 0, info_text.ljust(width), curses.color_pair(5))
 
             # Separator
             if width > 1:
                 stdscr.addstr(2, 0, "─" * (width - 1), curses.color_pair(6))
 
-            items = self.navigator.list_items()
-            list_start_y = 3
+            max_visible = height - 5
+            
+            if self.navigator.selected < self.ui_offset:
+                self.ui_offset = self.navigator.selected
+            elif self.navigator.selected >= self.ui_offset + max_visible:
+                self.ui_offset = self.navigator.selected - max_visible + 1
 
-            for idx, item in enumerate(items):
-                y = idx + list_start_y
-                if y >= height - 3:
-                    break
+            list_start_y = 3
+            
+            visible_items = items[self.ui_offset:self.ui_offset + max_visible]
+
+            for idx_offset, item in enumerate(visible_items):
+                idx = self.ui_offset + idx_offset
+                y = idx_offset + list_start_y
 
                 max_item_len = width - 10
                 display_item = item[:max_item_len] + ".." if len(item) > max_item_len else item
@@ -116,26 +130,42 @@ class ImportFileManager:
                     stdscr.addstr(y, 2, checkbox, cb_attr)
                     stdscr.addstr(y, 5, f" {icon} ", row_attr)
                     stdscr.addstr(y, 9, display_item, row_attr)
-                except:
+                except curses.error:
                     pass
 
             # Footer
-            footer_1 = "↑↓/k j: Move | →/l/ENTER: Enter Dir | ←/h: Go Up | SPACE: Select File"
-            footer_2 = "t: Toggle Hidden | s: Confirm & Import | r: Reverse Import (Transcript) | q: Cancel"
+            footer_1 = " ↑↓/k j: Move | →/l/ENTER: Enter Dir | ←/h: Go Up | SPACE: Select File | s: Confirm "
+            footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
 
             if height > 2:
-                stdscr.addstr(height - 2, 0, footer_1[:width], curses.color_pair(1))
-                stdscr.addstr(height - 1, 0, footer_2[:width], curses.color_pair(1))
+                try:
+                    stdscr.addstr(height - 2, 0, footer_1.ljust(width - 1)[:width-1], curses.color_pair(1))
+                    stdscr.addstr(height - 1, 0, footer_2.ljust(width - 1)[:width-1], curses.color_pair(1))
+                except curses.error:
+                    pass
 
             key = stdscr.getch()
             if key == ord("q"):
                 self.cancelled = True
                 break
+            elif key == ord("1"):
+                self.next_mode = "MODE_AUDIO"
+                self.cancelled = True
+                break
+            elif key == ord("2"):
+                self.next_mode = "MODE_AUTO"
+                self.cancelled = True
+                break
+            elif key == ord("3"):
+                self.next_mode = "MODE_SINGLE_TX"
+                self.cancelled = True
+                break
+            elif key == ord("4"):
+                self.next_mode = "MODE_BATCH_TX"
+                self.cancelled = True
+                break
             elif key == ord("s"):
                 self.confirmed_files = list(self.navigator.selected_files)
-                break
-            elif key in (ord("r"), ord("R")):
-                self.launch_transcript_mode = True
                 break
             elif key in (curses.KEY_RIGHT, 10, 13, ord("l")):
                 self.navigator.enter()
@@ -151,10 +181,9 @@ class ImportFileManager:
                 self.navigator.toggle_hidden_visibility()
 
     def run(self):
-        self.launch_transcript_mode = False
         curses.wrapper(self.draw)
-        if self.launch_transcript_mode:
-            return "LAUNCH_TRANSCRIPT_IMPORT"
+        if self.next_mode:
+            return self.next_mode
         return self.confirmed_files if not self.cancelled else None
 
 

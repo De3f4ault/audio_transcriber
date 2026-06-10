@@ -201,7 +201,7 @@ def _handle_slash_command(
                 console.print(
                     f"  [{DIM}]Comparison mode is OFF[/]\n"
                     f"  [{DIM}]Usage: /compare <model> to enable[/]\n"
-                    f"  [{DIM}]Example: /compare qwen3-next:80b-cloud[/]"
+                    f"  [{DIM}]Example: /compare qwen4-next:110b-cloud[/]"
                 )
             return False
         if arg.strip().lower() == "off":

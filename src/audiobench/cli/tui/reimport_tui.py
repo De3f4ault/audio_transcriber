@@ -20,13 +20,20 @@ from audiobench.storage.models import AudioFileRecord, TranscriptionRecord
 
 
 class ReimportTUI:
-    def __init__(self, start_path="~/Downloads", audio_start_path="~/Music/Audiobooks/Audios", batch=False):
+    def __init__(self, start_path="~/Downloads", audio_start_path="~/Music/Audiobooks/Audios", batch=False, auto_detect=False, shared_state=None):
         self.start_path = Path(start_path).expanduser()
         self.audio_start_path = Path(audio_start_path).expanduser()
         self.cancelled = False
         
         self.is_batch = batch
-        self.screen = 1 if not batch else 11
+        self.is_auto_detect = auto_detect
+        
+        if auto_detect:
+            self.screen = 21
+        elif batch:
+            self.screen = 11
+        else:
+            self.screen = 1
         
         # Single mode state
         self.transcript_path = None
@@ -50,16 +57,32 @@ class ReimportTUI:
         self.tx_nav = DirectoryNavigator(start_path=str(self.start_path), allowed_extensions={"json", "srt", "txt"})
         self.audio_nav = DirectoryNavigator(start_path=str(self.audio_start_path))
         self.audio_nav.allowed_extensions = None # all supported formats
+        self.root_nav = DirectoryNavigator(start_path=str(self.start_path))
+        self.ui_selected_idx = 0
+        self.ui_offset = 0
+        self.next_mode = None
+
+        if shared_state and "current_path" in shared_state:
+            try:
+                p = Path(shared_state["current_path"])
+                if p.exists():
+                    self.start_path = p
+                    self.tx_nav.current_path = p
+                    self.root_nav.current_path = p
+            except Exception:
+                pass
 
     def state_export(self) -> dict:
-        return {}
+        return {
+            "current_path": str(self.tx_nav.current_path if not self.is_auto_detect else self.root_nav.current_path)
+        }
         
     def state_import(self, state: dict) -> None:
         pass
         
     def run(self):
         curses.wrapper(self._run_loop)
-        return not self.cancelled
+        return self.next_mode if self.next_mode else (not self.cancelled)
 
     def _run_loop(self, stdscr):
         try:
@@ -110,6 +133,13 @@ class ReimportTUI:
                 break
             elif self.screen == 15:
                 self._draw_screen_15(stdscr)
+            elif self.screen == 21:
+                self._draw_screen_21(stdscr)
+            elif self.screen == 22:
+                self._draw_screen_22(stdscr)
+            elif self.screen == 23:
+                self._draw_screen_4b(stdscr)
+                break
                 
             key = stdscr.getch()
             self._handle_input(key)
@@ -123,6 +153,9 @@ class ReimportTUI:
             if key in (ord('b'), ord('B')):
                 self.is_batch = True
                 self.screen = 11
+            if key in (ord('a'), ord('A')):
+                self.is_auto_detect = True
+                self.screen = 21
         elif self.screen == 2:
             self._nav_input(key, self.audio_nav, on_enter=self._on_audio_selected)
         elif self.screen == 3:
@@ -180,10 +213,53 @@ class ReimportTUI:
                 self.screen = 13
             elif key in (ord('q'), ord('Q')):
                 self.cancelled = True
+        elif self.screen == 21:
+            self._nav_input(key, self.root_nav, on_enter=lambda p: None)
+            if key in (10, 13):
+                self.audio_dir = self.root_nav.current_path
+                self.transcript_dir = self.audio_dir
+                self._match_batch()
+                existing = self._get_existing_basenames()
+                # Check all by default EXCEPT existing ones
+                for p in self.batch_pairs:
+                    is_existing = p["tx"].stem in existing
+                    p["selected"] = not is_existing
+                    p["is_existing"] = is_existing
+                
+                self.screen = 22
+                self.ui_offset = 0
+                self.ui_selected_idx = 0
+        elif self.screen == 22:
+            if key in (curses.KEY_UP, ord('k')):
+                self.ui_selected_idx = max(0, self.ui_selected_idx - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                self.ui_selected_idx = min(len(self.batch_pairs) - 1, self.ui_selected_idx + 1)
+            elif key == ord(' '):
+                if self.batch_pairs:
+                    self.batch_pairs[self.ui_selected_idx]["selected"] = not self.batch_pairs[self.ui_selected_idx].get("selected", False)
+            elif key in (ord('s'), ord('S')):
+                self.batch_pairs = [p for p in self.batch_pairs if p.get("selected", False)]
+                self.screen = 23
+            elif key in (ord('q'), ord('Q')):
+                self.cancelled = True
                 
         if key in (ord('q'), ord('Q')) and self.screen < 5:
             self.cancelled = True
-        elif key in (ord('q'), ord('Q')) and self.screen in (11, 12, 15):
+        elif key in (ord('q'), ord('Q')) and self.screen in (11, 12, 15, 21, 22):
+            self.cancelled = True
+
+        # Mode switching shortcuts
+        if key in (ord('1'),):
+            self.next_mode = "MODE_AUDIO"
+            self.cancelled = True
+        elif key in (ord('2'),):
+            self.next_mode = "MODE_AUTO"
+            self.cancelled = True
+        elif key in (ord('3'),):
+            self.next_mode = "MODE_SINGLE_TX"
+            self.cancelled = True
+        elif key in (ord('4'),):
+            self.next_mode = "MODE_BATCH_TX"
             self.cancelled = True
 
     def _get_existing_basenames(self):
@@ -227,7 +303,9 @@ class ReimportTUI:
 
         # If the user selected specific files with spacebar, use those. 
         # Otherwise, default to all JSON files in the confirmed directory.
-        if self.tx_nav.selected_files:
+        if getattr(self, "is_auto_detect", False):
+            tx_files = list(self.transcript_dir.rglob("*.json"))
+        elif self.tx_nav.selected_files:
             tx_files = list(self.tx_nav.selected_files)
         else:
             tx_files = list(self.transcript_dir.glob("*.json"))
@@ -362,16 +440,25 @@ class ReimportTUI:
         
         # Draw navigator left
         items = self.tx_nav.list_items()
-        for i, item in enumerate(items[:h-4]):
+        max_visible = h - 4
+        if self.tx_nav.selected < self.ui_offset:
+            self.ui_offset = self.tx_nav.selected
+        elif self.tx_nav.selected >= self.ui_offset + max_visible:
+            self.ui_offset = self.tx_nav.selected - max_visible + 1
+            
+        visible_items = items[self.ui_offset:self.ui_offset + max_visible]
+        for i, item in enumerate(visible_items):
             y = i + 2
-            cur = self.tx_nav.get_current_item_path()
-            is_sel = (i == self.tx_nav.selected)
+            idx = self.ui_offset + i
+            is_sel = (idx == self.tx_nav.selected)
             attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
             icon = "📁" if (self.tx_nav.current_path / item).is_dir() else "📄"
             stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w//2], attr)
             
         try:
-            stdscr.addstr(h-1, 0, " ENTER: Select | b: Batch Mode | q: Quit ".ljust(w-1), curses.color_pair(1))
+            footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
+            stdscr.addstr(h-2, 0, " ENTER: Select | b: Batch Mode | a: Auto-Detect ".ljust(w-1), curses.color_pair(1))
+            stdscr.addstr(h-1, 0, footer_2.ljust(w-1), curses.color_pair(1))
         except curses.error:
             pass
 
@@ -380,15 +467,25 @@ class ReimportTUI:
         stdscr.addstr(0, 0, " 🎵 Reimport: Link Local Audio File ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
         
         items = self.audio_nav.list_items()
-        for i, item in enumerate(items[:h-4]):
+        max_visible = h - 4
+        if self.audio_nav.selected < self.ui_offset:
+            self.ui_offset = self.audio_nav.selected
+        elif self.audio_nav.selected >= self.ui_offset + max_visible:
+            self.ui_offset = self.audio_nav.selected - max_visible + 1
+            
+        visible_items = items[self.ui_offset:self.ui_offset + max_visible]
+        for i, item in enumerate(visible_items):
             y = i + 2
-            is_sel = (i == self.audio_nav.selected)
+            idx = self.ui_offset + i
+            is_sel = (idx == self.audio_nav.selected)
             attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
             icon = "📁" if (self.audio_nav.current_path / item).is_dir() else "🎵"
             stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w//2], attr)
             
         try:
-            stdscr.addstr(h-1, 0, " ENTER: Select | q: Quit ".ljust(w-1), curses.color_pair(1))
+            footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
+            stdscr.addstr(h-2, 0, " ENTER: Select ".ljust(w-1), curses.color_pair(1))
+            stdscr.addstr(h-1, 0, footer_2.ljust(w-1), curses.color_pair(1))
         except curses.error:
             pass
 
@@ -475,9 +572,18 @@ class ReimportTUI:
         
         existing = self._get_existing_basenames()
         items = self.tx_nav.list_items()
-        for i, item in enumerate(items[:h-4]):
+        
+        max_visible = h - 5
+        if self.tx_nav.selected < self.ui_offset:
+            self.ui_offset = self.tx_nav.selected
+        elif self.tx_nav.selected >= self.ui_offset + max_visible:
+            self.ui_offset = self.tx_nav.selected - max_visible + 1
+            
+        visible_items = items[self.ui_offset:self.ui_offset + max_visible]
+        for i, item in enumerate(visible_items):
             y = i + 2
-            is_sel = (i == self.tx_nav.selected)
+            idx = self.ui_offset + i
+            is_sel = (idx == self.tx_nav.selected)
             item_path = self.tx_nav.current_path / item
             is_checked = item_path in self.tx_nav.selected_files
             attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
@@ -495,9 +601,11 @@ class ReimportTUI:
                 
             stdscr.addstr(y, 1, f"{prefix} {icon} {item}{suffix}"[:w-2], attr)
             
-        stdscr.addstr(h-2, 0, f" Current Folder: {self.tx_nav.current_path} ({len(self.tx_nav.selected_files)} selected)".ljust(w), curses.color_pair(5))
+        stdscr.addstr(h-3, 0, f" Current Folder: {self.tx_nav.current_path} ({len(self.tx_nav.selected_files)} selected)".ljust(w), curses.color_pair(5))
         try:
-            stdscr.addstr(h-1, 0, " SPACE: Select File | ENTER: Confirm Folder/Files | q: Quit ".ljust(w-1), curses.color_pair(1))
+            footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
+            stdscr.addstr(h-2, 0, " SPACE: Select File | ENTER: Confirm Folder/Files ".ljust(w-1), curses.color_pair(1))
+            stdscr.addstr(h-1, 0, footer_2.ljust(w-1), curses.color_pair(1))
         except curses.error:
             pass
 
@@ -510,16 +618,26 @@ class ReimportTUI:
         stdscr.addstr(0, 0, " 📂 Batch Reimport: Select Audio Folder ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
         
         items = self.audio_nav.list_items()
-        for i, item in enumerate(items[:h-4]):
+        max_visible = h - 5
+        if self.audio_nav.selected < self.ui_offset:
+            self.ui_offset = self.audio_nav.selected
+        elif self.audio_nav.selected >= self.ui_offset + max_visible:
+            self.ui_offset = self.audio_nav.selected - max_visible + 1
+            
+        visible_items = items[self.ui_offset:self.ui_offset + max_visible]
+        for i, item in enumerate(visible_items):
             y = i + 2
-            is_sel = (i == self.audio_nav.selected)
+            idx = self.ui_offset + i
+            is_sel = (idx == self.audio_nav.selected)
             attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
             icon = "📁" if (self.audio_nav.current_path / item).is_dir() else "🎵"
             stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w-2], attr)
             
-        stdscr.addstr(h-2, 0, f" Current Folder: {self.audio_nav.current_path}".ljust(w), curses.color_pair(5))
+        stdscr.addstr(h-3, 0, f" Current Folder: {self.audio_nav.current_path}".ljust(w), curses.color_pair(5))
         try:
-            stdscr.addstr(h-1, 0, " ENTER: Confirm Folder | q: Quit ".ljust(w-1), curses.color_pair(1))
+            footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
+            stdscr.addstr(h-2, 0, " ENTER: Confirm Folder ".ljust(w-1), curses.color_pair(1))
+            stdscr.addstr(h-1, 0, footer_2.ljust(w-1), curses.color_pair(1))
         except curses.error:
             pass
 
@@ -600,3 +718,74 @@ class ReimportTUI:
         stdscr.refresh()
         stdscr.timeout(-1)
         stdscr.getch()
+
+    def _draw_screen_21(self, stdscr):
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, " 🔍 Auto-Detect: Select Root Folder ".ljust(w), curses.color_pair(1) | curses.A_BOLD)
+        
+        items = self.root_nav.list_items()
+        max_visible = h - 5
+        if self.root_nav.selected < self.ui_offset:
+            self.ui_offset = self.root_nav.selected
+        elif self.root_nav.selected >= self.ui_offset + max_visible:
+            self.ui_offset = self.root_nav.selected - max_visible + 1
+            
+        visible_items = items[self.ui_offset:self.ui_offset + max_visible]
+        for i, item in enumerate(visible_items):
+            y = i + 2
+            idx = self.ui_offset + i
+            is_sel = (idx == self.root_nav.selected)
+            attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
+            icon = "📁" if (self.root_nav.current_path / item).is_dir() else "📄"
+            stdscr.addstr(y, 1, f"{'>' if is_sel else ' '} {icon} {item}"[:w-2], attr)
+            
+        stdscr.addstr(h-3, 0, f" Current Folder: {self.root_nav.current_path}".ljust(w), curses.color_pair(5))
+        try:
+            footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
+            stdscr.addstr(h-2, 0, " ENTER: Confirm Root Folder ".ljust(w-1), curses.color_pair(1))
+            stdscr.addstr(h-1, 0, footer_2.ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass
+
+    def _draw_screen_22(self, stdscr):
+        h, w = stdscr.getmaxyx()
+        msg = f" 🚀 Auto-Detect Ready: {len(self.batch_pairs)} pairs matched "
+        stdscr.addstr(0, 0, msg.ljust(w), curses.color_pair(1) | curses.A_BOLD)
+        
+        if not self.batch_pairs:
+            stdscr.addstr(2, 2, "No matching pairs found.", curses.color_pair(4))
+        else:
+            # Handle scrolling
+            max_visible = h - 4
+            if self.ui_selected_idx < self.ui_offset:
+                self.ui_offset = self.ui_selected_idx
+            elif self.ui_selected_idx >= self.ui_offset + max_visible:
+                self.ui_offset = self.ui_selected_idx - max_visible + 1
+                
+            for i in range(max_visible):
+                idx = self.ui_offset + i
+                if idx >= len(self.batch_pairs):
+                    break
+                
+                pair = self.batch_pairs[idx]
+                y = i + 2
+                is_sel = (idx == self.ui_selected_idx)
+                is_checked = pair.get("selected", False)
+                attr = curses.color_pair(3) | curses.A_BOLD if is_sel else curses.color_pair(2)
+                
+                tx = pair["tx"].name
+                au = pair["audio"].name if pair["audio"] else "MISSING AUDIO"
+                if not pair["audio"]:
+                    attr = curses.color_pair(7)
+                
+                suffix = " [Already Imported]" if pair.get("is_existing") else ""
+                
+                prefix = f"{'>' if is_sel else ' '} {'[x]' if is_checked else '[ ]'}"
+                stdscr.addstr(y, 1, f"{prefix} {tx} <--> {au}{suffix}"[:w-2], attr)
+            
+        try:
+            footer_2 = " Modes: [1]Audio [2]Auto-Detect [3]Single [4]Batch  |  q: Quit "
+            stdscr.addstr(h-2, 0, " SPACE: Toggle | S: Start Import ".ljust(w-1), curses.color_pair(1))
+            stdscr.addstr(h-1, 0, footer_2.ljust(w-1), curses.color_pair(1))
+        except curses.error:
+            pass

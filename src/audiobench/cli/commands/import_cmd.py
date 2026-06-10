@@ -9,7 +9,7 @@ from audiobench.cli.display.theme import ACCENT, BOLD, DIM, error_panel
 console = Console()
 
 
-def run_import_flow(session=None, restore_state=None) -> list[int]:
+def run_import_flow(session=None, restore_state=None, initial_mode="MODE_AUDIO") -> list[int]:
     """Run the import flow and return a list of newly imported or updated audio_file IDs."""
     try:
         import questionary
@@ -19,25 +19,66 @@ def run_import_flow(session=None, restore_state=None) -> list[int]:
         )
         return []
 
-    # 1 & 2. Full-Screen Directory Navigation & File Selection
+    from audiobench.cli.wizard import prompt_menu
     from audiobench.cli.tui.import_tui import launch_file_manager
+    from audiobench.cli.tui.reimport_tui import ReimportTUI
 
-    selected_files, state = launch_file_manager(start_state=restore_state)
+    current_mode = initial_mode
+    shared_state = restore_state or {}
+    
+    # Check if we should show the main menu
+    if current_mode == "main_menu":
+        options = [
+            ("Audio", "Import raw audio files", "MODE_AUDIO"),
+            ("Auto-Detect", "Intelligently scan and pair transcripts/audio", "MODE_AUTO"),
+            ("Manual Pair", "Manually link a single transcript to an audio file", "MODE_SINGLE_TX"),
+            ("Batch Folders", "Map a folder of transcripts to a folder of audio", "MODE_BATCH_TX"),
+            ("Exit", "Cancel and exit", "exit")
+        ]
+        current_mode = prompt_menu("Select Import Mode", options, default_idx=0)
+        if not current_mode or current_mode == "exit":
+            return []
+
+    # Routing Loop
+    while current_mode:
+        if current_mode == "MODE_AUDIO":
+            selected_files, new_state = launch_file_manager(start_state=shared_state)
+            shared_state.update(new_state)
+            
+            if isinstance(selected_files, str) and selected_files.startswith("MODE_"):
+                current_mode = selected_files
+                continue
+            
+            if not selected_files:
+                console.print(f"\n  [{DIM}]Import cancelled or no files selected.[/]")
+                return []
+            
+            # Break out of loop to process audio files below
+            break
+            
+        elif current_mode in ("MODE_AUTO", "MODE_SINGLE_TX", "MODE_BATCH_TX"):
+            is_auto = (current_mode == "MODE_AUTO")
+            is_batch = (current_mode == "MODE_BATCH_TX")
+            
+            tui = ReimportTUI(batch=is_batch, auto_detect=is_auto, shared_state=shared_state)
+            result = tui.run()
+            shared_state.update(tui.state_export())
+            
+            if isinstance(result, str) and result.startswith("MODE_"):
+                current_mode = result
+                continue
+                
+            if not result:
+                console.print(f"\n  [{DIM}]Transcript import cancelled.[/]")
+            # Transcript imports don't return audio IDs for staging
+            return []
+            
+        else:
+            break
 
     if session and getattr(session, "navigation_stack", None) and session.navigation_stack[-1].context == "import":
-        session.navigation_stack[-1].state = state
+        session.navigation_stack[-1].state = shared_state
         session._persist_stack()
-
-    if selected_files == "LAUNCH_TRANSCRIPT_IMPORT":
-        from audiobench.cli.tui.reimport_tui import ReimportTUI
-        tui = ReimportTUI(batch=False)
-        if not tui.run():
-            console.print(f"\n  [{DIM}]Reimport cancelled.[/]")
-        return []
-
-    if not selected_files:
-        console.print(f"\n  [{DIM}]Import cancelled or no files selected.[/]")
-        return []
 
     # Sort files alphabetically for the allocation wizard
     selected_files.sort(key=lambda x: x.name.lower())
@@ -150,7 +191,8 @@ def run_import_flow(session=None, restore_state=None) -> list[int]:
 @click.command(name="import")
 @click.option("-T", "--transcript", is_flag=True, help="Reverse import: select transcript file first")
 @click.option("--batch", is_flag=True, help="Batch mode for --transcript (folder-to-folder mapping)")
-def import_cmd(transcript: bool, batch: bool):
+@click.option("--auto-detect", is_flag=True, help="Auto-detect mode: recursively scan and pair audio and transcript files")
+def import_cmd(transcript: bool, batch: bool, auto_detect: bool):
     """Import audio files into the internal library.
 
     \b
@@ -158,16 +200,17 @@ def import_cmd(transcript: bool, batch: bool):
       audiobench import
       audiobench import --transcript
       audiobench import --transcript --batch
+      audiobench import --auto-detect
     """
-    if transcript:
-        from audiobench.cli.tui.reimport_tui import ReimportTUI
-        tui = ReimportTUI(batch=batch)
-        if not tui.run():
-            console.print(f"\n  [{DIM}]Reimport cancelled.[/]")
-        return
-        
-    if batch and not transcript:
-        console.print(error_panel("Error", "--batch is only supported with --transcript"))
-        return
+    initial_mode = "main_menu"
+    
+    if auto_detect:
+        initial_mode = "MODE_AUTO"
+    elif transcript and batch:
+        initial_mode = "MODE_BATCH_TX"
+    elif transcript:
+        initial_mode = "MODE_SINGLE_TX"
+    elif not any([transcript, batch, auto_detect]):
+        initial_mode = "main_menu"
 
-    run_import_flow()
+    run_import_flow(initial_mode=initial_mode)
