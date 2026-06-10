@@ -100,6 +100,9 @@ def ensure_daemon_running() -> None:
     Safe to call repeatedly — no-ops if the daemon is already alive.
     """
     settings = get_settings()
+    if settings.disable_memory:
+        return
+
     socket_path = Path(settings.daemon_socket_path)
 
     if _is_socket_alive(socket_path):
@@ -122,6 +125,9 @@ def get_daemon_client() -> RetrievalClient:
     If it never comes up, falls back to the in-process client silently.
     """
     settings = get_settings()
+    if settings.disable_memory:
+        raise RuntimeError("Semantic memory is disabled (AUDIOBENCH_DISABLE_MEMORY is set). Cannot get daemon client.")
+
     socket_path = Path(settings.daemon_socket_path)
 
     # 1. Quick check — already alive?

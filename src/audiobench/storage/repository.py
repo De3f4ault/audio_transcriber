@@ -142,12 +142,14 @@ class TranscriptionRepository:
                     # Delete old transcriptions and their semantic vectors
                     from audiobench.daemon.factory import get_daemon_client
                     from audiobench.storage.models import ExpressionRecord
+                    from audiobench.core.settings import get_settings
                     
                     daemon_client = None
-                    try:
-                        daemon_client = get_daemon_client()
-                    except Exception as e:
-                        logger.warning("Could not connect to daemon to delete expressions: %s", e)
+                    if not get_settings().disable_memory:
+                        try:
+                            daemon_client = get_daemon_client()
+                        except Exception as e:
+                            logger.warning("Could not connect to daemon to delete expressions: %s", e)
                         
                     from audiobench.memory.enums import SourceType
                     for old_tx in existing_txs:
@@ -277,6 +279,11 @@ class TranscriptionRepository:
         self, transcription_id: int, transcript: Transcript, chapter_id: int | None, on_phase: object | None = None
     ) -> None:
         """Process transcription text through daemon and register semantic expressions."""
+        from audiobench.core.settings import get_settings
+        if get_settings().disable_memory:
+            logger.info("Skipping semantic memory registration (disable_memory=True)")
+            return
+
         from audiobench.daemon.factory import get_daemon_client
         from audiobench.memory.chunking import Chunk, _clean_text, parent_child_grouper
         from audiobench.memory.enums import RelationType, SourceType

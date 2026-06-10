@@ -174,6 +174,10 @@ class AudioBenchSettings(BaseSettings):
     )
 
     # --- Daemon & Memory Layer ---
+    disable_memory: bool = Field(
+        default=False,
+        description="Disable daemon auto-start and semantic memory embeddings entirely",
+    )
     daemon_socket_path: Path = Field(
         default=Path("/tmp/audiobench-daemon.sock"),
         description="Path to daemon Unix socket",
