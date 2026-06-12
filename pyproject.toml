@@ -41,14 +41,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-memory = [
-    "lancedb>=0.6.0",
-    "llama-index-core>=0.10.0",
-    "llama-index-vector-stores-lancedb>=0.1.0",
-    "llama-index-embeddings-huggingface>=0.2.0",
-    "sentence-transformers>=3.0.0",
-    "rerankers>=0.0.4",
-]
+
 streaming = ["RealtimeSTT>=0.3.0"]
 diarization = ["pyannote.audio>=3.3.0", "torch>=2.0.0", "torchaudio>=2.0.0"]
 tts = ["piper-tts>=1.2.0", "sounddevice>=0.5.0"]
@@ -64,7 +57,7 @@ dev = [
     "mypy>=1.10.0",
 ]
 docs = ["zensical>=0.0.23"]
-all = ["audiobench[memory,streaming,diarization,tts,ai,vosk,google,api,dev,docs]"]
+all = ["audiobench[streaming,diarization,tts,ai,vosk,google,api,dev,docs]"]
 
 [project.scripts]
 audiobench = "audiobench.cli.app:cli"

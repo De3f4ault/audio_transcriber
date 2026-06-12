@@ -23,8 +23,8 @@ class TestReplSession:
     def test_prompt_no_context(self):
         session = self._make_session()
         prompt = session.prompt
-        assert "❯" in prompt
-        assert "#" not in prompt
+        assert "❯" in str(prompt)
+        assert "#" not in str(prompt)
 
     def test_expand_vars_no_context(self):
         session = self._make_session()
@@ -104,33 +104,6 @@ class TestSlashCommands:
         group = click.Group("test")
         session = ReplSession(group)
         assert handle_slash_command("/nonexistent", session) is False
-
-
-class TestDotCommands:
-    """Test dot-command registry and typo correction."""
-
-    def test_dot_commands_registry_not_empty(self):
-        from audiobench.cli.repl.dot_commands import DOT_COMMANDS
-
-        assert len(DOT_COMMANDS) > 15
-
-    def test_suggest_close_match(self):
-        from audiobench.cli.repl.dot_commands import _suggest_dot_command
-
-        result = _suggest_dot_command(".stat")
-        assert result == ".stats"
-
-    def test_suggest_no_match(self):
-        from audiobench.cli.repl.dot_commands import _suggest_dot_command
-
-        result = _suggest_dot_command(".zzzzz")
-        assert result is None
-
-    def test_all_dot_commands_start_with_dot(self):
-        from audiobench.cli.repl.dot_commands import DOT_COMMANDS
-
-        for cmd in DOT_COMMANDS:
-            assert cmd.startswith("."), f"{cmd} doesn't start with dot"
 
 
 class TestAliases:

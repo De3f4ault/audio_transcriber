@@ -139,31 +139,8 @@ class TranscriptionRepository:
                     if not overwrite:
                         raise ValueError("Transcription already exists for this audio file.")
                     
-                    # Delete old transcriptions and their semantic vectors
-                    from audiobench.daemon.factory import get_daemon_client
-                    from audiobench.storage.models import ExpressionRecord
-                    from audiobench.core.settings import get_settings
-                    
-                    daemon_client = None
-                    if not get_settings().disable_memory:
-                        try:
-                            daemon_client = get_daemon_client()
-                        except Exception as e:
-                            logger.warning("Could not connect to daemon to delete expressions: %s", e)
-                        
-                    from audiobench.memory.enums import SourceType
+                    # Delete old transcriptions
                     for old_tx in existing_txs:
-                        if daemon_client:
-                            old_exprs = session.query(ExpressionRecord).filter_by(
-                                source_type=SourceType.AUDIO_TRANSCRIPT.value, 
-                                source_id=old_tx.id
-                            ).all()
-                            for expr in old_exprs:
-                                try:
-                                    daemon_client.delete(expr.id)
-                                except Exception as e:
-                                    logger.warning("Failed to delete expression %d from daemon: %s", expr.id, e)
-                        
                         session.delete(old_tx)
                     session.commit()
 
@@ -265,114 +242,7 @@ class TranscriptionRepository:
                 "Saved transcription #%d (%d segments)", tx_record.id, len(transcript.segments)
             )
 
-            # --- PHASE 5: Expression Registration & Chunking ---
-            try:
-                self._register_expressions(tx_record.id, transcript, chapter_id, on_phase)
-            except Exception as e:
-                logger.error(
-                    "Failed to register expressions for transcription %d: %s", tx_record.id, e
-                )
-
             return tx_record.id
-
-    def _register_expressions(
-        self, transcription_id: int, transcript: Transcript, chapter_id: int | None, on_phase: object | None = None
-    ) -> None:
-        """Process transcription text through daemon and register semantic expressions."""
-        from audiobench.core.settings import get_settings
-        if get_settings().disable_memory:
-            logger.info("Skipping semantic memory registration (disable_memory=True)")
-            return
-
-        from audiobench.daemon.factory import get_daemon_client
-        from audiobench.memory.chunking import Chunk, _clean_text, parent_child_grouper
-        from audiobench.memory.enums import RelationType, SourceType
-        from audiobench.storage.expression_repository import ExpressionRepository
-
-        try:
-            daemon = get_daemon_client()
-        except Exception as e:
-            logger.warning("Daemon not available, skipping semantic memory registration: %s", e)
-            return
-
-        expr_repo = ExpressionRepository()
-
-        # Step 1. Get raw chunks from daemon
-        diarized = bool(transcript.speaker_map)
-        segments_for_daemon = []
-        if diarized:
-            for seg in transcript.segments:
-                segments_for_daemon.append({"speaker": seg.speaker, "text": seg.text})
-
-        if on_phase:
-            on_phase("embedding", "Chunking text...", 0.0)
-
-        chunk_results = daemon.chunk(
-            transcript.text, transcription_id, diarized, segments_for_daemon
-        )
-
-        # Convert chunk dicts to Chunk objects for grouper
-        chunks = [
-            Chunk(content=c["content"], uuid=c["uuid"], tier=c["tier"], speaker=c.get("speaker"))
-            for c in chunk_results
-        ]
-
-        # Step 2. Group into parents
-        parent_groups = parent_child_grouper(chunks)
-
-        # Only Tier 3 sentence chunks are embedded in LanceDB (true parent-child retrieval).
-        # Tier 1 and Tier 2 live in SQLite only for graph-expansion during search.
-        total_embeds = sum(len(pg.children) for pg in parent_groups)
-        current_embed = 0
-
-        def _update_progress():
-            nonlocal current_embed
-            current_embed += 1
-            if on_phase and total_embeds > 0:
-                on_phase("embedding", "Generating embeddings...", float(current_embed) / total_embeds)
-
-        if on_phase:
-            on_phase("embedding", "Generating embeddings...", 0.0)
-
-        # Step 3. Register Tier 1 (full cleaned text) in SQLite only — NOT embedded in LanceDB.
-        # Tier 1 serves as the root anchor for the SQLite expression graph.
-        cleaned_text = _clean_text(transcript.text)
-        t1_expr = expr_repo.register(
-            content=cleaned_text,
-            source_type=SourceType.AUDIO_TRANSCRIPT.value,
-            source_id=transcription_id,
-        )
-
-        # Step 4. Register Tier 2 (SQLite only) and Tier 3 (SQLite + LanceDB)
-        for pg in parent_groups:
-            # Tier 2 parent — registered in SQLite only, NOT embedded in LanceDB.
-            # During search, Tier 3 hits walk up to this node for rich context.
-            t2_expr = expr_repo.register(
-                content=pg.parent_text,
-                source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                source_id=transcription_id,
-            )
-            expr_repo.link(
-                from_id=t2_expr.id, to_id=t1_expr.id, relation_type=RelationType.SOURCE.value
-            )
-
-            # Tier 3 children
-            for child in pg.children:
-                t3_expr = expr_repo.register(
-                    content=child.content,
-                    source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                    source_id=transcription_id,
-                    speaker=child.speaker,
-                )
-                expr_repo.link(
-                    from_id=t3_expr.id, to_id=t2_expr.id, relation_type=RelationType.SOURCE.value
-                )
-                daemon.embed(
-                    t3_expr.id, child.content, SourceType.AUDIO_TRANSCRIPT, speaker=child.speaker
-                )
-                _update_progress()
-
-        logger.info("Registered semantic expressions for transcription %d", transcription_id)
 
     def save_live_session(self, transcript: Transcript, on_phase: object | None = None) -> int:
         """Save a live transcription session to the database.
@@ -416,12 +286,7 @@ class TranscriptionRepository:
                 "Saved live session #%d (%d segments)", tx_record.id, len(transcript.segments)
             )
 
-            try:
-                self._register_expressions(tx_record.id, transcript, None, on_phase)
-            except Exception as e:
-                logger.error(
-                    "Failed to register expressions for live session %d: %s", tx_record.id, e
-                )
+
 
             return tx_record.id
 
