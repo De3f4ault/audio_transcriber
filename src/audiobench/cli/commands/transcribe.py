@@ -224,6 +224,17 @@ from audiobench.core.settings import get_settings
     help="Worker count for --strategy concurrent.",
 )
 @click.option(
+    "--parallel-gpus",
+    is_flag=True,
+    help="Run transcription on multiple GPUs in parallel",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=0,
+    help="Number of parallel GPU workers (0 = auto-detect based on GPUs)",
+)
+@click.option(
     "--interactive",
     "interactive_mode",
     is_flag=True,
@@ -270,6 +281,8 @@ def transcribe(
     pipeline_workers: int,
     parallel: int,
     skip_ghost: bool,
+    parallel_gpus: bool,
+    workers: int,
 ) -> None:
     """Transcribe audio or video files to text.
 
@@ -877,6 +890,41 @@ def transcribe(
     # If parse_formats returns formats, use the first as primary
     primary_format = multi_formats[0] if multi_formats else None
     extra_formats = multi_formats[1:] if len(multi_formats) > 1 else []
+
+    if parallel_gpus:
+        from audiobench.transcription.parallel import ParallelTranscriber
+        
+        opts = {
+            "output_path": output_path,
+            "primary_format": primary_format,
+            "extra_formats": extra_formats,
+            "settings_output_format": settings.output_format,
+            "input_base_dir": input_base_dir,
+            "collision": collision,
+            "language": language,
+            "word_timestamps": not no_timestamps,
+            "skip_cache": no_cache,
+            "speed_preset": speed_preset,
+            "initial_prompt": initial_prompt,
+            "translate": translate,
+            "enable_diarization": diarize,
+            "diarize_mode": diarize_mode,
+            "diarize_threshold": diarize_threshold,
+            "map_speakers": map_speakers,
+            "auto_name": auto_name,
+            "filters": filters,
+            "engine_name": engine_name,
+            "target_chapters": parsed_chapters,
+            "resume": resume,
+            "parallel_chapters": parallel,
+            "skip_ghost": skip_ghost,
+            "workers": workers,
+            "model": settings.model_name,
+        }
+        
+        pt = ParallelTranscriber()
+        pt.run(resolved_files, opts)
+        return
 
     pipeline = TranscriptionPipeline()
     results: list[dict] = []
