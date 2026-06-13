@@ -30,8 +30,8 @@ from audiobench.daemon.local_client import LocalRetrievalClient
 logger = get_logger("daemon.factory")
 
 # How long get_daemon_client() will wait for the socket after a recent
-# ensure_daemon_running() call. Needs to be long enough for Kaggle and other
-# cloud environments to download models from HF and load them into GPU VRAM
+# ensure_daemon_running() call. Needs to be long enough for slow
+# environments to download models from HF and load them into GPU VRAM
 # during cold starts.
 _FAST_PATH_TIMEOUT = 180.0  # seconds
 
@@ -70,7 +70,7 @@ def _fork_daemon(socket_path: Path) -> bool:
     try:
         env = os.environ.copy()
         # Ensure the 'src' directory is in PYTHONPATH so the -m audiobench command works
-        # even if not pip-installed (e.g. in Kaggle kernels where sys.path is hacked).
+        # even if not pip-installed (e.g. in environments where sys.path is hacked).
         src_path = str(Path(__file__).resolve().parent.parent.parent)
         env["PYTHONPATH"] = f"{src_path}:{env.get('PYTHONPATH', '')}"
 

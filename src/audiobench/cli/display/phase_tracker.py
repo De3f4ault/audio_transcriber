@@ -22,8 +22,7 @@ import time
 from pathlib import Path
 
 # Detect non-interactive environments that need forced flushing
-_IS_KAGGLE = "KAGGLE_KERNEL_RUN_TYPE" in os.environ or "KAGGLE_CONTAINER_NAME" in os.environ
-_FORCE_FLUSH = _IS_KAGGLE or not sys.stdout.isatty()
+_FORCE_FLUSH = not sys.stdout.isatty()
 
 from rich.live import Live
 from rich.text import Text
@@ -86,7 +85,7 @@ class PhaseTracker:
     def start(self) -> None:
         """Start the Rich Live display. Call before first update."""
         if not self.quiet:
-            if sys.stdout.isatty() and not _IS_KAGGLE:
+            if sys.stdout.isatty():
                 self._live = Live(
                     self,
                     console=console,
