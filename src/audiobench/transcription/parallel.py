@@ -41,6 +41,7 @@ def _worker_process(gpu_id: int, queue: multiprocessing.Queue, total_files: int,
     db_dir = os.path.join(opts.get("output_path", "/tmp"), f".audiobench_gpu{gpu_id}")
     os.makedirs(db_dir, exist_ok=True)
     os.environ["AUDIOBENCH_DATA_DIR"] = db_dir
+    os.environ["AUDIOBENCH_DATABASE_URL"] = f"sqlite:///{db_dir}/transcriptions.db"
 
     from audiobench.transcribe.transcriber import TranscriptionPipeline
     from audiobench.cli.io.output_resolver import resolve_output
