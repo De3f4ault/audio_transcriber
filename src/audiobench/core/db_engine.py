@@ -70,7 +70,7 @@ def init_db() -> None:
     from audiobench.storage.models import Base  # noqa: F811
 
     engine = get_engine()
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine, checkfirst=True)
 
     # Run idempotent migrations for existing databases
     url = get_settings().database_url
