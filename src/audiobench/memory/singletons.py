@@ -30,6 +30,9 @@ _primary_lock = threading.Lock()
 _reranker: Any = None
 _reranker_lock = threading.Lock()
 
+_llm_breaker: Any = None
+_llm_breaker_lock = threading.Lock()
+
 _hf_configured = False
 
 
@@ -242,6 +245,18 @@ def get_colbert_reranker() -> Any:
                 except Exception as e:
                     _handle_load_error(e, "answerdotai/answerai-colbert-small-v1")
     return _colbert_reranker
+
+
+def get_llm_circuit_breaker() -> Any:
+    """Get the global circuit breaker for LLM API calls."""
+    global _llm_breaker
+    if _llm_breaker is None:
+        with _llm_breaker_lock:
+            if _llm_breaker is None:
+                from audiobench.memory.llm_caller import CircuitBreaker
+                # Trip after 3 failures, allow probe after 60s
+                _llm_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=60.0)
+    return _llm_breaker
 
 
 def pre_warm_retrieval_pipeline() -> None:

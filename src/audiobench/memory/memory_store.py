@@ -300,11 +300,215 @@ class SpeakerProfileStore:
 
     def save_speaker(self, profile_id: str, name: str, voice_print: list[float]) -> None:
         """Save or update a speaker's voice print in the database."""
-        # Delete if it exists to allow updates
+        # Delete if it exists to allow updates.
+        # LanceDB raises when the filter matches zero rows on some versions — log, never swallow.
         try:
             self.table.delete(f"profile_id = '{profile_id}'")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("LanceDB delete failed during upsert (expected if new profile): %s", exc)
+
+        now_str = datetime.datetime.now(datetime.UTC).isoformat()
+        record = SpeakerProfileNode(
+            profile_id=profile_id,
+            name=name,
+            vector=voice_print,
+            created_at=now_str,
+        )
+        self.table.add([record])
+        logger.info("Saved speaker profile for '%s' (ID: %s)", name, profile_id)
+
+
+# ── Segment Vector Store ──────────────────────────────────────────────────────
+
+
+class SegmentVectorNode(LanceModel):
+    """LanceDB schema for audio segment embeddings.
+
+    One record per segment row in SQLite. Carries timestamps and source file
+    path so the display layer can show provenance without additional DB lookups.
+    """
+
+    segment_id: int           # FK → segments.id in SQLite
+    vector: Vector(768)       # type: ignore[valid-type]  # Nomic nomic-embed-text-v1.5
+    text: str                 # raw transcript text of the segment
+    start_time: float         # seconds from audio start
+    end_time: float           # seconds from audio end
+    source_file: str          # absolute path to the audio file
+    embedded_at: str          # ISO-8601 timestamp of when this was embedded
+
+
+class SegmentVectorStore:
+    """LanceDB adapter for audio segment vector embeddings.
+
+    Mirrors the structure of MemoryStore but targets the 'segment_vectors'
+    table and is keyed by segment_id (not expression_id).
+
+    The daemon's _rag_consistency_sweep_sync populates this table
+    automatically for every new segment. The CLI backfill command
+    'audiobench db embed-segments' handles segments that existed before
+    this feature was introduced.
+    """
+
+    table_name: str = "segment_vectors"
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        lancedb_dir = Path(settings.data_dir) / "lancedb"
+        lancedb_dir.mkdir(parents=True, exist_ok=True)
+
+        self.db = lancedb.connect(str(lancedb_dir))
+        self._engine = EmbeddingEngine()
+        self.model_version = "nomic-embed-text-v1.5"
+
+        if self.table_name not in self.db.table_names():
+            logger.info("Creating LanceDB segment vectors table '%s'", self.table_name)
+            self.table = self.db.create_table(self.table_name, schema=SegmentVectorNode)
+        else:
+            self.table = self.db.open_table(self.table_name)
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def upsert_segment(
+        self,
+        segment_id: int,
+        text: str,
+        start_time: float,
+        end_time: float,
+        source_file: str,
+    ) -> None:
+        """Embed text and write (or overwrite) a segment into LanceDB.
+
+        Idempotent: safe to call multiple times for the same segment_id.
+        Deletes the old record first to allow content updates.
+        """
+        # Delete stale record if it exists
+        try:
+            self.table.delete(f"segment_id = {segment_id}")
+        except Exception as exc:
+            logger.debug("Segment delete (upsert) for id=%d: %s", segment_id, exc)
+
+        vector = self._engine.embed_for_storage(text).tolist()
+        now_str = datetime.datetime.now(datetime.UTC).isoformat()
+
+        record = SegmentVectorNode(
+            segment_id=segment_id,
+            vector=vector,
+            text=text,
+            start_time=start_time,
+            end_time=end_time,
+            source_file=source_file,
+            embedded_at=now_str,
+        )
+        self.table.add([record])
+        logger.debug("Upserted segment_id=%d into segment_vectors", segment_id)
+
+    def upsert_segment_with_vector(
+        self,
+        segment_id: int,
+        text: str,
+        start_time: float,
+        end_time: float,
+        source_file: str,
+        vector: list[float],
+    ) -> None:
+        """Write a segment using a pre-computed vector (from the daemon's warm model).
+
+        Used by the daemon handlers so the warm Nomic model in the daemon
+        process is reused rather than cold-loading it in the CLI process.
+        """
+        try:
+            self.table.delete(f"segment_id = {segment_id}")
+        except Exception as exc:
+            logger.debug("Segment delete (upsert_with_vector) for id=%d: %s", segment_id, exc)
+
+        now_str = datetime.datetime.now(datetime.UTC).isoformat()
+        record = SegmentVectorNode(
+            segment_id=segment_id,
+            vector=vector,
+            text=text,
+            start_time=start_time,
+            end_time=end_time,
+            source_file=source_file,
+            embedded_at=now_str,
+        )
+        self.table.add([record])
+        logger.debug("Upserted segment_id=%d (pre-computed vector) into segment_vectors", segment_id)
+
+    # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
+
+    def search(self, query_vector: list[float], top_k: int = 10) -> list[dict]:
+        """ANN search over segment embeddings.
+
+        Returns a list of plain dicts with keys:
+            segment_id, text, start_time, end_time, source_file, _distance
+        """
+        results = (
+            self.table.search(query_vector, query_type="vector")
+            .limit(top_k)
+            .to_list()
+        )
+        return results
+
+    def count_embedded(self) -> int:
+        """Total number of segments currently embedded."""
+        return self.table.count_rows()
+
+    def get_embedded_ids(self) -> set[int]:
+        """Return the set of segment_ids already in this table.
+
+        Used by the daemon sweep and backfill command to find which
+        segments still need embedding without redundant work.
+        """
+        rows = self.table.search().select(["segment_id"]).limit(100_000).to_list()
+        return {int(r["segment_id"]) for r in rows}
+
+
+    def identify_speaker(self, voice_print: list[float], threshold: float = 0.82) -> str | None:
+        """Find the closest known speaker for a given voice print.
+        
+        Args:
+            voice_print: 192-D list of floats from SpeechBrain.
+            threshold: Minimum cosine similarity required to confirm match.
+                       (LanceDB uses distance, so distance <= 1 - threshold)
+        """
+        if self.table.count_rows() == 0:
+            return None
+            
+        results = self.table.search(voice_print).limit(1).to_list()
+        
+        if results:
+            best_match = results[0]
+            # LanceDB distance is typically 1 - cosine_similarity for vectors
+            # So a cosine similarity of 0.82 means distance of 0.18
+            distance = float(best_match.get("_distance", 1.0))
+            max_distance = 1.0 - threshold
+            
+            if distance <= max_distance:
+                logger.info(
+                    "Voice matched! '%s' (dist: %.4f < %.4f)",
+                    best_match["name"], distance, max_distance
+                )
+                return best_match["name"]
+            else:
+                logger.debug(
+                    "Voice NOT matched. Closest was '%s' (dist: %.4f > %.4f)",
+                    best_match["name"], distance, max_distance
+                )
+                
+        return None
+
+    def save_speaker(self, profile_id: str, name: str, voice_print: list[float]) -> None:
+        """Save or update a speaker's voice print in the database."""
+        # Delete if it exists to allow updates.
+        # LanceDB raises when the filter matches zero rows on some versions — log, never swallow.
+        try:
+            self.table.delete(f"profile_id = '{profile_id}'")
+        except Exception as exc:
+            logger.debug("LanceDB delete failed during upsert (expected if new profile): %s", exc)
 
         now_str = datetime.datetime.now(datetime.UTC).isoformat()
         record = SpeakerProfileNode(
