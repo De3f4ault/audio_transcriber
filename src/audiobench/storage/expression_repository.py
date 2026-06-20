@@ -5,13 +5,17 @@ Provides a clean interface for managing semantic memory expressions:
 - Linking expressions via directed relations
 - Querying by ID and retrieving relations
 - Navigating expression hierarchies (walking to parents)
+
+Batch methods (EQ-1 / EQ-2):
+- get_by_ids(): single WHERE IN query for N expressions — replaces N individual get_by_id() calls.
+- get_parents_batch(): one JOIN to resolve all source-relation parents — replaces N walk_to_parent() calls.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from sqlalchemy import asc
+from sqlalchemy import asc, tuple_
 
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
@@ -105,6 +109,76 @@ class ExpressionRepository:
             if record:
                 session.expunge(record)
             return record
+
+    def get_by_ids(self, ids: list[int]) -> dict[int, ExpressionRecord]:
+        """Batch-fetch expressions by ID in a single WHERE IN query.
+
+        Returns a dict keyed by expression ID.  Returns ``{}`` immediately when
+        *ids* is empty — no query is issued (SQLite raises on empty IN clause).
+
+        Args:
+            ids: List of expression IDs to fetch.
+
+        Returns:
+            Dict mapping expression_id → ExpressionRecord for every ID found.
+            IDs that do not exist in the database are absent from the result.
+        """
+        if not ids:
+            return {}
+        with get_session() as session:
+            records = (
+                session.query(ExpressionRecord)
+                .filter(ExpressionRecord.id.in_(ids))
+                .all()
+            )
+            result: dict[int, ExpressionRecord] = {}
+            for r in records:
+                session.expunge(r)
+                result[r.id] = r
+            return result
+
+    def get_parents_batch(
+        self, child_ids: list[int]
+    ) -> dict[int, ExpressionRecord]:
+        """Resolve source-relation parents for a batch of child expression IDs.
+
+        Issues a single JOIN query instead of N individual walk_to_parent() calls,
+        reducing complexity from O(N×Q) to O(1) queries.
+
+        Only follows the first outbound ``source`` relation per child.
+        Children that have no source relation are absent from the result.
+
+        Args:
+            child_ids: List of expression IDs whose parents we want.
+
+        Returns:
+            Dict mapping child_expression_id → parent ExpressionRecord.
+        """
+        if not child_ids:
+            return {}
+        with get_session() as session:
+            rows = (
+                session.query(
+                    ExpressionRelation.from_expression_id,
+                    ExpressionRecord,
+                )
+                .join(
+                    ExpressionRecord,
+                    ExpressionRecord.id == ExpressionRelation.to_expression_id,
+                )
+                .filter(
+                    ExpressionRelation.from_expression_id.in_(child_ids),
+                    ExpressionRelation.relation_type
+                    == RelationType.SOURCE.value,
+                )
+                .all()
+            )
+            result: dict[int, ExpressionRecord] = {}
+            for child_id, parent_rec in rows:
+                if child_id not in result:  # keep first source relation only
+                    session.expunge(parent_rec)
+                    result[child_id] = parent_rec
+            return result
 
     def link(
         self,

@@ -1,0 +1,135 @@
+"""Tests for P1-5: Synthesis Failure Guard Rail."""
+
+import dataclasses
+import pytest
+
+from audiobench.memory.query_engine import ResearchEngine, ResearchResult
+from audiobench.memory.rrf_fusion import FusedResult
+from audiobench.memory.query_types import ReformulatedQuery
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _make_fused(segment_id: int, start: float = 10.0, end: float = 20.0) -> FusedResult:
+    return FusedResult(
+        segment_id=segment_id,
+        start_time=start,
+        end_time=end,
+        text=f"Fragment text for segment {segment_id}.",
+        rrf_score=1.0 / 61,
+        stream_contributions=(("fts5", 1),),
+    )
+
+
+def _any_rq() -> ReformulatedQuery:
+    return ReformulatedQuery(
+        original="test",
+        bm25_keywords="test",
+        semantic_query="test",
+        hyde_anchor="test",
+    )
+
+
+def make_failed_query_result(sources: int = 3) -> ResearchResult:
+    return ResearchResult(
+        query="test query",
+        sources=[_make_fused(i + 1, start=float(i * 10 + 1), end=float(i * 10 + 9)) for i in range(sources)],
+        synthesis_failed=True,
+        synthesis_error="ollama: connection refused | gemini: no api key configured",
+        answer=None,
+    )
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_all_llm_fail(monkeypatch):
+    """Make all LLM paths return Err so synthesis always fails."""
+    from audiobench.memory.query_engine import Err
+    monkeypatch.setattr(
+        "audiobench.memory.query_engine._call_llm",
+        lambda *a, **kw: Err(error="all llm providers failed"),
+    )
+    # Stub reformulator to avoid real LLM call
+    monkeypatch.setattr(
+        "audiobench.memory.query_reformulator.QueryReformulator.reformulate",
+        lambda self, q: _any_rq(),
+    )
+    # Stub FTS5 to return hits so we have sources
+    monkeypatch.setattr(
+        "audiobench.memory.retrieval_streams.FTS5Stream.retrieve",
+        lambda self, rq, top_k: [
+            __import__(
+                "audiobench.memory.retrieval_streams",
+                fromlist=["SegmentHit"]
+            ).SegmentHit(
+                segment_id=i,
+                start_time=float(i * 10),
+                end_time=float(i * 10 + 9),
+                text=f"segment {i} text",
+            )
+            for i in range(1, 4)
+        ],
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.retrieval_streams.DenseStream.retrieve",
+        lambda self, rq, top_k: [],
+    )
+    monkeypatch.setattr(
+        "audiobench.memory.retrieval_streams.ColBERTStream.retrieve",
+        lambda self, rq, top_k: [],
+    )
+
+
+@pytest.fixture
+def mock_input_quit(monkeypatch):
+    """Simulate user pressing Q at the panel prompt."""
+    monkeypatch.setattr("builtins.input", lambda prompt="": "Q")
+
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
+def test_query_result_preserves_sources_on_synthesis_failure(mock_all_llm_fail):
+    engine = ResearchEngine()
+    result = engine.search("test query with results")
+    assert result.synthesis_failed is True
+    assert result.answer is None
+    assert result.synthesis_error is not None
+    assert len(result.sources) > 0, "Sources must be preserved even when synthesis fails"
+
+
+def test_query_result_sources_have_timestamps_on_failure(mock_all_llm_fail):
+    engine = ResearchEngine()
+    result = engine.search("learning from failure")
+    for source in result.sources:
+        assert source.start_time >= 0.0
+        assert source.end_time > source.start_time
+
+
+def test_cli_displays_segments_on_synthesis_failure(capsys):
+    from audiobench.cli.commands.memory_cmd import _display_results
+    result = make_failed_query_result(sources=3)
+    _display_results(result)
+    captured = capsys.readouterr()
+    # Must show synthesis failed banner
+    assert "synthesis failed" in captured.out.lower() or "⚠" in captured.out
+    # Must show fragment markers
+    assert "FRAGMENT" in captured.out.upper() or "→" in captured.out
+    # Must show timestamps in HH:MM:SS format (contains ":")
+    assert ":" in captured.out
+
+
+def test_cli_shows_panel_prompt_on_synthesis_failure(mock_input_quit, capsys):
+    """Even on synthesis failure, the [E]xpand [C]hat [Q]uit panel must appear."""
+    from audiobench.cli.commands.memory_cmd import _run_search_panel
+    result = make_failed_query_result(sources=2)
+    _run_search_panel(result)  # mock_input_quit makes user "press Q"
+    # Must not raise, must not exit process
+
+
+def test_research_result_synthesis_fields_default_to_not_failed():
+    """New ResearchResult must default to synthesis_failed=False and answer=None."""
+    result = ResearchResult(query="x")
+    assert result.synthesis_failed is False
+    assert result.answer is None
+    assert result.synthesis_error is None

@@ -11,7 +11,7 @@ from audiobench.cli.display.theme import error_panel
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
 from audiobench.memory.enums import SourceType
-from audiobench.memory.query_engine import MemoryQueryEngine
+from audiobench.memory.query_engine import ResearchEngine
 from audiobench.storage.models import ConversationSummary, ExpressionRecord
 
 logger = get_logger("cli.memory")
@@ -105,46 +105,14 @@ def search(
         console.print(error_panel("No Query", "A query must be provided."))
         return
 
-    engine = MemoryQueryEngine()
+    engine = ResearchEngine()
 
-    console.print(
-        f"[dim]Using preset: [bold]{preset}[/bold] (HyDE: {enable_hyde if enable_hyde is not None else 'default'}, CrossEncoder: {enable_cross_encoder if enable_cross_encoder is not None else 'default'}, ColBERT: {enable_colbert if enable_colbert is not None else 'default'})[/dim]"
-    )
+    console.print("[dim]Using parallel ResearchEngine with RRF fusion[/dim]")
 
     with console.status("Querying memory graph..."):
-        result = engine.query(
-            text=query,
-            preset=preset,
-            enable_hyde=enable_hyde,
-            enable_cross_encoder=enable_cross_encoder,
-            use_colbert=enable_colbert,
-            use_cache=not no_cache,
-        )
+        result = engine.search(query=query, preset=preset)
 
-    console.print(Panel(f"[bold green]Query:[/bold green] {query}", expand=False))
-
-    if result.hyde_document:
-        console.print(
-            Panel(f"[bold blue]HyDE Document:[/bold blue] {result.hyde_document}", expand=False)
-        )
-
-    # Render Sources
-    if result.sources:
-        console.print("\n[bold]Sources ([cyan]Top 5 Reranked[/cyan]):[/bold]")
-        for i, src in enumerate(result.sources, 1):
-            src_type = src.get("type", "unknown")
-            score = src.get("score", 0.0)
-            content = src.get("content", "").replace("\n", " ")
-            if len(content) > 150:
-                content = content[:150] + "..."
-            console.print(
-                f"  {i}. [[magenta]{src_type}[/magenta]] [dim](vec_score: {score:.3f})[/dim]\n     {content}"
-            )
-
-    console.print("\n[bold]Synthesis:[/bold]")
-    console.print(result.answer)
-    console.print(f"\n[dim]Query executed in {result.query_time_seconds:.2f}s[/dim]")
-    console.print()
+    _run_search_panel(result)
 
 
 @memory.command()
@@ -261,5 +229,196 @@ def correct(target_id: int, correction_text: str) -> None:
         logger.warning("Daemon embed failed for correction: %s", e)
 
     console.print(
-        f"[green]✓ Corrected inference #{target_id} with expression #{correction_expr.id}.[/green]"
+        f"[green]✓ Corrected inference #{target_id} with expression #{correction_expr.id}.[/green]\n"
     )
+
+
+# ── Research Engine display helpers (P1-5) ────────────────────────────────────
+
+def _fmt_timestamp(seconds: float) -> str:
+    """Format seconds as HH:MM:SS."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
+def _short_source(file_path: str) -> str:
+    """Return a readable short name from a full file path."""
+    import os
+    name = os.path.basename(file_path)
+    # Strip common extensions
+    for ext in (".mp4", ".mp3", ".m4a", ".wav", ".webm"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    # Strip leading hash prefix (e.g. "f5c6e2c8_Life is Short" → "Life is Short")
+    if "_" in name and len(name.split("_")[0]) == 8:
+        name = name.split("_", 1)[1]
+    return name.strip()
+
+
+_STREAM_COLORS: dict[str, str] = {
+    "fts5":    "yellow",
+    "dense":   "magenta",
+    "colbert": "blue",
+}
+
+
+def _display_results(result: "ResearchResult") -> None:  # type: ignore[name-defined]
+    """Render a ResearchResult to stdout.
+
+    Layout: fragments list first (with source + stream badges), answer panel last.
+    On synthesis failure: show a ⚠ warning banner instead of the answer.
+    Streams that returned 0 results get a ✗ badge so the user knows what ran.
+    """
+    from audiobench.memory.query_engine import ResearchResult  # local to avoid cycle
+
+    console.print()
+
+    # ── HyDE fallback notice (dim, single line) ───────────────────────────────
+    if result.hyde_fallback:
+        console.print(
+            "[dim yellow]⚠  HyDE unavailable — falling back to direct query embedding[/dim yellow]"
+        )
+
+    # ── Fragments ─────────────────────────────────────────────────────────────
+    if result.sources:
+        # Build skipped-stream suffix for header
+        skipped_note = ""
+        if result.streams_skipped:
+            skipped_labels = " ".join(
+                f"[dim red]{s}✗[/dim red]" for s in result.streams_skipped
+            )
+            skipped_note = f"  {skipped_labels}"
+
+        console.print(f"[bold]Fragments ({len(result.sources)})[/bold]{skipped_note}")
+        for i, fr in enumerate(result.sources, 1):
+            ts = f"{_fmt_timestamp(fr.start_time)} → {_fmt_timestamp(fr.end_time)}"
+            score_str = f"[dim](rrf: {fr.rrf_score:.4f})[/dim]"
+            snippet = fr.text[:120].replace("\n", " ")
+            if len(fr.text) > 120:
+                snippet += "…"
+
+            # Source label
+            source_label = ""
+            if fr.source_file:
+                source_label = f"  [dim]{_short_source(fr.source_file)}[/dim]"
+
+            # Stream contribution badges (streams that DID return this hit)
+            badges = ""
+            if fr.stream_contributions:
+                parts = []
+                for stream, rank in fr.stream_contributions:
+                    color = _STREAM_COLORS.get(stream, "white")
+                    parts.append(f"[{color}]{stream}[/{color}][dim]#{rank}[/dim]")
+                badges = "  " + " ".join(parts)
+
+            console.print(
+                f"  [bold]{i}.[/bold] [cyan]{ts}[/cyan] {score_str}{badges}{source_label}\n"
+                f"     [italic]{snippet}[/italic]"
+            )
+        console.print()
+
+    # ── Answer (always last) ──────────────────────────────────────────────────
+    if result.synthesis_failed or result.answer is None:
+        console.print(
+            Panel(
+                f"[bold yellow]⚠ Synthesis failed[/bold yellow]\n"
+                f"[dim]{result.synthesis_error or 'Unknown error'}[/dim]\n\n"
+                "[italic]Showing raw fragments instead.[/italic]",
+                title="[bold red]Synthesis Failed[/bold red]",
+                border_style="red",
+                expand=False,
+            )
+        )
+    else:
+        console.print(
+            Panel(
+                result.answer,
+                title=f"[bold cyan]Answer[/bold cyan] [dim]({result.query_time_seconds:.2f}s)[/dim]",
+                border_style="cyan",
+                expand=False,
+            )
+        )
+    console.print()
+
+
+def _stream_expanded_synthesis(result: "ResearchResult") -> None:  # type: ignore[name-defined]
+    """Generate and stream a deeply expanded synthesis using all fragments."""
+    from audiobench.chat.providers.ollama_provider import OllamaClient
+    from audiobench.core.settings import get_settings
+    from rich.live import Live
+    from rich.markdown import Markdown as RichMarkdown
+    from rich.padding import Padding
+    from audiobench.cli.display.theme import chat_console, CHAT_CODE_THEME, DIM
+    
+    settings = get_settings()
+    client = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
+    
+    prompt = (
+        f"You are exploring the open question: '{result.query}'.\n"
+        "Synthesize the following source fragments into a deep, expanded answer.\n"
+        "Please heavily cite specific times or timestamps from the text.\n\n"
+    )
+    for i, src in enumerate(result.sources, 1):
+        prompt += f"--- Fragment {i} (Time: {_fmt_timestamp(src.start_time)} - {_fmt_timestamp(src.end_time)}) ---\n"
+        content = getattr(src, "expression_content", None) or src.text
+        prompt += f"{content}\n\n"
+        
+    console.print("\n[dim]Generating expanded synthesis...[/dim]\n")
+    content_parts = []
+    
+    try:
+        with Live(console=chat_console, refresh_per_second=8, transient=True) as live:
+            for chunk in client.stream(prompt=prompt, system_prompt="You are an expert researcher."):
+                if chunk:
+                    content_parts.append(chunk)
+                    live.update(RichMarkdown("".join(content_parts), code_theme=CHAT_CODE_THEME))
+                    
+        if content_parts:
+            chat_console.print(Padding(RichMarkdown("".join(content_parts), code_theme=CHAT_CODE_THEME), (0, 0, 1, 0)))
+            
+    except Exception as e:
+        console.print(f"[red]Error during synthesis: {e}[/red]")
+
+
+def _run_search_panel(result: "ResearchResult") -> None:  # type: ignore[name-defined]
+    """Display results and show [E]xpand [C]hat [Q]uit panel.
+
+    This interactive panel is always shown — even on synthesis failure — so
+    the user can still access fragments, open a chat, or quit cleanly.
+    """
+    _display_results(result)
+
+    if not result.sources:
+        return
+
+    while True:
+        console.print(
+            "[dim]Press [bold]E[/bold] expand synthesis · "
+            "[bold]C[/bold] open chat · [bold]Q[/bold] quit[/dim]"
+        )
+        try:
+            choice = input("  › ").strip().upper()
+        except (KeyboardInterrupt, EOFError):
+            console.print()
+            break
+
+        if choice == "Q":
+            break
+        elif choice == "E":
+            _stream_expanded_synthesis(result)
+        elif choice == "C":
+            from audiobench.chat.chat_repl import ChatREPL
+            
+            # Start chat with search followup session
+            repl = ChatREPL(
+                session_type="search_followup",
+                preloaded_fragments=result.sources,
+                preloaded_title=f"🔍 Search: {result.query}",
+            )
+            repl.run()
+            break
+        else:
+            console.print("[dim]Unknown command. Use E, C, or Q.[/dim]")
