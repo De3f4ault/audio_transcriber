@@ -370,6 +370,25 @@ class ExpressionRecord(Base):
         return f"<ExpressionRecord(id={self.id}, source_type='{self.source_type}', len={len(self.content)})>"
 
 
+class ExpressionSegmentMap(Base):
+    """Bridge table linking expressions to their raw transcript segments."""
+
+    __tablename__ = "expression_segment_map"
+
+    expression_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="CASCADE"), primary_key=True
+    )
+    segment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("segments.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), index=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<ExpressionSegmentMap(expr={self.expression_id}, seg={self.segment_id})>"
+
+
 class ExpressionRelation(Base):
     """Directed relation between two semantic expressions."""
 
@@ -397,6 +416,21 @@ class ExpressionRelation(Base):
 
     def __repr__(self) -> str:
         return f"<ExpressionRelation({self.from_expression_id} -> {self.to_expression_id}, type='{self.relation_type}')>"
+
+
+class PendingRelation(Base):
+    __tablename__ = "pending_relations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    from_expression_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="CASCADE"), nullable=False
+    )
+    to_expression_id_hint: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    to_source_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    relation_type: Mapped[str] = mapped_column(String(64), nullable=False, default="explicit")
+    raw_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
 
 
 class AskLog(Base):
@@ -572,30 +606,17 @@ class Workflow(Base):
         return f"<Workflow(id={self.id}, name='{self.name}')>"
 
 
-class NoteRecord(Base):
-    """A user-authored note — the intake pipe for direct understanding into the namespace.
-    
-    The note is the only place where the user's understanding enters the expression
-    namespace in their own voice, unmediated by AI or transcription. Everything else
-    in the system receives the world and gives back understanding. The note is where
-    the user gives the system their understanding directly.
-    
-    Lifecycle:
-        draft    → ExpressionRecord not yet created. Not searchable.
-        active   → ExpressionRecord exists and is embedded. Searchable via .search.
-        archived → Hidden from default listings but preserved in the namespace.
-    """
-    __tablename__ = "notes"
+class NoteCollection(Base):
+    """A collection of notes (captures) tied to an audio file or subject."""
+    __tablename__ = "note_collections"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    title: Mapped[str] = mapped_column(String(512), nullable=False, default="Untitled Note")
-    body: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(16), default="draft")  # draft | active | archived
-    expression_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True, index=True
-    )
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
     audio_file_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("audio_files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    expression_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(
@@ -605,6 +626,83 @@ class NoteRecord(Base):
     # Relationships
     audio_file: Mapped[AudioFileRecord | None] = relationship()
     expression: Mapped[ExpressionRecord | None] = relationship()
+    captures: Mapped[list[NoteCapture]] = relationship(
+        "NoteCapture", back_populates="collection", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
-        return f"<NoteRecord(id={self.id}, title='{self.title}', status='{self.status}')>"
+        return f"<NoteCollection(id={self.id}, title='{self.title}')>"
+
+
+class NoteCapture(Base):
+    """An individual note capture, addressable via segment_id and expression_id."""
+    __tablename__ = "note_captures"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    collection_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("note_collections.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    expression_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    segment_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("segments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationships
+    collection: Mapped[NoteCollection] = relationship(back_populates="captures")
+    expression: Mapped[ExpressionRecord | None] = relationship()
+    segment: Mapped[SegmentRecord | None] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<NoteCapture(id={self.id}, coll_id={self.collection_id}, body='{self.body[:20]}')>"
+
+class StudyProject(Base):
+    """A project containing study sessions for a specific audio file."""
+
+    __tablename__ = "study_projects"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    audio_file_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("audio_files.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC)
+    )
+
+    # Relationships
+    audio_file: Mapped[AudioFileRecord] = relationship()
+    sessions: Mapped[list["StudySession"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class StudySession(Base):
+    """An active or completed study session over specific chapters."""
+
+    __tablename__ = "study_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("study_projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    session_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    conversation_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("chat_conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    chapter_ids: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    memoir_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("expressions.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC)
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, default=None
+    )
+
+    # Relationships
+    project: Mapped[StudyProject] = relationship(back_populates="sessions")
+    memoir: Mapped[ExpressionRecord | None] = relationship()

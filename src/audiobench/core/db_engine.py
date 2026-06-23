@@ -58,6 +58,8 @@ def get_engine() -> Engine:
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA mmap_size=268435456")
+                cursor.execute("PRAGMA cache_size=-32000")
                 cursor.close()
 
         logger.info("Database engine created: %s", url.split("@")[-1] if "@" in url else url)
