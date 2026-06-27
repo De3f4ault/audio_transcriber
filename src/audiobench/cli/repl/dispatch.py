@@ -11,7 +11,11 @@ Provides:
 from __future__ import annotations
 
 import difflib
+import uuid
 from typing import Callable
+
+# ── Module-level session ID — generated once per REPL process ─────────────────
+SESSION_ID: str = str(uuid.uuid4())[:8]
 
 # ── Backslash Handler Registry ───────────────────────────────
 #
@@ -141,26 +145,28 @@ def dispatch_command(session: ReplSession, args: list[str]) -> None:
 
 
 def _log_command_event(session: ReplSession, args: list[str], duration_ms: int) -> None:
-    """Write one row to command_events. Silent on any failure."""
+    """Log command dispatch to Observatory journal. Silent on any failure."""
     try:
-        from audiobench.core.db_engine import get_engine
-        from sqlalchemy import text
+        from audiobench.observatory.context import log_event
 
         cmd = args[0] if args else "unknown"
-        args_json = json.dumps(args[1:] if len(args) > 1 else [])
         file_id = session.focus.id if session.focus and session.focus.type == "file" else None
         tx_id = session.last_id
 
-        with get_engine().connect() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO command_events "
-                    "(command, args_json, context_file_id, context_tx_id, duration_ms) "
-                    "VALUES (:cmd, :args, :fid, :tid, :dur)"
-                ),
-                {"cmd": cmd, "args": args_json, "fid": file_id, "tid": tx_id, "dur": duration_ms},
-            )
-            conn.commit()
+        log_event(
+            subsystem="repl",
+            event_type="command_dispatched",
+            message=f"{cmd} {' '.join(args[1:]) if len(args) > 1 else ''}".strip(),
+            level="INFO",
+            duration_ms=duration_ms,
+            metadata={
+                "command": cmd,
+                "args": args[1:] if len(args) > 1 else [],
+                "context_file_id": file_id,
+                "context_tx_id": tx_id,
+            },
+            session_id=SESSION_ID,
+        )
     except Exception:
         pass  # Command graph is advisory — never break the REPL
 

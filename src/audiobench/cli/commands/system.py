@@ -280,7 +280,114 @@ def status() -> None:
     table.add_row("Voice Cache", format_size(voices_size))
     table.add_row("Saved Presets", str(presets_count))
 
+    # journal.db size
+    journal_path = settings.data_dir / "journal.db"
+    journal_size = journal_path.stat().st_size if journal_path.exists() else 0
+    table.add_row("Observatory DB", format_size(journal_size))
+
     console.print(table)
+
+    # Process registry
+    try:
+        from audiobench.supervisor.registry import get_all as get_all_processes
+        from audiobench.observatory.db import get_journal_session
+        import datetime as _dt
+
+        processes = get_all_processes()
+        if processes:
+            proc_table = make_table(
+                "Managed Processes",
+                [
+                    ("Process", {"style": BOLD}),
+                    ("State", {"width": 10}),
+                    ("PID", {"justify": "right", "width": 8}),
+                    ("Restarts", {"justify": "right", "width": 10}),
+                    ("Updated", {}),
+                ],
+            )
+
+            state_styles = {
+                "running": SUCCESS,
+                "stopped": DIM,
+                "backoff": "yellow",
+                "fatal": "red",
+            }
+
+            for p in processes:
+                state_style = state_styles.get(p["state"], "white")
+                pid_str = str(p["pid"]) if p["pid"] else "—"
+                state_str = p['state'].upper()
+                
+                # Check for stale state
+                if p["state"] == "running" and p["pid"]:
+                    try:
+                        import psutil
+                        if not psutil.pid_exists(p["pid"]):
+                            state_str = "STALE"
+                            state_style = "red"
+                    except ImportError:
+                        pass
+                
+                # Relative time
+                updated = "—"
+                if p["updated_at"]:
+                    try:
+                        then = _dt.datetime.fromisoformat(p["updated_at"].replace("Z", "+00:00"))
+                        now = _dt.datetime.now(_dt.timezone.utc)
+                        diff = now - then
+                        secs = int(diff.total_seconds())
+                        if secs < 60:
+                            updated = f"{secs}s ago"
+                        elif secs < 3600:
+                            updated = f"{secs//60}m ago"
+                        else:
+                            updated = f"{secs//3600}h {(secs%3600)//60}m ago"
+                    except Exception:
+                        updated = p["updated_at"]
+
+                proc_table.add_row(
+                    p["name"],
+                    f"[{state_style}]{state_str}[/]",
+                    pid_str,
+                    str(p["restart_count"] or 0),
+                    updated,
+                )
+
+            console.print(proc_table)
+
+        # Recent events
+        with get_journal_session() as conn:
+            rows = conn.execute(
+                "SELECT ts, level, subsystem, event_type, message FROM system_events "
+                "ORDER BY ts DESC LIMIT 10"
+            ).fetchall()
+
+        if rows:
+            evt_table = make_table(
+                "Recent Events",
+                [
+                    ("Time", {"width": 20}),
+                    ("Level", {"width": 8}),
+                    ("Subsystem", {"width": 12}),
+                    ("Event", {"width": 26}),
+                    ("Message", {}),
+                ],
+            )
+            level_styles = {"INFO": "cyan", "WARN": "yellow", "ERROR": "red", "CRITICAL": "bold red", "DEBUG": DIM}
+            for ts, level, subsystem, event_type, message in rows:
+                ls = level_styles.get(level, "white")
+                short_ts = ts[11:19] if ts else "—"
+                evt_table.add_row(
+                    short_ts,
+                    f"[{ls}]{level}[/]",
+                    subsystem,
+                    event_type,
+                    (message or "")[:60],
+                )
+            console.print(evt_table)
+
+    except Exception as exc:
+        console.print(f"  [{DIM}]Observatory unavailable: {exc}[/]")
 
 
 # ── Cleanup Command ─────────────────────────────────────────
@@ -309,11 +416,17 @@ def status() -> None:
     is_flag=True,
     help="Show what would be deleted without deleting",
 )
+@click.option(
+    "--rotate-logs",
+    is_flag=True,
+    help="Archive active log files and delete archives older than 30 days",
+)
 @click.confirmation_option(prompt="Are you sure?")
 def cleanup(
     older_than: str | None,
     clean_cache: bool,
     clean_temp: bool,
+    rotate_logs: bool,
     dry_run: bool,
 ) -> None:
     """Clean up old data, cache, and temp files.
@@ -391,6 +504,44 @@ def cleanup(
                     with contextlib.suppress(OSError):
                         f.unlink()
                 actions.append(f"Removed {len(tmp_files)} temp file(s)")
+
+    # Log Rotation
+    if rotate_logs:
+        import time
+        from zipfile import ZipFile, ZIP_DEFLATED
+        from audiobench.cli.display.theme import format_size
+        
+        log_dir = settings.data_dir / "logs"
+        if log_dir.exists():
+            # Archive old logs
+            for log_file in ["audiobench.log", "worker.log"]:
+                path = log_dir / log_file
+                if path.exists() and path.stat().st_size > 0:
+                    ts_str = time.strftime("%Y%m%d_%H%M%S")
+                    zip_path = log_dir / f"{log_file}.{ts_str}.zip"
+                    
+                    if dry_run:
+                        actions.append(f"Would compress {log_file} ({format_size(path.stat().st_size)}) to {zip_path.name}")
+                    else:
+                        with ZipFile(zip_path, 'w', ZIP_DEFLATED) as zf:
+                            zf.write(path, log_file)
+                        with open(path, "w") as f:
+                            f.truncate()
+                        actions.append(f"Compressed {log_file} to {zip_path.name}")
+
+            # Delete zips older than 30 days
+            cutoff = _parse_age("30d")
+            if cutoff:
+                zips = list(log_dir.glob("*.zip"))
+                for zip_path in zips:
+                    from datetime import datetime
+                    mtime = datetime.fromtimestamp(zip_path.stat().st_mtime)
+                    if mtime < cutoff:
+                        if dry_run:
+                            actions.append(f"Would delete old log archive {zip_path.name}")
+                        else:
+                            zip_path.unlink()
+                            actions.append(f"Deleted old log archive {zip_path.name}")
 
     if not actions:
         console.print(f"  [{DIM}]Nothing to clean up.[/]")

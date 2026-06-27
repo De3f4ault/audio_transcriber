@@ -20,265 +20,29 @@ from audiobench.cli.display.theme import (
 )
 from audiobench.core.settings import get_settings
 
-# ── Chat Help Text ──────────────────────────────────────────
-
-CHAT_HELP_TEXT = (
-    "  [bold]Slash Commands[/]\n"
-    "  ─────────────────────────────────────\n"
-    "  /help              Show this help\n"
-    "  /context [ID]      Show context, or add transcript by ID\n"
-    "  /load <ID>         Add a transcript to context\n"
-    "  /remove <ID>       Remove a transcript from context\n"
-    "  /clear             Clear history and all context\n"
-    "  /model <name>      Switch model mid-chat\n"
-    "  /compare <model>     Toggle side-by-side comparison\n"
-    "  /compare off         Disable comparison mode\n"
-    "  /think             Toggle thinking display\n"
-    "  /retry             Regenerate last response\n"
-    "  /export [file]     Export chat to markdown\n"
-    "  /bookmarks [ID]    List bookmarks for a transcript\n"
-    "  /history           List past chat sessions\n"
-    "  /save              Force-save conversation\n"
-    "  /exit              Exit chat (also Ctrl+D)\n"
-    "\n"
-    "  [bold]Multi-line Input[/]\n"
-    "  ─────────────────────────────────────\n"
-    '  Type [bold]triple-quotes (\\"\\"\\")'
-    "[/] to start/end a multi-line block.\n"
-)
-
-
-# ── Slash Command Handler ───────────────────────────────────
-
-
-def _handle_slash_command(
-    cmd: str,
-    session,
-    tx_repo,
-    chat_repo,
-    settings,
-) -> bool:
-    """Handle a slash command. Returns True if the REPL should exit."""
-    parts = cmd.strip().split(None, 1)
-    command = parts[0].lower()
-    arg = parts[1] if len(parts) > 1 else ""
-
-    if command in ("/exit", "/quit", "/q"):
-        return True
-
-    elif command == "/help":
-        console.print()
-        console.print(CHAT_HELP_TEXT)
-
-    elif command == "/context":
-        if arg and arg.strip().isdigit():
-            # /context <ID> → shorthand for /load <ID>
-            tid = int(arg.strip())
-            record = tx_repo.get_by_id(tid)
-            if not record:
-                console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
-                return False
-            session.load_transcripts([record])
-            console.print(
-                f"  [{SUCCESS}]✓ Loaded #{tid} "
-                f"{record['file_name']} "
-                f"({record['word_count']:,} words)[/]"
-            )
-        else:
-            console.print()
-            for line in session.get_context_summary():
-                console.print(f"    {line}")
-            console.print()
-
-    elif command == "/load":
-        if not arg or not arg.strip().isdigit():
-            console.print(f"  [{DIM}]Usage: /load <transcript_id>[/]")
-            return False
-        tid = int(arg.strip())
-        record = tx_repo.get_by_id(tid)
-        if not record:
-            console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
-            return False
-        session.load_transcripts([record])
-        console.print(
-            f"  [{SUCCESS}]✓ Loaded #{tid} "
-            f"{record['file_name']} "
-            f"({record['word_count']:,} words)[/]"
-        )
-
-    elif command == "/clear":
-        session.clear_history()
-        console.print(
-            f"  [{SUCCESS}]✓ Conversation cleared (new session #{session.conversation_id})[/]"
-        )
-        console.print(f"  [{DIM}]Context reset — use /load <ID> to add transcripts[/]")
-
-    elif command == "/remove":
-        if not arg or not arg.strip().isdigit():
-            console.print(f"  [{DIM}]Usage: /remove <transcript_id>[/]")
-            return False
-        tid = int(arg.strip())
-        if session.remove_transcript(tid):
-            console.print(f"  [{SUCCESS}]✓ Removed transcript #{tid} from context[/]")
-        else:
-            console.print(f"  [{DIM}]Transcript #{tid} not in context[/]")
-
-    elif command == "/model":
-        if not arg:
-            console.print(f"  [{DIM}]Current model: {session.model}[/]")
-            console.print(f"  [{DIM}]Usage: /model <name>[/]")
-            return False
-        session.switch_model(arg.strip())
-        console.print(f"  [{SUCCESS}]✓ Switched to {arg.strip()}[/]")
-
-    elif command == "/think":
-        session.show_thinking = not session.show_thinking
-        state = "on" if session.show_thinking else "off"
-        console.print(f"  [{SUCCESS}]✓ Thinking display: {state}[/]")
-
-    elif command == "/history":
-        convs = chat_repo.list_conversations(limit=10)
-        if not convs:
-            console.print(f"  [{DIM}]No past conversations[/]")
-            return False
-        console.print()
-        for c in convs:
-            tid_list = c.get("transcript_ids", [])
-            ctx = f" (transcripts: {tid_list})" if tid_list else ""
-            console.print(
-                f"    [{ACCENT}]#{c['id']}[/] "
-                f"{c['title']} "
-                f"[{DIM}]({c['message_count']} msgs, "
-                f"{c['model']}){ctx}[/]"
-            )
-        console.print()
-
-    elif command == "/save":
-        console.print(f"  [{SUCCESS}]✓ Conversation #{session.conversation_id} saved[/]")
-
-    elif command == "/export":
-        import time as _time
-        from pathlib import Path
-
-        if not session.messages:
-            console.print(f"  [{DIM}]Nothing to export yet[/]")
-            return False
-        fname = arg.strip() if arg.strip() else None
-        if not fname:
-            slug = f"chat_{session.conversation_id or 'new'}_{int(_time.time())}"
-            fname = f"{slug}.md"
-        path = Path(fname).expanduser()
-        lines = [f"# Chat #{session.conversation_id or 'new'}\n"]
-        lines.append(f"Model: {session.model}  \n")
-        lines.append("---\n")
-        for msg in session.messages:
-            if msg["role"] == "user":
-                lines.append(f"**You:** {msg['content']}\n")
-            elif msg["role"] == "assistant":
-                lines.append(f"**AI:**\n\n{msg['content']}\n")
-            lines.append("---\n")
-        path.write_text("\n".join(lines), encoding="utf-8")
-        console.print(f"  [{SUCCESS}]✓ Exported to {path}[/]")
-
-    elif command == "/retry":
-        # Signal to the REPL that we want a retry
-        # We store a flag on the session object
-        session._retry_requested = True  # noqa: SLF001
-        return False  # handled in the REPL loop
-
-    elif command == "/compare":
-        if not arg:
-            # Status: show current comparison state
-            cmp_model = getattr(session, "_compare_model", None)
-            if cmp_model:
-                console.print(
-                    f"  [{ACCENT}]⚡ Comparison mode ON[/]\n"
-                    f"  [{DIM}]Primary:   {session.model}[/]\n"
-                    f"  [{DIM}]Secondary: {cmp_model}[/]\n"
-                    f"  [{DIM}]Use /compare off to disable[/]"
-                )
-            else:
-                console.print(
-                    f"  [{DIM}]Comparison mode is OFF[/]\n"
-                    f"  [{DIM}]Usage: /compare <model> to enable[/]\n"
-                    f"  [{DIM}]Example: /compare qwen4-next:110b-cloud[/]"
-                )
-            return False
-        if arg.strip().lower() == "off":
-            old = getattr(session, "_compare_model", None)
-            session._compare_model = None  # noqa: SLF001
-            if old:
-                console.print(
-                    f"  [{SUCCESS}]✓ Comparison mode OFF[/] [{DIM}](was comparing with {old})[/]"
-                )
-            else:
-                console.print(f"  [{DIM}]Comparison mode was already off[/]")
-            return False
-        # Enable or switch comparison model
-        new_model = arg.strip()
-        old = getattr(session, "_compare_model", None)
-        session._compare_model = new_model  # noqa: SLF001
-        if old and old != new_model:
-            console.print(
-                f"  [{ACCENT}]⚡ Switched comparison:[/] [{DIM}]{old}[/] → [{BOLD}]{new_model}[/]"
-            )
-        else:
-            console.print(
-                f"  [{ACCENT}]⚡ Comparison mode ON[/]\n"
-                f"  [{DIM}]Every prompt will compare {session.model} vs {new_model}[/]\n"
-                f"  [{DIM}]/compare off to disable[/]"
-            )
-        return False
-
-    elif command == "/bookmarks":
-        from audiobench.core.db_engine import init_db
-        from audiobench.storage.bookmark_repository import (
-            BOOKMARK_TYPES,
-            BookmarkRepository,
-        )
-        from audiobench.storage.bookmark_repository import (
-            _format_timestamp as _bfmt,
-        )
-
-        init_db()
-        bm_repo = BookmarkRepository()
-
-        if arg and arg.strip().isdigit():
-            # Show bookmarks for a specific transcript's audio file
-            tid = int(arg.strip())
-            record = tx_repo.get_by_id(tid)
-            if not record:
-                console.print(f"  [{DIM}]Transcript #{tid} not found[/]")
-                return False
-            audio_id = record.get("audio_file_id")
-            if not audio_id:
-                console.print(f"  [{DIM}]No audio file linked to #{tid}[/]")
-                return False
-            bookmarks = bm_repo.list_for_file(audio_id)
-            label = f"#{tid} {record.get('file_name', '')}"
-        else:
-            bookmarks = bm_repo.list_all(limit=15)
-            label = "All files"
-
-        if not bookmarks:
-            console.print(f"  [{DIM}]No bookmarks found[/]")
-            return False
-
-        console.print()
-        console.print(f"  [{ACCENT}]Bookmarks — {label}[/]")
-        for b in bookmarks:
-            emoji = BOOKMARK_TYPES.get(b["bookmark_type"], "🔖")
-            time_str = _bfmt(b["timestamp"])
-            if b.get("is_region") and b.get("end_timestamp"):
-                time_str += f"→{_bfmt(b['end_timestamp'])}"
-            console.print(f"    [{DIM}]#{b['id']}[/] {emoji} {time_str}  {b['name'][:40]}")
-        console.print()
-
-    else:
-        console.print(f"  [{DIM}]Unknown command: {command} (type /help for commands)[/]")
-
-    return False
-
+def _maybe_pick_chapters(audio_file_id: int, token_threshold: int = 80000) -> list[int] | None:
+    """Check if an audio file's transcript is too large and prompt for chapters if so.
+    
+    Returns a list of chapter IDs if picked, or None if the file is small enough
+    to load entirely.
+    """
+    from audiobench.core.db_session import get_session
+    from audiobench.storage.models import ChapterRecord
+    from audiobench.cli.tui.chapter_picker import pick_chapters
+    
+    with get_session() as session:
+        chapters = session.query(ChapterRecord).filter_by(audio_file_id=audio_file_id).order_by(ChapterRecord.start_time).all()
+        
+    if not chapters:
+        return None
+        
+    total_chars = sum((ch.transcript_length or 0) for ch in chapters)
+    estimated_tokens = total_chars / 4
+    
+    if estimated_tokens > token_threshold:
+        return pick_chapters(audio_file_id)
+        
+    return None
 
 # ── Ask Command ─────────────────────────────────────────────
 
@@ -493,9 +257,8 @@ def ask(
         # --- PHASE 5.3: Ask Log & Expression Wiring ---
         from audiobench.chat.chat_store import ChatRepository
         from audiobench.core.logger_factory import get_logger
-        from audiobench.daemon.factory import get_daemon_client
-        from audiobench.memory.enums import RelationType, SourceType
-        from audiobench.storage.expression_repository import ExpressionRepository
+        from audiobench.memory.knowledge_ingester import KnowledgeIngester
+        import threading
 
         _logger = get_logger("cmd.ask")
 
@@ -504,56 +267,31 @@ def ask(
             chat_repo = ChatRepository()
             log_id = chat_repo.get_or_create_ask_log(audio_file_id)
 
-            expr_repo = ExpressionRepository()
-
-            # 1. Register Query Expression
-            q_expr = expr_repo.register(
-                content=question,
-                source_type=SourceType.ASK_QUERY.value,
-                source_id=log_id,
-            )
-
-            # 2. Register Answer Expression
-            a_expr = expr_repo.register(
-                content=final_md,
-                source_type=SourceType.ASK_ANSWER.value,
-                source_id=log_id,
-            )
-
-            # 3. Link Query -> Answer (Wait, relation_type is source)
-            # Query is the source of the answer? No, Answer is derived from Query.
-            # Relation(from=a_expr, to=q_expr, type=source)
-            expr_repo.link(
-                from_id=a_expr.id, to_id=q_expr.id, relation_type=RelationType.SOURCE.value
-            )
-
-            # 4. Link Answer -> Transcript Expression?
-            # To do this, we need the Tier 1 transcript expression. We don't have its ID immediately,
-            # but we can look it up or we can just link to the transcript ID in source_id (already done).
-
-            chat_repo.add_ask_entry(
+            entry_id = chat_repo.add_ask_entry(
                 log_id=log_id,
                 question=question,
                 answer=final_md,
                 model_name=model_name,
-                question_expression_id=q_expr.id,
-                answer_expression_id=a_expr.id,
             )
 
             try:
-                daemon = get_daemon_client()
-                daemon.embed(
-                    expression_id=q_expr.id,
-                    content=question,
-                    source_type=SourceType.ASK_QUERY,
-                )
-                daemon.embed(
-                    expression_id=a_expr.id,
-                    content=final_md,
-                    source_type=SourceType.ASK_ANSWER,
-                )
+                from audiobench.core.db_session import get_session
+                from audiobench.storage.models import AskEntry, AskLog
+                
+                with get_session() as session:
+                    entry = session.query(AskEntry).filter_by(id=entry_id).first()
+                    log = session.query(AskLog).filter_by(id=log_id).first()
+                    if entry and log:
+                        session.expunge(entry)
+                        session.expunge(log)
+                        ingester = KnowledgeIngester()
+                        threading.Thread(
+                            target=ingester.ingest_ask_entry,
+                            args=(entry, log),
+                            daemon=True
+                        ).start()
             except Exception as ex:
-                _logger.warning("Daemon not available for ask query embedding: %s", ex)
+                _logger.warning("Failed to spawn ingestion thread for ask entry %d: %s", entry_id, ex)
 
     except AIError as e:
         console.print(error_panel("AI Error", str(e)))
@@ -624,6 +362,13 @@ def ask(
     default=None,
     help="View the session memoir for a conversation",
 )
+@click.option(
+    "--project",
+    "project_id",
+    type=int,
+    default=None,
+    help="Start/resume a study project by project ID",
+)
 def chat(
     transcript_ids: tuple[int, ...],
     model: str | None,
@@ -636,6 +381,7 @@ def chat(
     think: bool,
     chapter: int | None,
     summary: int | None,
+    project_id: int | None,
 ) -> None:
     """Interactive AI chat with transcript context.
 
@@ -745,6 +491,67 @@ def chat(
         )
         return
 
+    # ── Study Project Integration ──
+    current_session_number = None
+    transcripts_to_load = []
+    
+    if project_id is not None:
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.models import StudyProject, StudySession
+        from audiobench.storage.chapter_repository import get_chapter_repo
+        from audiobench.storage.models import ChapterRecord
+        import json
+        import sys
+
+        with get_session() as db:
+            project = db.query(StudyProject).filter_by(id=project_id).first()
+            if not project:
+                console.print(error_panel("Not found", f"Study project #{project_id} not found"))
+                sys.exit(1)
+            
+            # Find the active session
+            sess = (
+                db.query(StudySession)
+                .filter_by(project_id=project_id)
+                .filter(StudySession.closed_at.is_(None))
+                .first()
+            )
+            if not sess:
+                console.print(error_panel("No active session", "Use 'audiobench study resume' to start a new session"))
+                sys.exit(1)
+            
+            current_session_number = sess.session_number
+            audio_file_id = project.audio_file_id
+            
+            if sess.conversation_id:
+                resume_id = sess.conversation_id
+            
+            try:
+                chap_list = json.loads(sess.chapter_ids)
+            except Exception:
+                chap_list = []
+            
+            if chap_list:
+                # Load only these chapters
+                for ch_idx in chap_list:
+                    chap = get_chapter_repo().get_chapter_by_index(audio_file_id, ch_idx)
+                    if chap and chap.id:
+                        db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
+                        tx_id = db_chap.transcription_id if db_chap else None
+                        if tx_id:
+                            chap_record = tx_repo.get_by_id(tx_id)
+                            if chap_record:
+                                chap_record["file_name"] = f"{chap_record['file_name']} (Chapter {ch_idx}: {chap.title})"
+                                transcripts_to_load.append(chap_record)
+            else:
+                # Load full file
+                from audiobench.storage.models import TranscriptionRecord
+                tx = db.query(TranscriptionRecord).filter_by(audio_file_id=audio_file_id).first()
+                if tx:
+                    record = tx_repo.get_by_id(tx.id)
+                    if record:
+                        transcripts_to_load.append(record)
+
     # ── Create or resume session ──
     session = ChatSession(
         client=client,
@@ -765,591 +572,120 @@ def chat(
         )
         return
 
-    # ── Load transcript context ──
-    transcripts_to_load = []
+    # ── Load standard transcript context (if not study project) ──
+    if project_id is None:
+        # By explicit IDs
+        for tid in transcript_ids:
+            record = tx_repo.get_by_id(tid)
+            if record:
+                if chapter is not None:
+                    from audiobench.core.db_session import get_session
+                    from audiobench.storage.chapter_repository import get_chapter_repo
+                    from audiobench.storage.models import ChapterRecord
 
-    # By explicit IDs
-    for tid in transcript_ids:
-        record = tx_repo.get_by_id(tid)
-        if record:
-            if chapter is not None:
-                from audiobench.core.db_session import get_session
-                from audiobench.storage.chapter_repository import get_chapter_repo
-                from audiobench.storage.models import ChapterRecord
+                    audio_file_id = record.get("audio_file_id")
+                    if audio_file_id:
+                        chap = get_chapter_repo().get_chapter_by_index(audio_file_id, chapter)
+                        if chap and chap.id:
+                            with get_session() as db:
+                                db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
+                                tx_id = db_chap.transcription_id if db_chap else None
+                            if tx_id:
+                                chap_record = tx_repo.get_by_id(tx_id)
+                                if chap_record:
+                                    chap_record["file_name"] = (
+                                        f"{record['file_name']} (Chapter {chapter}: {chap.title})"
+                                    )
+                                    transcripts_to_load.append(chap_record)
+                                    continue
+                                else:
+                                    console.print(
+                                        f"  [{DIM}]Chapter {chapter} transcript not found, skipping[/]"
+                                    )
+                                    continue
+                        else:
+                            console.print(
+                                f"  [{DIM}]Chapter {chapter} not found or not transcribed, skipping[/]"
+                            )
+                            continue
+                else:
+                    audio_file_id = record.get("audio_file_id")
+                    if audio_file_id:
+                        picked = _maybe_pick_chapters(audio_file_id)
+                        if picked:
+                            from audiobench.core.db_session import get_session
+                            from audiobench.storage.chapter_repository import get_chapter_repo
+                            from audiobench.storage.models import ChapterRecord
+                            
+                            for ch_idx in picked:
+                                chap = get_chapter_repo().get_chapter_by_index(audio_file_id, ch_idx)
+                                if chap and chap.id:
+                                    with get_session() as db:
+                                        db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
+                                        tx_id = db_chap.transcription_id if db_chap else None
+                                    if tx_id:
+                                        chap_record = tx_repo.get_by_id(tx_id)
+                                        if chap_record:
+                                            chap_record["file_name"] = f"{record['file_name']} (Chapter {ch_idx}: {chap.title})"
+                                            transcripts_to_load.append(chap_record)
+                            continue
+                transcripts_to_load.append(record)
+            else:
+                console.print(f"  [{DIM}]Transcript #{tid} not found, skipping[/]")
 
-                audio_file_id = record.get("audio_file_id")
-                if audio_file_id:
-                    chap = get_chapter_repo().get_chapter_by_index(audio_file_id, chapter)
-                    if chap and chap.id:
-                        with get_session() as db:
-                            db_chap = db.query(ChapterRecord).filter_by(id=chap.id).first()
-                            tx_id = db_chap.transcription_id if db_chap else None
-                        if tx_id:
-                            chap_record = tx_repo.get_by_id(tx_id)
-                            if chap_record:
-                                chap_record["file_name"] = (
-                                    f"{record['file_name']} (Chapter {chapter}: {chap.title})"
-                                )
-                                transcripts_to_load.append(chap_record)
-                                continue
-                            else:
-                                console.print(
-                                    f"  [{DIM}]Chapter {chapter} transcript not found, skipping[/]"
-                                )
-                                continue
-                    else:
-                        console.print(
-                            f"  [{DIM}]Chapter {chapter} not found or not transcribed, skipping[/]"
-                        )
-                        continue
-            transcripts_to_load.append(record)
-        else:
-            console.print(f"  [{DIM}]Transcript #{tid} not found, skipping[/]")
+        # By search
+        if search_query:
+            results = tx_repo.search(search_query, limit=5)
+            for r in results:
+                full = tx_repo.get_by_id(r["id"])
+                if full:
+                    transcripts_to_load.append(full)
+            if not results:
+                console.print(f"  [{DIM}]No transcripts matching '{search_query}'[/]")
 
-    # By search
-    if search_query:
-        results = tx_repo.search(search_query, limit=5)
-        for r in results:
-            full = tx_repo.get_by_id(r["id"])
-            if full:
-                transcripts_to_load.append(full)
-        if not results:
-            console.print(f"  [{DIM}]No transcripts matching '{search_query}'[/]")
+        # By recent
+        if recent:
+            history_items = tx_repo.get_history(limit=recent)
+            for h in history_items:
+                full = tx_repo.get_by_id(h["id"])
+                if full:
+                    transcripts_to_load.append(full)
 
-    # By recent
-    if recent:
-        history_items = tx_repo.get_history(limit=recent)
-        for h in history_items:
-            full = tx_repo.get_by_id(h["id"])
-            if full:
-                transcripts_to_load.append(full)
+    # Link conversation to study session if new
+    if project_id is not None and resume_id is None:
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.models import StudySession
+        
+        conv_id = chat_repo.create_conversation(
+            model=session.model,
+            title=f"Study Project #{project_id} - Session {current_session_number}",
+            session_type="study"
+        )
+        session._conversation_id = conv_id
+        
+        with get_session() as db:
+            sess = (
+                db.query(StudySession)
+                .filter_by(project_id=project_id)
+                .filter(StudySession.closed_at.is_(None))
+                .first()
+            )
+            if sess:
+                sess.conversation_id = conv_id
+                db.commit()
 
     if transcripts_to_load:
         session.load_transcripts(transcripts_to_load)
 
-    # ── Header ──
-    console.print()
-    conv_label = f" [#{resume_id}]" if resume_id else ""
-    console.print(f"  [{BOLD} {ACCENT}]{APP_NAME}[/] — AI Chat{conv_label}")
-    console.print(f"  [{DIM}]{'─' * 44}[/]")
-    console.print(f"    Model:    {model_name}")
-    ctx_lines = session.get_context_summary()
-    console.print(f"    Context:  {ctx_lines[0]}")
-    for line in ctx_lines[1:]:
-        console.print(f"              {line}")
-    think_label = "on" if think else "off"
-    console.print(f"    Thinking: {think_label}")
-    if resume_id and session.turn_count > 0:
-        console.print(f"    Resumed:  {session.turn_count} previous turn(s)")
-    console.print(f"  [{DIM}]{'─' * 44}[/]")
-    console.print()
-
-    # ── Render past messages on resume ──
-    import time as _time
-    from pathlib import Path as _Path
-
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.formatted_text import ANSI
-    from prompt_toolkit.history import FileHistory
-    from rich.console import Group
-    from rich.layout import Layout
-    from rich.markdown import Markdown as RichMarkdown
-    from rich.padding import Padding
-    from rich.panel import Panel
-
-    # ── prompt_toolkit session with persistent history ──
-    _history_file = _Path.home() / ".cache" / "audiobench_chat_history"
-    _history_file.parent.mkdir(parents=True, exist_ok=True)
-    _pt_session: PromptSession = PromptSession(
-        history=FileHistory(str(_history_file)),
+    from audiobench.chat.chat_repl import ChatREPL
+    repl = ChatREPL(
+        session, 
+        tx_repo, 
+        chat_repo, 
+        settings, 
+        session_type="study" if project_id else "chat",
+        project_id=project_id,
+        current_session_number=current_session_number,
     )
-    _multiline_active = False  # toggled by """
+    repl.run(resume_id=session.conversation_id)
 
-    def _save_readline_history() -> None:
-        pass  # prompt_toolkit auto-saves via FileHistory
-
-    def _render_comparison_pair(msg_a: dict, msg_b: dict) -> None:
-        """Render a comparison pair as side-by-side panels."""
-        layout = Layout()
-        layout.split_row(
-            Layout(name="left"),
-            Layout(name="right"),
-        )
-        for side, msg in [("left", msg_a), ("right", msg_b)]:
-            parts = []
-            if msg.get("thinking") and session.show_thinking:
-                think_preview = msg["thinking"][:300]
-                if len(msg["thinking"]) > 300:
-                    think_preview += "…"
-                parts.append(Text(f"💭 {think_preview}", style="dim italic"))
-            parts.append(RichMarkdown(msg["content"], code_theme=CHAT_CODE_THEME))
-            model_label = msg.get("model_name") or "Model"
-            border = "cyan" if side == "left" else "magenta"
-            layout[side].update(Panel(Group(*parts), title=model_label, border_style=border))
-        console.print(layout)
-
-    # ── Render past messages on resume ──
-    if resume_id and session.messages:
-        console.print(f"  [{DIM}]─── Previous Messages ───[/]")
-        console.print()
-        msgs = session.messages
-        i = 0
-        while i < len(msgs):
-            msg = msgs[i]
-            if msg["role"] == "user":
-                console.print(f"  [{PROMPT}]>>> {msg['content']}[/]")
-                console.print()
-                i += 1
-            elif msg["role"] == "assistant":
-                # Detect comparison pair: two consecutive assistants with different models
-                if (
-                    i + 1 < len(msgs)
-                    and msgs[i + 1]["role"] == "assistant"
-                    and msg.get("model_name") != msgs[i + 1].get("model_name")
-                ):
-                    _render_comparison_pair(msg, msgs[i + 1])
-                    console.print()
-                    i += 2
-                elif msg["content"].strip():
-                    # Show thinking if present
-                    if msg.get("thinking") and session.show_thinking:
-                        think_preview = msg["thinking"][:200]
-                        if len(msg["thinking"]) > 200:
-                            think_preview += "…"
-                        console.print(
-                            Padding(
-                                Text(f"💭 {think_preview}", style="dim italic"),
-                                (0, 2, 0, 4),
-                            )
-                        )
-                    md = RichMarkdown(
-                        msg["content"],
-                        code_theme=CHAT_CODE_THEME,
-                    )
-                    chat_console.print(Padding(md, (0, 2, 1, 2)))
-                    console.print()
-                    i += 1
-                else:
-                    i += 1
-            else:
-                i += 1
-        console.print(f"  [{DIM}]─── End of History ───[/]")
-        console.print()
-
-    # ── Helper: stream a message and render ──
-    def _stream_and_render(user_text: str) -> None:
-        """Send user input and render the streamed response.
-
-        Uses a compact tail-preview in Rich Live during streaming to
-        avoid the scrollback-duplication problem that occurs when Live
-        content exceeds the terminal viewport height.  The full formatted
-        markdown is printed once after streaming completes.
-        """
-        console.print()
-        try:
-            thinking_parts: list[str] = []
-            content_parts: list[str] = []
-            token_count = 0
-            t_start = _time.monotonic()
-
-            with Live(
-                console=chat_console,
-                refresh_per_second=8,
-                transient=True,
-            ) as live:
-                for chunk in session.send(user_text):
-                    thinking = chunk.get("thinking", "")
-                    content = chunk.get("content", "")
-
-                    if thinking:
-                        thinking_parts.append(thinking)
-
-                    if content:
-                        content_parts.append(content)
-
-                    if content:
-                        token_count += 1
-
-                    # ── Compact streaming preview ──
-                    # Only show the *tail* of thinking/content so the Live
-                    # viewport never exceeds the terminal height.  This
-                    # prevents Rich from pushing lines into the permanent
-                    # scrollback buffer where they can't be erased.
-                    display_parts = []
-
-                    if thinking_parts and session.show_thinking:
-                        think_text = "".join(thinking_parts)
-                        think_lines = think_text.splitlines()
-                        if len(think_lines) > 5:
-                            think_text = "…\n" + "\n".join(think_lines[-5:])
-                        display_parts.append(
-                            Text(f"💭 {think_text}", style="dim italic"),
-                        )
-
-                    if content_parts:
-                        full_text = "".join(content_parts)
-                        preview_lines = full_text.splitlines()
-                        if len(preview_lines) > 8:
-                            preview = "\n".join(preview_lines[-8:])
-                            display_parts.append(
-                                Text("  ⋮\n", style="dim"),
-                            )
-                        else:
-                            preview = full_text
-                        display_parts.append(Text(preview))
-                        # Token counter only during content streaming
-                        elapsed_so_far = _time.monotonic() - t_start
-                        tps_so_far = token_count / elapsed_so_far if elapsed_so_far > 0 else 0
-                        display_parts.append(
-                            Text(
-                                f"\n  ▍ {token_count} tokens · {tps_so_far:.0f} tok/s",
-                                style="dim",
-                            ),
-                        )
-
-                    if display_parts:
-                        live.update(Group(*display_parts))
-
-            # ── Print full formatted content ──
-            # Live was transient so its viewport is erased; we now
-            # print the complete markdown-rendered response once.
-            if content_parts:
-                final_md = "".join(content_parts)
-                chat_console.print(
-                    Padding(
-                        RichMarkdown(final_md, code_theme=CHAT_CODE_THEME),
-                        (0, 0, 0, 0),
-                    )
-                )
-            elif thinking_parts:
-                # Some models (e.g. deepseek) return the entire response
-                # in the "thinking" field with empty "content". Display
-                # the thinking text as the response in that case.
-                final_md = "".join(thinking_parts)
-                chat_console.print(
-                    Padding(
-                        RichMarkdown(final_md, code_theme=CHAT_CODE_THEME),
-                        (0, 0, 0, 0),
-                    )
-                )
-
-            # Persist response + background title gen (non-blocking)
-            session.finalize_response()
-
-            # Token stats
-            elapsed = _time.monotonic() - t_start
-            if token_count > 0 and elapsed > 0:
-                tps = token_count / elapsed
-                console.print(
-                    f"  [{DIM}]{token_count} tokens · {tps:.1f} tok/s · {elapsed:.1f}s[/]"
-                )
-            console.print()
-
-        except KeyboardInterrupt:
-            # Save partial response if anything was generated
-            if content_parts:
-                session.finalize_response()
-            console.print()
-            console.print(f"  [{DIM}]Generation interrupted[/]")
-            console.print()
-
-        except AIError as e:
-            console.print(error_panel("AI Error", str(e)))
-            console.print()
-
-    # ── Helper: compare two models and render ──
-    def _compare_and_render(user_text: str, compare_model: str) -> None:
-        """Run comparison between primary and secondary model."""
-        console.print()
-        try:
-            from audiobench.chat.compare import ModelComparison
-
-            # Build messages for the comparison
-            cmp_messages = session._build_api_messages()  # noqa: SLF001
-            cmp_messages.append({"role": "user", "content": user_text})
-
-            comparison = ModelComparison(
-                client=client,
-                messages=cmp_messages,
-                model_a=session.model,
-                model_b=compare_model,
-                temperature=temperature,
-                show_thinking=session.show_thinking,
-            )
-            result = comparison.run()
-
-            # Ensure conversation exists
-            if not session.conversation_id:
-                session._conversation_id = chat_repo.create_conversation(  # noqa: SLF001
-                    model=session.model,
-                    title="Model Comparison",
-                )
-
-            # Save user message
-            chat_repo.add_message(session.conversation_id, "user", user_text)
-            session._messages.append(  # noqa: SLF001
-                {"role": "user", "content": user_text}
-            )
-
-            # Save Model A response
-            res_a = result["model_a"]
-            chat_repo.add_message(
-                session.conversation_id,
-                "assistant",
-                res_a["content"],
-                thinking=res_a["thinking"],
-                model_name=res_a["model_name"],
-            )
-            session._messages.append(
-                {  # noqa: SLF001
-                    "role": "assistant",
-                    "content": res_a["content"],
-                    "thinking": res_a["thinking"],
-                    "model_name": res_a["model_name"],
-                }
-            )
-
-            # Save Model B response
-            res_b = result["model_b"]
-            chat_repo.add_message(
-                session.conversation_id,
-                "assistant",
-                res_b["content"],
-                thinking=res_b["thinking"],
-                model_name=res_b["model_name"],
-            )
-            session._messages.append(
-                {  # noqa: SLF001
-                    "role": "assistant",
-                    "content": res_b["content"],
-                    "thinking": res_b["thinking"],
-                    "model_name": res_b["model_name"],
-                }
-            )
-
-            # Stats
-            elapsed = result["elapsed"]
-            total_tokens = res_a["tokens"] + res_b["tokens"]
-            tps = total_tokens / elapsed if elapsed > 0 else 0
-            console.print(f"  [{DIM}]{total_tokens} tok · {tps:.0f} tok/s · {elapsed:.1f}s[/]")
-            console.print()
-
-            # Trigger title generation if first turn
-            if session.turn_count <= 1:
-                session._generate_title_async()  # noqa: SLF001
-
-        except KeyboardInterrupt:
-            console.print()
-            console.print(f"  [{DIM}]Comparison interrupted[/]")
-            console.print()
-
-        except Exception as e:
-            console.print(error_panel("Comparison Error", str(e)))
-            console.print()
-
-    # ── Multi-line input helper ──
-    def _read_multiline() -> str:
-        """Read multi-line input via prompt_toolkit (Alt+Enter or \"\"\" to end)."""
-        console.print(
-            f'  [{DIM}]Multi-line mode — type """ on its own line or press Alt+Enter to submit:[/]'
-        )
-        try:
-            text = _pt_session.prompt(
-                ANSI("\033[38;5;240m... \033[0m"),
-                multiline=True,
-            )
-        except (EOFError, KeyboardInterrupt):
-            return ""
-        # Strip wrapping triple-quotes if user typed them
-        text = text.strip()
-        if text.startswith('"""'):
-            text = text[3:]
-        if text.endswith('"""'):
-            text = text[:-3]
-        return text.strip()
-
-    # ── Interactive REPL ──
-    last_user_input: str | None = None
-    session._retry_requested = False  # noqa: SLF001
-    if not hasattr(session, "_compare_model"):
-        session._compare_model = None  # noqa: SLF001
-
-    def _trigger_summary(conv_id: int, messages: list[dict], repo, settings) -> None:
-        """Trigger summary generation in a background thread."""
-        import threading
-
-        def run_summary():
-            import json
-
-            from audiobench.chat.summary_generator import SummaryGenerator
-            from audiobench.daemon.factory import get_daemon_client
-            from audiobench.memory.enums import SourceType
-            from audiobench.storage.expression_repository import ExpressionRepository
-
-            gen = SummaryGenerator()
-            result = gen.generate(messages)
-            if not result:
-                return
-
-            # Update title
-            if result.refined_title:
-                repo.update_title(conv_id, result.refined_title)
-
-            # Write Expression
-            expr_repo = ExpressionRepository()
-            expr = expr_repo.register(
-                content=result.narrative,
-                source_type=SourceType.SESSION_SUMMARY.value,
-                source_id=conv_id,
-                session_type="chat",
-                session_id=conv_id,
-            )
-
-            # Save ConversationSummary record
-            repo.save_summary(
-                conversation_id=conv_id,
-                narrative=result.narrative,
-                drift_phases=json.dumps(result.drift_phases),
-                key_insights=json.dumps(result.key_insights),
-                open_threads=json.dumps(result.open_threads),
-                refined_title=result.refined_title,
-                generated_by=gen.model_name,
-                expression_id=expr.id,
-            )
-
-            # Embed Expression
-            try:
-                daemon = get_daemon_client()
-                daemon.embed(
-                    expression_id=expr.id,
-                    content=result.narrative,
-                    source_type=SourceType.SESSION_SUMMARY,
-                )
-            except Exception:
-                pass  # Already logged by DaemonFactory/Client
-
-        thread = threading.Thread(target=run_summary, daemon=True)
-        thread.start()
-
-    def _push_exit_frame() -> None:
-        """Push a navigation frame onto the REPL session stack (if inside REPL).
-
-        The chat command can be invoked two ways:
-          1. Directly: `audiobench chat 152`  — no REPL session, no-op.
-          2. Via REPL: `\\chat` or `chat 152`   — ReplSession is accessible
-             through Click's parent context object.
-
-        We look for a ReplSession on the Click context; if absent we skip
-        silently so standalone invocations are unaffected.
-        """
-        if not session.conversation_id:
-            return
-        try:
-            from audiobench.cli.repl.session import NavigationFrame, ReplSession
-            ctx = click.get_current_context(silent=True)
-            # Walk up the Click context chain looking for a ReplSession
-            repl_session: ReplSession | None = None
-            while ctx is not None:
-                obj = getattr(ctx, "obj", None)
-                if isinstance(obj, ReplSession):
-                    repl_session = obj
-                    break
-                ctx = getattr(ctx, "parent", None)
-            if repl_session is not None:
-                repl_session.push_frame(NavigationFrame(
-                    context="chat",
-                    state={"conversation_id": session.conversation_id},
-                    intent="mid-conversation",
-                ))
-        except Exception:
-            pass  # Never crash on exit cleanup
-
-    while True:
-        try:
-            # Show comparison mode in prompt
-            cmp_active = getattr(session, "_compare_model", None)
-            if cmp_active:
-                prompt_str = ANSI("\033[38;5;214m⚡ >>> \033[0m")
-            else:
-                prompt_str = ANSI("\033[38;5;48m>>> \033[0m")
-            user_input = _pt_session.prompt(prompt_str).strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            _save_readline_history()
-            if session.conversation_id:
-                console.print(
-                    f"  [{SUCCESS}]✓ Conversation "
-                    f"#{session.conversation_id} saved "
-                    f"({session.turn_count * 2} messages)[/]"
-                )
-                # --- PHASE 6.2/6.3: Wire Summary Trigger ---
-                if session.turn_count >= 3:
-                    _trigger_summary(session.conversation_id, session.messages, chat_repo, settings)
-            _push_exit_frame()
-            console.print(f"  [{DIM}]Goodbye![/]")
-            console.print()
-            break
-
-        if not user_input:
-            continue
-
-        # Multi-line input
-        if user_input == '"""':
-            user_input = _read_multiline()
-            if not user_input.strip():
-                continue
-
-        # Slash commands (accept both / and \)
-        if user_input.startswith("\\"):
-            user_input = "/" + user_input[1:]
-        if user_input.startswith("/"):
-            should_exit = _handle_slash_command(
-                user_input,
-                session,
-                tx_repo,
-                chat_repo,
-                settings,
-            )
-
-            # Handle /retry
-            if getattr(session, "_retry_requested", False):
-                session._retry_requested = False  # noqa: SLF001
-                if last_user_input and session.messages:
-                    # Remove last assistant + user message
-                    session._messages = [m for m in session._messages if m != session._messages[-1]]
-                    if session._messages and session._messages[-1]["role"] == "user":
-                        session._messages.pop()
-                    console.print(f"  [{DIM}]Regenerating...[/]")
-                    _stream_and_render(last_user_input)
-                else:
-                    console.print(f"  [{DIM}]Nothing to retry[/]")
-                continue
-
-            if should_exit:
-                _save_readline_history()
-                if session.conversation_id:
-                    console.print(
-                        f"  [{SUCCESS}]✓ Conversation "
-                        f"#{session.conversation_id} saved "
-                        f"({session.turn_count * 2} messages)"
-                        f"[/]"
-                    )
-                    # --- PHASE 6.2/6.3: Wire Summary Trigger ---
-                    if session.turn_count >= 3:
-                        _trigger_summary(
-                            session.conversation_id, session.messages, chat_repo, settings
-                        )
-                _push_exit_frame()
-                console.print(f"  [{DIM}]Goodbye![/]")
-                console.print()
-                break
-            continue
-
-        last_user_input = user_input
-
-        # Route through comparison or single-model
-        compare_model = getattr(session, "_compare_model", None)
-        if compare_model:
-            _compare_and_render(user_input, compare_model)
-        else:
-            _stream_and_render(user_input)

@@ -455,124 +455,27 @@ def cmd_config(session: ReplSession, args: str) -> None:
 
 # ── Notes & Capture ──────────────────────────────────────────
 
-
-@register_backslash("note")
-def cmd_note(session: ReplSession, args: str) -> None:
-    """Manage and edit notes.
-    
-    Usage:
-      \\note              → open new note (context-linked if focus set)
-      \\note "Title"      → open new note with title
-      \\note 5            → reopen note #5
-      \\note --list       → list active notes
-      \\note --inbox      → open global inbox
-      \\note --capture-log→ show unprocessed captures
-    """
-    from audiobench.cli.display.theme import console, ACCENT, WARNING, SUCCESS, DIM, BOLD
-    from audiobench.storage.note_repository import NoteRepository
-    import shlex
-    import os
-    import tempfile
-    import subprocess
-    
-    repo = NoteRepository()
-    arg = args.strip()
-    
-    if arg == "--list":
-        notes = repo.list_notes()
-        if not notes:
-            console.print(f"  [{DIM}]No active notes found.[/]")
-            return
-        from audiobench.cli.display.theme import make_table
-        table = make_table("Active Notes", [("ID", {"style": ACCENT, "justify": "right"}), ("Title", {}), ("Created", {})])
-        for n in notes:
-            table.add_row(str(n.id), n.title, str(n.created_at)[:16])
-        console.print(table)
-        return
-        
-    if arg == "--inbox":
-        note = repo.find_or_create_inbox()
-    elif arg == "--capture-log":
-        captures = repo.list_unprocessed_captures()
-        if not captures:
-            console.print(f"  [{DIM}]No captures found.[/]")
-            return
-        console.print(f"\n  [{BOLD}]Capture Log[/]")
-        for c in captures:
-            console.print(f"  [{DIM}]{c['timestamp']}[/] [{ACCENT}]note:{c['note_id']}[/] {c['text']}")
-        return
-    elif arg.isdigit():
-        note = repo.get_by_id(int(arg))
-        if not note:
-            console.print(f"  [{WARNING}]Note #{arg} not found.[/]")
-            return
-    else:
-        # Create new
-        title = arg.strip('"\'') if arg else ("Untitled Note" if not session.focus else f"Notes on {session.focus.label}")
-        audio_file_id = session.focus.id if session.focus and session.focus.type == "file" else None
-        note = repo.create(title=title, audio_file_id=audio_file_id)
-        if session.focus:
-            console.print(f"  [{DIM}]Opening note linked to {session.focus.label}...[/]")
-            
-    # Open in Editor
-    editor = os.environ.get("EDITOR", "nano")
-    with tempfile.NamedTemporaryFile(
-        mode="w+", suffix=".md",
-        prefix=f"audiobench_note_{note.id}_",
-        delete=False
-    ) as f:
-        f.write(note.body or "")
-        tmp_path = f.name
-        
-    try:
-        subprocess.run([editor, tmp_path])
-        with open(tmp_path, "r") as f:
-            new_body = f.read()
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-            
-    if new_body != note.body:
-        repo.save_body(note.id, new_body)
-        console.print(f"  [{SUCCESS}]Note #{note.id} saved. Searchable via .search[/]")
-        
-        # Post-save ambient retrieval
-        from audiobench.daemon.factory import get_daemon_client
-        daemon = get_daemon_client()
-        if daemon.is_alive() and new_body.strip():
-            console.print(f"  [{DIM}]Fetching related ideas...[/]")
-            results = daemon.search(query=new_body[-500:], top_k=5, use_bm25=False, use_dense=True, use_colbert=True)
-            if results:
-                from audiobench.storage.expression_repository import ExpressionRepository
-                expr_repo = ExpressionRepository()
-                for r in results:
-                    expr = expr_repo.get_by_id(r["expression_id"])
-                    if expr and expr.source_id != note.id:
-                        snippet = expr.content[:80].replace('\\n', ' ')
-                        console.print(f"    [{DIM}]~[/] {snippet}...")
-    else:
-        console.print(f"  [{DIM}]No changes made.[/]")
-
-
 def _resolve_capture_destination(session: ReplSession, repo) -> int:
-    """Tier 1: active note, Tier 2: context note, Tier 3: inbox"""
-    # Tier 1
-    active_id = session.navigation_stack[-1].state.get("note_id") if session.navigation_stack else None
+    """Tier 1: active note collection, Tier 2: context note collection, Tier 3: global inbox"""
+    # Tier 1: User explicitly navigated to a note collection (if supported later)
+    active_id = session.navigation_stack[-1].state.get("collection_id") if session.navigation_stack else None
     if active_id:
         return active_id
-    # Tier 2
+        
+    # Tier 2: Focus is on an audio file
     if session.focus and session.focus.type == "file":
-        note = repo.find_or_create_context_note(session.focus.id, session.focus.label)
-        return note.id
-    # Tier 3
-    inbox = repo.find_or_create_inbox()
-    return inbox.id
+        col = repo.find_or_create_collection(session.focus.id, f"Notes: {session.focus.label}")
+        return col.id
+        
+    # Tier 3: No focus, global inbox
+    col = repo.find_or_create_collection(None, "Global Inbox")
+    return col.id
 
 
 @register_backslash("capture")
 def cmd_capture(session: ReplSession, args: str) -> None:
-    """Capture a thought or expression to the current context note or inbox."""
-    from audiobench.cli.display.theme import console, ACCENT, WARNING, SUCCESS, DIM
+    """Capture a thought or expression to the current context collection or inbox."""
+    from audiobench.cli.display.theme import console, SUCCESS
     from audiobench.storage.note_repository import NoteRepository
     
     arg = args.strip()
@@ -584,7 +487,7 @@ def cmd_capture(session: ReplSession, args: str) -> None:
             return
 
     repo = NoteRepository()
-    note_id = _resolve_capture_destination(session, repo)
+    collection_id = _resolve_capture_destination(session, repo)
     
     expression_id = None
     if arg.startswith("expression:"):
@@ -597,9 +500,17 @@ def cmd_capture(session: ReplSession, args: str) -> None:
             if expr:
                 arg = f"Captured expression: {expr.content[:100]}..."
                 
-    repo.append_capture(note_id, arg, expression_id)
-    dest_note = repo.get_by_id(note_id)
-    console.print(f"  [{SUCCESS}]→ Captured to: {dest_note.title} (#note:{dest_note.id})[/]")
+    cols = repo.list_collections(limit=100)
+    target_col = next((c for c in cols if c.id == collection_id), None)
+    
+    cap = repo.create_capture(
+        collection_id=collection_id, 
+        body=arg, 
+        segment_id=None, 
+        transcript_expression_id=expression_id, 
+        collection_expression_id=target_col.expression_id if target_col else None
+    )
+    console.print(f"  [{SUCCESS}]→ Captured to: {target_col.title if target_col else 'Inbox'} (#capture:{cap.id})[/]")
 
 
 # ── Help ─────────────────────────────────────────────────────
@@ -1115,3 +1026,111 @@ def resume_config(session: ReplSession, frame) -> None:
     from audiobench.cli.repl.dispatch import dispatch_command
     dispatch_command(session, ["config", "--interactive"])
 
+
+# ── Observatory ──────────────────────────────────────────────
+
+
+@register_backslash("obs")
+def cmd_obs(session: ReplSession, args: str) -> None:
+    """Launch the Observatory live TUI. Usage: \\obs [--subsystem X] [--level L]"""
+    import shlex
+    from audiobench.observatory.db import init_journal_db
+    from audiobench.observatory.subscriber import get_subscriber
+    from audiobench.events import get_bus
+
+    init_journal_db()
+    get_bus().on("*", get_subscriber().record)
+
+    subsystem = None
+    level = None
+    try:
+        parts = shlex.split(args)
+        for i, p in enumerate(parts):
+            if p in ("--subsystem", "-s") and i + 1 < len(parts):
+                subsystem = parts[i + 1]
+            elif p in ("--level", "-l") and i + 1 < len(parts):
+                level = parts[i + 1]
+    except Exception:
+        pass
+
+    from audiobench.cli.tui.observatory_app import ObservatoryApp
+    ObservatoryApp(subsystem=subsystem, level=level).run()
+
+
+@register_backslash("logs")
+def cmd_logs(session: ReplSession, args: str) -> None:
+    r"""Print recent Observatory events. Usage: \logs [daemon|errors|--entity ID]
+
+    \b
+    Examples:
+      \logs              — last 50 events
+      \logs daemon       — subsystem=daemon
+      \logs errors       — level in WARN/ERROR/CRITICAL
+      \logs --entity 42  — entity_id=42
+      \logs --follow     — live tail mode
+    """
+    import shlex
+    from audiobench.observatory.db import init_journal_db, query_events
+
+    init_journal_db()
+
+    parts = shlex.split(args) if args.strip() else []
+
+    subsystem = None
+    level = None
+    entity_id = None
+    follow = False
+
+    if parts:
+        first = parts[0].lower()
+        if first == "daemon":
+            subsystem = "daemon"
+        elif first in ("errors", "error"):
+            level = "ERROR"
+        elif first == "--follow":
+            follow = True
+        elif first == "--entity" and len(parts) > 1:
+            try:
+                entity_id = int(parts[1])
+            except ValueError:
+                pass
+
+    if follow:
+        import time
+        console.print(f"[dim]Following Observatory events. Ctrl+C to stop.[/]\n")
+        last_id = 0
+        try:
+            while True:
+                events = query_events(
+                    subsystem=subsystem, level=level,
+                    entity_id=entity_id, id_gt=last_id, limit=50
+                )
+                for ev in events:
+                    ts = (ev.get("ts") or "")[:19]
+                    lvl = ev.get("level", "INFO")
+                    sub = ev.get("subsystem", "?")
+                    etype = ev.get("event_type", "")
+                    msg = (ev.get("message") or "")[:120]
+                    lc = {"INFO": "cyan", "WARN": "yellow", "ERROR": "red", "CRITICAL": "bold red"}.get(lvl, "white")
+                    console.print(f"[dim]{ts}[/] [{lc}]{lvl:5}[/] [bold]{sub:12}[/] {etype:30} {msg}")
+                    last_id = max(last_id, ev.get("id", 0))
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            pass
+    else:
+        events = query_events(
+            subsystem=subsystem, level=level,
+            entity_id=entity_id, limit=50
+        )
+        if not events:
+            console.print(f"[{DIM}]No events found.[/]")
+            return
+        for ev in reversed(events):
+            ts = (ev.get("ts") or "")[:19]
+            lvl = ev.get("level", "INFO")
+            sub = ev.get("subsystem", "?")
+            etype = ev.get("event_type", "")
+            msg = (ev.get("message") or "")[:120]
+            lc = {"INFO": "cyan", "WARN": "yellow", "ERROR": "red", "CRITICAL": "bold red"}.get(lvl, "white")
+            console.print(f"[dim]{ts}[/] [{lc}]{lvl:5}[/] [bold]{sub:12}[/] {etype:30} {msg}")
+        console.print(f"\n[{DIM}]{len(events)} event(s)[/]")

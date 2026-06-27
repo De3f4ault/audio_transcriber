@@ -21,7 +21,7 @@ from sqlalchemy import text
 
 from audiobench.cli.repl.session import ReplSession
 from audiobench.core.db_session import get_session
-from audiobench.storage.models import NoteRecord
+from audiobench.storage.models import NoteCollection
 
 # ── Caches (populated at session start via setup_completion) ──────────────────
 
@@ -146,22 +146,26 @@ def _load_transcript_cache(session: ReplSession) -> None:
 def _load_transition_matrix() -> None:
     global _TRANSITION_MATRIX
     try:
-        with get_session() as db:
-            result = db.execute(text("""
-                SELECT command, next_command, COUNT(*) as freq
-                FROM (
-                  SELECT command,
-                         LEAD(command) OVER (ORDER BY created_at) as next_command
-                  FROM command_events
-                  WHERE created_at > datetime('now', '-90 days')
-                )
-                WHERE next_command IS NOT NULL
+        from audiobench.observatory.db import get_journal_session
+        with get_journal_session() as conn:
+            result = conn.execute("""
+                SELECT
+                  json_extract(metadata, '$.command') as command,
+                  LEAD(json_extract(metadata, '$.command'))
+                    OVER (PARTITION BY session_id ORDER BY ts) as next_command,
+                  COUNT(*) as freq
+                FROM system_events
+                WHERE subsystem='repl'
+                  AND event_type='command_dispatched'
+                  AND ts > datetime('now', '-90 days')
                 GROUP BY command, next_command
                 ORDER BY freq DESC
-            """)).fetchall()
+            """).fetchall()
             matrix: dict[str, str] = {}
-            for cmd, next_cmd, _ in result:
-                if cmd not in matrix:
+            for row in result:
+                cmd = row[0]
+                next_cmd = row[1]
+                if cmd and next_cmd and cmd not in matrix:
                     matrix[cmd] = next_cmd
             _TRANSITION_MATRIX = matrix
     except Exception:
@@ -306,9 +310,8 @@ class AudioBenchCompleter(Completer):
             try:
                 with get_session() as db:
                     notes = (
-                        db.query(NoteRecord)
-                        .filter_by(status="active")
-                        .order_by(NoteRecord.updated_at.desc())
+                        db.query(NoteCollection)
+                        .order_by(NoteCollection.updated_at.desc())
                         .limit(20)
                         .all()
                     )

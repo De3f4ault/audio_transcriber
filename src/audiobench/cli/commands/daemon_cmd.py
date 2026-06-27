@@ -26,12 +26,26 @@ def daemon_group() -> None:
 
 @daemon_group.command(name="start")
 def start_daemon() -> None:
-    """Start the daemon in the foreground (usually fork-started by factory)."""
-    from audiobench.daemon.server import run
+    """Start the daemon in the foreground (supervised)."""
+    import audiobench.supervisor as supervisor
 
-    console.print("[dim]Starting audiobench memory daemon...[/dim]")
+    console.print("[dim]Starting supervised audiobench memory daemon...[/dim]")
     try:
-        run()
+        from audiobench.observatory.db import init_journal_db
+        from audiobench.observatory.subscriber import get_subscriber
+        from audiobench.events import get_bus
+
+        init_journal_db()
+        get_bus().on("*", get_subscriber().record)
+
+        supervisor.start("daemon")
+        from audiobench.supervisor.commands import wait_all
+        wait_all()
+    except KeyboardInterrupt:
+        console.print("[yellow]Interrupted. Shutting down...[/yellow]")
+        from audiobench.supervisor.watcher import _SHUTDOWN_EVENT
+        _SHUTDOWN_EVENT.set()
+        supervisor.stop("daemon")
     except Exception as e:
         logger.exception("Daemon crashed")
         console.print(f"[bold red]Fatal error:[/bold red] {e}")
@@ -39,44 +53,11 @@ def start_daemon() -> None:
 
 @daemon_group.command(name="stop")
 def stop_daemon() -> None:
-    """Stop the running daemon gracefully."""
-    settings = get_settings()
-    pid_path = Path(settings.daemon_pid_path)
-
-    if not pid_path.exists():
-        console.print("[yellow]Daemon is not running (no PID file found).[/yellow]")
-        return
-
-    try:
-        pid = int(pid_path.read_text().strip())
-    except Exception:
-        console.print("[red]Failed to read PID file. It may be corrupted.[/red]")
-        pid_path.unlink(missing_ok=True)
-        return
-
-    console.print(f"Sending SIGTERM to daemon (PID {pid})...")
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        console.print("[yellow]Process not found. Cleaning up stale PID file.[/yellow]")
-        pid_path.unlink(missing_ok=True)
-        return
-    except PermissionError:
-        console.print(
-            "[bold red]Permission denied. Are you the owner of the daemon process?[/bold red]"
-        )
-        return
-
-    # Wait for graceful exit
-    for _ in range(50):
-        if not pid_path.exists():
-            console.print("[bold green]Daemon stopped successfully.[/bold green]")
-            return
-        time.sleep(0.1)
-
-    console.print(
-        "[yellow]Daemon did not clean up PID file in time. It may still be shutting down.[/yellow]"
-    )
+    """Stop the running daemon gracefully via supervisor."""
+    import audiobench.supervisor as supervisor
+    console.print("Sending SIGTERM to daemon via supervisor...")
+    supervisor.stop("daemon")
+    console.print("[bold green]Stop requested.[/bold green]")
 
 
 @daemon_group.command(name="status")
@@ -88,8 +69,25 @@ def daemon_status() -> None:
     with console.status("Pinging daemon..."):
         if not client.ping():
             console.print("[yellow]Daemon is not running or socket is unreachable.[/yellow]")
-            if Path(settings.daemon_pid_path).exists():
-                console.print("[dim]Note: PID file exists but daemon is dead (stale).[/dim]")
+            try:
+                from audiobench.supervisor.registry import get_process
+                import psutil
+                p = get_process("daemon")
+                if p:
+                    state = p["state"].lower()
+                    if state == "fatal":
+                        console.print(f"[bold red]Supervisor reports daemon is in FATAL state (restarts exhausted).[/bold red]")
+                    elif state == "backoff":
+                        console.print(f"[bold yellow]Supervisor reports daemon is in BACKOFF (restarting shortly).[/bold yellow]")
+                    elif state == "stopped":
+                        console.print(f"[dim]Supervisor reports daemon is gracefully STOPPED.[/dim]")
+                    elif state == "running":
+                        if p["pid"] and not psutil.pid_exists(p["pid"]):
+                            console.print(f"[bold red]Supervisor reports RUNNING but PID {p['pid']} is dead (STALE state).[/bold red]")
+                        else:
+                            console.print(f"[bold red]Supervisor reports RUNNING but socket ping failed.[/bold red]")
+            except ImportError:
+                pass
             return
 
     try:

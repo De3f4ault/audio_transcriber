@@ -240,14 +240,16 @@ def _resolve_provenance(expr) -> dict:
                         info["file_name"] = af.file_name
                         info["audio_file_id"] = af.id
 
-            # Journal entry (note)
+            # Journal entry (note capture)
             elif source_type == "journal_entry":
                 if source_id:
-                    from audiobench.storage.models import NoteRecord
-                    note = s.query(NoteRecord).filter_by(id=source_id).first()
-                    if note:
-                        info["note_title"] = note.title
-                        info["note_id"] = note.id
+                    from audiobench.storage.models import NoteCapture, NoteCollection
+                    cap = s.query(NoteCapture).filter_by(id=source_id).first()
+                    if cap:
+                        col = s.query(NoteCollection).filter_by(id=cap.collection_id).first()
+                        if col:
+                            info["note_title"] = col.title
+                        info["note_id"] = cap.id
 
     except Exception:
         pass
@@ -309,7 +311,6 @@ def _action_menu(
         ("v", "View full content"),
         ("g", "Show graph context (parent, relations, inferences)"),
         ("f", "Focus source file in REPL") if prov.get("audio_file_id") else None,
-        ("e", "Edit note in $EDITOR") if expr.source_type == "journal_entry" else None,
         ("n", "Capture to active/context note"),
         ("a", "Use as context for .ask synthesis"),
         ("s", "Show surrounding expressions"),
@@ -355,11 +356,7 @@ def _action_menu(
             _chain_to_ask(session, expr)
             return
 
-        elif choice == "e" and expr.source_type == "journal_entry":
-            if prov.get("note_id"):
-                from audiobench.cli.repl.backslash_commands import cmd_note
-                cmd_note(session, str(prov["note_id"]))
-                return
+
 
         elif choice == "n":
             from audiobench.cli.repl.backslash_commands import cmd_capture

@@ -247,6 +247,10 @@ def repl(transcript_id: int | None) -> None:
 
     print_banner(session)
 
+    from audiobench.cli.repl.dispatch import SESSION_ID
+    from audiobench.observatory.context import log_event
+    log_event(subsystem="repl", event_type="session_started", message="REPL session started", level="INFO", session_id=SESSION_ID)
+
     # Pre-load context if transcript ID given
     if transcript_id is not None:
         session.set_context(transcript_id)
@@ -273,6 +277,7 @@ def repl(transcript_id: int | None) -> None:
             user_input = prompt_session.prompt(session.prompt).strip()
         except (EOFError, KeyboardInterrupt):
             console.print()
+            log_event(subsystem="repl", event_type="session_ended", message="REPL session ended", level="INFO", session_id=SESSION_ID)
             print_goodbye(session)
             break
 
@@ -286,6 +291,7 @@ def repl(transcript_id: int | None) -> None:
                 for seg in segments:
                     should_exit = _dispatch_single(session, seg)
                     if should_exit:
+                        log_event(subsystem="repl", event_type="session_ended", message="REPL session ended", level="INFO", session_id=SESSION_ID)
                         print_goodbye(session)
                         return  # exit REPL from within a chain
                 continue
@@ -293,5 +299,6 @@ def repl(transcript_id: int | None) -> None:
         # Single command — full dispatch
         should_exit = _dispatch_single(session, user_input)
         if should_exit:
+            log_event(subsystem="repl", event_type="session_ended", message="REPL session ended", level="INFO", session_id=SESSION_ID)
             print_goodbye(session)
             break

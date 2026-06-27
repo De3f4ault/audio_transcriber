@@ -68,6 +68,13 @@ def cli(ctx: click.Context, verbose: bool, debug: bool, json_mode: bool) -> None
     else:
         log_level = "WARNING"
     setup_logging(log_level)
+    from audiobench.observatory.db import init_journal_db
+    from audiobench.observatory.subscriber import get_subscriber
+    from audiobench.events import get_bus
+    
+    init_journal_db()
+    get_bus().on("*", get_subscriber().record)
+    
     ctx.ensure_object(dict)
     ctx.obj["json_mode"] = json_mode
 
