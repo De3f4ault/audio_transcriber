@@ -214,3 +214,38 @@ class DaemonClient:
         if hyde_document:
             args["hyde_document"] = hyde_document
         self._send("write_cache", args)
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a query string using the daemon's warm Nomic model.
+
+        Returns a 768-dimensional float vector. Using the daemon means the
+        model stays resident in memory between calls rather than cold-loading
+        in the CLI process on every invocation.
+        """
+        data = self._send("embed_query", {"text": text})
+        return list(data["vector"])
+
+    def embed_segment(
+        self,
+        segment_id: int,
+        text: str,
+        start_time: float,
+        end_time: float,
+        source_file: str,
+    ) -> None:
+        """Embed a single audio segment and write it to the segment_vectors LanceDB table.
+
+        The daemon generates the vector using its warm Nomic model, then writes
+        the SegmentVectorNode record. Idempotent — safe to call multiple times
+        for the same segment_id.
+        """
+        self._send(
+            "embed_segment",
+            {
+                "segment_id": segment_id,
+                "text": text,
+                "start_time": start_time,
+                "end_time": end_time,
+                "source_file": source_file,
+            },
+        )

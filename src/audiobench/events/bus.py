@@ -86,7 +86,7 @@ class EventBus:
         """
         with self._lock:
             handlers = list(self._handlers.get(event, []))
-            handlers += [h for h in self._handlers.get("*", []) if h not in handlers]
+            wildcards = [h for h in self._handlers.get("*", []) if h not in handlers]
 
         for fn in handlers:
             try:
@@ -97,6 +97,22 @@ class EventBus:
                     getattr(fn, "__qualname__", repr(fn)),
                     event,
                 )
+
+        if wildcards:
+            wildcard_payload = {
+                "subsystem": "events",
+                "event_type": event,
+                "metadata": payload,
+            }
+            for fn in wildcards:
+                try:
+                    fn(**wildcard_payload)
+                except Exception:
+                    logger.exception(
+                        "EventBus: wildcard handler %r raised for event %r",
+                        getattr(fn, "__qualname__", repr(fn)),
+                        event,
+                    )
 
     def subscribe(self, event: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator to register a method/function as a subscriber.

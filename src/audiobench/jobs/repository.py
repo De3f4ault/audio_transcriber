@@ -62,6 +62,26 @@ class JobRepository:
             cursor.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             return cursor.fetchone()
 
+    def cancel_job(self, job_id: int) -> None:
+        job = self.get_job(job_id)
+        if not job:
+            return
+        
+        pid = job.get("pid")
+        if pid:
+            import os
+            import signal
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+                
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = 'failed', ended_at = CURRENT_TIMESTAMP, exit_code = -1 WHERE id = ?",
+                (job_id,),
+            )
+
     def get_all_jobs(self, limit: int = 50) -> list[dict]:
         with self._get_conn() as conn:
             cursor = conn.cursor()

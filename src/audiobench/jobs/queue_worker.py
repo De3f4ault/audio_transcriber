@@ -89,6 +89,13 @@ def _spawn_daemon():
 
 def process_queue(foreground: bool = False):
     """Main worker loop. Runs sequentially until the queue is empty."""
+    from audiobench.observatory.db import init_journal_db
+    from audiobench.observatory.subscriber import get_subscriber
+    from audiobench.events import get_bus
+
+    init_journal_db()
+    get_bus().on("*", get_subscriber().record)
+
     settings = get_settings()
     lock_path = Path(settings.data_dir) / "worker.lock"
 
@@ -158,7 +165,7 @@ def process_queue(foreground: bool = False):
                     result = subprocess.run(cmd)
 
                 with get_session() as session:
-                    item = session.query(JobQueueItem).get(item_id)
+                    item = session.get(JobQueueItem, item_id)
                     if result.returncode == 0:
                         item.status = "done"
                     else:

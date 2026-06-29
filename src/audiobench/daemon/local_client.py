@@ -123,3 +123,14 @@ class LocalRetrievalClient:
     def write_cache(self, query: str, answer: str, hyde_document: str | None = None) -> None:
         """Write to semantic cache locally."""
         self._get_cache().write_cache(query, answer, hyde_document)
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a query string using the daemon's warm Nomic model."""
+        from audiobench.memory.singletons import get_primary_embedder, get_primary_inference_lock
+
+        self._get_store()  # Ensure models are loaded
+        text = str(text)[:12_000]
+        prefixed = f"search_query: {text}"
+        model = get_primary_embedder()
+        with get_primary_inference_lock():
+            return model.encode(prefixed).tolist()

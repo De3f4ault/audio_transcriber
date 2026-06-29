@@ -59,4 +59,12 @@ def test_daemon_search_contract() -> None:
         assert len(resp["data"]["results"]) == 1
         assert resp["data"]["results"][0]["expression_id"] == 1
 
-        mock_store.search.assert_called_once_with(query="hello world", top_k=3, speaker_filter=None)
+        mock_store.search.assert_called_once_with(
+            query="hello world",
+            top_k=3,
+            speaker_filter=None,
+            hyde_document=None,
+            use_bm25=True,
+            use_dense=True,
+            use_colbert=True,
+        )

@@ -90,6 +90,18 @@ def _fork_daemon(socket_path: Path) -> bool:
         return False
 
 
+
+# Timestamp (monotonic) at which we last successfully forked a daemon process.
+# ``None`` means we have never tried to start one this session.
+_daemon_forked_at: float | None = None
+
+# After a recent fork, poll for up to this many seconds before giving up.
+_DAEMON_FORK_WAIT = _FAST_PATH_TIMEOUT  # 180 s — same value as before
+
+# When no fork is pending, do a short grace-period to catch an already-running daemon.
+_DAEMON_QUICK_WAIT = 2.0
+
+
 def ensure_daemon_running() -> None:
     """Ensure the daemon is running, starting it in the background if needed.
 
@@ -99,6 +111,8 @@ def ensure_daemon_running() -> None:
 
     Safe to call repeatedly — no-ops if the daemon is already alive.
     """
+    global _daemon_forked_at
+
     settings = get_settings()
     if settings.disable_memory:
         return
@@ -113,20 +127,27 @@ def ensure_daemon_running() -> None:
         _clean_stale_socket(socket_path)
 
     logger.info("Daemon not running — forking in background...")
-    _fork_daemon(socket_path)
+    if _fork_daemon(socket_path):
+        _daemon_forked_at = time.monotonic()
 
 
 def get_daemon_client() -> RetrievalClient:
     """Return a connected DaemonClient, or fall back to LocalRetrievalClient.
 
     Checks whether the daemon is alive.  If it was recently started via
-    ensure_daemon_running(), waits up to _FAST_PATH_TIMEOUT seconds for it
+    ensure_daemon_running(), waits up to _DAEMON_FORK_WAIT seconds for it
     to become ready (models usually load within 3-8 s on warm hardware).
+    If no fork is pending, only waits _DAEMON_QUICK_WAIT seconds so that
+    DenseStream / ColBERTStream calls don't block for 3 minutes when the
+    daemon was never started.
     If it never comes up, falls back to the in-process client silently.
     """
     settings = get_settings()
     if settings.disable_memory:
-        raise RuntimeError("Semantic memory is disabled (AUDIOBENCH_DISABLE_MEMORY is set). Cannot get daemon client.")
+        raise RuntimeError(
+            "Semantic memory is disabled (AUDIOBENCH_DISABLE_MEMORY is set). "
+            "Cannot get daemon client."
+        )
 
     socket_path = Path(settings.daemon_socket_path)
 
@@ -137,22 +158,29 @@ def get_daemon_client() -> RetrievalClient:
     if socket_path.exists():
         _clean_stale_socket(socket_path)
 
-    # 2. Was the daemon recently forked (e.g. by ensure_daemon_running at
-    #    REPL startup)? Give it a short window to finish loading.
-    start_t = time.time()
+    # 2. Decide how long to wait:
+    #    • If we forked a daemon during this session → wait the full timeout.
+    #    • Otherwise → short grace period so we don't freeze for 3 minutes.
+    now = time.monotonic()
+    if _daemon_forked_at is not None and (now - _daemon_forked_at) < _DAEMON_FORK_WAIT:
+        poll_deadline = _daemon_forked_at + _DAEMON_FORK_WAIT
+        timeout_used = _DAEMON_FORK_WAIT
+    else:
+        poll_deadline = now + _DAEMON_QUICK_WAIT
+        timeout_used = _DAEMON_QUICK_WAIT
+
     client = DaemonClient(socket_path)
-    while time.time() - start_t < _FAST_PATH_TIMEOUT:
+    while time.monotonic() < poll_deadline:
         if client.ping():
-            logger.info("Daemon became ready after %.1fs", time.time() - start_t)
+            logger.info("Daemon became ready after %.1fs", time.monotonic() - now)
             return client
         time.sleep(0.25)
 
     # 3. Not up yet — fall back to local in-process models.
-    #    The daemon may still be loading in the background; future calls to
-    #    get_daemon_client() will pick it up once it's ready.
     logger.warning(
         "Daemon not ready within %.1fs — using local in-process client. "
         "Run `audiobench daemon start` for persistent background service.",
-        _FAST_PATH_TIMEOUT,
+        timeout_used,
     )
     return LocalRetrievalClient()
+

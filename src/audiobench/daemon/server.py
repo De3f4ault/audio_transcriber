@@ -21,8 +21,8 @@ from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
 from audiobench.daemon.protocol import DaemonRequest, DaemonResponse
 from audiobench.memory.chunking import content_aware_router
-from audiobench.memory.memory_store import MemoryStore
-from audiobench.memory.singletons import get_reranker, pre_warm_retrieval_pipeline
+from audiobench.memory.memory_store import MemoryStore, SegmentVectorStore
+from audiobench.memory.singletons import get_primary_embedder, get_reranker, pre_warm_retrieval_pipeline
 from audiobench.storage.models import TranscriptionRecord
 
 logger = get_logger("daemon.server")
@@ -30,6 +30,8 @@ logger = get_logger("daemon.server")
 # Module-level state (lives for the lifetime of the daemon process)
 _start_time: float = 0.0
 _memory_store: MemoryStore | None = None
+_segment_store: SegmentVectorStore | None = None
+_sweep_state = None  # audiobench.daemon.sweep_state.SweepState — loaded lazily
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +44,13 @@ def _get_store() -> MemoryStore:
     if _memory_store is None:
         raise RuntimeError("MemoryStore not initialised — was pre_warm called?")
     return _memory_store
+
+
+def _get_segment_store() -> SegmentVectorStore:
+    """Get the module-level SegmentVectorStore instance (must have been initialised)."""
+    if _segment_store is None:
+        raise RuntimeError("SegmentVectorStore not initialised — was pre_warm called?")
+    return _segment_store
 
 
 def _handle_ping(args: dict[str, Any]) -> dict[str, Any]:
@@ -130,20 +139,79 @@ def _handle_chunk(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_rerank(args: dict[str, Any]) -> dict[str, Any]:
-    """Rerank search results using the CrossEncoder."""
-    query = str(args["query"])
+    """Rerank search results using the CrossEncoder.
+
+    Inputs are truncated before forming pairs to prevent tensor size mismatches.
+    CrossEncoders (ms-marco-MiniLM series) have a 512-token limit for the
+    concatenated [CLS] query [SEP] doc [SEP] input. Long HyDE documents or
+    long segment texts can exceed this, causing a RuntimeError.
+
+    Conservative limits: query ≤ 512 chars, doc ≤ 1024 chars — well within
+    the 512-token window even at average token density of ~4 chars/token.
+    """
+    query = str(args["query"])[:512]
     docs = args.get("docs", [])
 
     if not docs:
         return {"scores": []}
 
+    # Truncate each document to prevent tensor mismatch
+    truncated_docs = [str(d)[:1024] for d in docs]
+
     reranker = get_reranker()
-    pairs = [(query, doc) for doc in docs]
+    pairs = [(query, doc) for doc in truncated_docs]
 
     # predict returns a numpy array, must convert to list
     scores = reranker.predict(pairs).tolist()
 
     return {"scores": scores}
+
+
+def _handle_embed_query(args: dict[str, Any]) -> dict[str, Any]:
+    """Embed a query string using the daemon's warm Nomic model.
+
+    Returns a 768-dim vector. The caller (DenseStream/ColBERTStream) uses this
+    vector for ANN search rather than cold-loading the model in the CLI process.
+    """
+    from audiobench.memory.singletons import get_primary_inference_lock
+
+    text = str(args["text"])[:12_000]  # bound token count
+    prefixed = f"search_query: {text}"
+    model = get_primary_embedder()
+    with get_primary_inference_lock():
+        vector = model.encode(prefixed).tolist()
+    return {"vector": vector}
+
+
+def _handle_embed_segment(args: dict[str, Any]) -> dict[str, Any]:
+    """Embed a single audio segment and write it to the segment_vectors table.
+
+    Generates the vector using the warm Nomic model, then delegates the
+    upsert to SegmentVectorStore.upsert_segment_with_vector so the table
+    write and the embedding happen in the same daemon process.
+    """
+    from audiobench.memory.singletons import get_primary_inference_lock
+
+    segment_id = int(args["segment_id"])
+    text = str(args["text"])[:12_000]  # bound token count
+    start_time = float(args["start_time"])
+    end_time = float(args["end_time"])
+    source_file = str(args["source_file"])
+
+    prefixed = f"search_document: {text}"
+    model = get_primary_embedder()
+    with get_primary_inference_lock():
+        vector = model.encode(prefixed).tolist()
+
+    _get_segment_store().upsert_segment_with_vector(
+        segment_id=segment_id,
+        text=text,
+        start_time=start_time,
+        end_time=end_time,
+        source_file=source_file,
+        vector=vector,
+    )
+    return {"embedded": True}
 
 
 def _handle_check_cache(args: dict[str, Any]) -> dict[str, Any]:
@@ -185,6 +253,8 @@ _HANDLERS: dict[str, Any] = {
     "rerank": _handle_rerank,
     "check_cache": _handle_check_cache,
     "write_cache": _handle_write_cache,
+    "embed_query": _handle_embed_query,
+    "embed_segment": _handle_embed_segment,
 }
 
 
@@ -268,77 +338,208 @@ def _cleanup(socket_path: Path, pid_path: Path) -> None:
     logger.info("Cleanup complete")
 
 
-def _rag_consistency_sweep_sync():
-    """Background task to sync transcripts that were not indexed to the vector db."""
-    try:
-        # Wait a bit before starting the sweep to allow the daemon to fully initialize
-        # and respond to the client's 'status' pings.
-        time.sleep(10)
+def _do_sweep_once() -> None:
+    """Perform one pass of the RAG consistency sweep (called from the loop)."""
+    from audiobench.daemon.sweep_state import get_sweep_state
+    from audiobench.memory.enums import SourceType
+    from audiobench.storage.expression_repository import ExpressionRepository
+    from sqlalchemy import text as sql_text
 
-        logger.info("Starting background RAG consistency sweep...")
+    state = get_sweep_state()
+
+    # ── Pick up any new work added since last tick ─────────────────────────
+    _refresh_sweep_state_incremental(state)
+
+    # ── Expression sweep (transcript deque → expression chunks → LanceDB) ──
+    tx_ids = state.pop_transcript_batch(size=20)
+    if not tx_ids:
+        logger.info("RAG sweep: all transcripts indexed (deque empty).")
+    else:
+        logger.info("RAG sweep: indexing %d transcripts from deque...", len(tx_ids))
+        expr_repo = ExpressionRepository()
+        success_ids: list[int] = []
+        failed_ids: list[int] = []
+
         with get_session() as session:
-            unindexed = (
-                session.query(TranscriptionRecord).filter(TranscriptionRecord.is_indexed == 0).all()
+            transcripts = (
+                session.query(TranscriptionRecord)
+                .filter(TranscriptionRecord.id.in_(tx_ids))
+                .all()
             )
-
-            if not unindexed:
-                logger.info("RAG consistency sweep: All transcripts are indexed.")
-                return
-
-            logger.info(
-                f"RAG consistency sweep: Found {len(unindexed)} unindexed transcripts. Indexing..."
-            )
-
-            from audiobench.memory.enums import SourceType
-            from audiobench.storage.expression_repository import ExpressionRepository
-
-            expr_repo = ExpressionRepository()
-
-            success_count = 0
-            for transcript in unindexed:
+            for transcript in transcripts:
                 try:
                     text = transcript.full_text or ""
                     if not text.strip():
                         transcript.is_indexed = 1
+                        success_ids.append(transcript.id)
                         continue
 
-                    # Semantic chunking
                     chunks = content_aware_router(text)
-                    for chunk in chunks:
-                        # Register in SQLite (which deduplicates via content_hash)
-                        expr = expr_repo.register(
-                            content=chunk.content,
-                            source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                            source_id=transcript.id,
-                            speaker=chunk.speaker,
+                    if chunks:
+                        chunk_items = [
+                            {
+                                "content": chunk.content,
+                                "source_type": SourceType.AUDIO_TRANSCRIPT.value,
+                                "source_id": transcript.id,
+                                "speaker": chunk.speaker,
+                            }
+                            for chunk in chunks
+                        ]
+                        # O(1) dedup — no SQL IN() query for known hashes
+                        registered = expr_repo.register_batch(
+                            chunk_items,
+                            known_hashes=state.known_hashes,
                         )
-                        # Embed in LanceDB
-                        _get_store().write_node(
-                            expression_id=expr.id,
-                            content=expr.content,
-                            source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                            speaker=chunk.speaker,
+                        # Batch embed + write — one model forward-pass per transcript
+                        nodes = [
+                            {
+                                "expression_id": expr.id,
+                                "content": expr.content,
+                                "source_type": SourceType.AUDIO_TRANSCRIPT.value,
+                                "speaker": expr.speaker,
+                            }
+                            for expr in registered
+                        ]
+                        _get_store().batch_write_nodes(
+                            nodes,
+                            indexed_ids=state.indexed_expression_ids,
                         )
 
                     transcript.is_indexed = 1
-                    success_count += 1
-
-                    # Prevent locking LanceDB entirely
-                    time.sleep(0.5)
+                    success_ids.append(transcript.id)
                 except Exception as e:
-                    logger.error(f"Failed to index transcript {transcript.id}: {e}")
+                    logger.error(
+                        "RAG sweep: failed to index transcript %d: %s",
+                        transcript.id, e,
+                    )
+                    failed_ids.append(transcript.id)
 
             session.commit()
-            logger.info(
-                f"RAG consistency sweep: Successfully indexed {success_count}/{len(unindexed)} transcripts."
-            )
-    except Exception as e:
-        logger.error(f"RAG consistency sweep failed: {e}")
+
+        logger.info(
+            "RAG sweep: indexed %d transcripts (%d failed).",
+            len(success_ids), len(failed_ids),
+        )
+        if failed_ids:
+            state.requeue_transcripts(failed_ids)
+
+    # ── Segment sweep (segment deque → batch embed → LanceDB + SQLite) ─────
+    seg_ids = state.pop_segment_batch(size=256)
+    if not seg_ids:
+        logger.info("RAG sweep: all segments vectorized (deque empty).")
+    else:
+        logger.info("RAG sweep: vectorizing %d segments from deque...", len(seg_ids))
+        with get_session() as session:
+            placeholders = ", ".join(str(i) for i in seg_ids)
+            rows = session.execute(
+                sql_text(
+                    f"SELECT s.id, s.text, s.start_time, s.end_time, af.file_path "
+                    f"FROM segments s "
+                    f"JOIN transcriptions t ON s.transcription_id = t.id "
+                    f"JOIN audio_files af ON t.audio_file_id = af.id "
+                    f"WHERE s.id IN ({placeholders})"
+                )
+            ).mappings().all()
+            rows = list(rows)
+
+        if rows:
+            from audiobench.memory.singletons import get_primary_inference_lock
+            seg_store = _get_segment_store()
+            model = get_primary_embedder()
+            try:
+                texts = [f"search_document: {r['text'][:12_000]}" for r in rows]
+                with get_primary_inference_lock():
+                    vectors = model.encode(
+                        texts, batch_size=64, show_progress_bar=False,
+                        sort_by_length=True,
+                    ).tolist()
+                seg_store.batch_upsert_segments(
+                    rows=[dict(r) for r in rows], vectors=vectors
+                )
+                done_ids = [int(r["id"]) for r in rows]
+                with get_session() as upd:
+                    id_list = ", ".join(str(i) for i in done_ids)
+                    upd.execute(
+                        sql_text(
+                            f"UPDATE segments SET vector_indexed=1 WHERE id IN ({id_list})"
+                        )
+                    )
+                    upd.commit()
+                logger.info(
+                    "RAG sweep: vectorized %d segments in one batch.", len(rows)
+                )
+            except Exception as seg_exc:
+                logger.error(
+                    "RAG sweep: failed to batch vectorize segments: %s", seg_exc
+                )
+                state.requeue_segments(seg_ids)
+
+
+def _refresh_sweep_state_incremental(state) -> None:
+    """Pick up any transcripts or segments added since the last sweep tick.
+
+    Only queries for IDs **not already in the deques** by comparing the
+    current DB un-indexed set against the tail of the deque.  This avoids
+    re-queuing duplicates after restarts while still catching new work.
+    """
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session as _gs
+
+    try:
+        with _gs() as session:
+            # New un-indexed transcripts
+            new_tx = session.execute(
+                sql_text("SELECT id FROM transcriptions WHERE is_indexed=0 ORDER BY id")
+            ).scalars().all()
+            queued_tx = set(state.unindexed_transcript_ids)
+            fresh_tx = [i for i in new_tx if i not in queued_tx]
+            if fresh_tx:
+                state.push_transcripts(fresh_tx)
+                logger.debug(
+                    "SweepState refresh: +%d new transcript IDs", len(fresh_tx)
+                )
+
+            # New un-vectorized segments
+            new_seg = session.execute(
+                sql_text(
+                    "SELECT id FROM segments WHERE vector_indexed=0 ORDER BY id"
+                )
+            ).scalars().all()
+            queued_seg = set(state.pending_segment_ids)
+            fresh_seg = [i for i in new_seg if i not in queued_seg]
+            if fresh_seg:
+                state.push_segments(fresh_seg)
+                logger.debug(
+                    "SweepState refresh: +%d new segment IDs", len(fresh_seg)
+                )
+    except Exception as exc:
+        logger.warning("SweepState incremental refresh failed: %s", exc)
+
+
+def _rag_consistency_sweep_sync() -> None:
+    """Periodic background worker — runs forever, sweeping every 5 minutes.
+
+    The first pass starts after a 10-second warm-up delay so the daemon can
+    finish initialisation and start accepting client connections before any
+    heavy embedding work begins.
+    """
+    SWEEP_INTERVAL_SECONDS = 300  # 5 minutes
+
+    # Initial delay — let the daemon become ready first.
+    time.sleep(10)
+
+    while True:
+        try:
+            _do_sweep_once()
+        except Exception as exc:
+            logger.error("RAG sweep loop: unexpected error: %s", exc)
+        logger.info("RAG sweep: sleeping %ds until next pass.", SWEEP_INTERVAL_SECONDS)
+        time.sleep(SWEEP_INTERVAL_SECONDS)
 
 
 async def _serve(socket_path: Path, pid_path: Path) -> None:
     """Start the Unix socket server and serve until SIGTERM/SIGINT."""
-    global _start_time, _memory_store
+    global _start_time, _memory_store, _segment_store, _sweep_state
 
     # Remove stale socket from previous crash
     socket_path.unlink(missing_ok=True)
@@ -346,11 +547,31 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     # --- warm models BEFORE writing PID file so the client waits properly ---
     logger.info("Pre-warming retrieval pipeline...")
     await asyncio.get_running_loop().run_in_executor(None, pre_warm_retrieval_pipeline)
-    logger.info("Models warm. Initialising MemoryStore...")
+    logger.info("Models warm. Initialising stores...")
     _memory_store = await asyncio.get_running_loop().run_in_executor(None, MemoryStore)
+    _segment_store = await asyncio.get_running_loop().run_in_executor(None, SegmentVectorStore)
+    logger.info("SegmentVectorStore ready (%d segments embedded).", _segment_store.count_embedded())
+
+    # --- Initialise the in-memory O(1) sweep state -------------------------
+    from audiobench.daemon.sweep_state import init_sweep_state
+
+    _sweep_state = init_sweep_state()
+    await asyncio.get_running_loop().run_in_executor(None, _sweep_state.load_from_db)
+    await asyncio.get_running_loop().run_in_executor(
+        None, _sweep_state.sync_indexed_expression_ids
+    )
+    logger.info(
+        "SweepState ready — %d known hashes | %d LanceDB expr IDs | "
+        "%d pending segments | %d unindexed transcripts",
+        len(_sweep_state.known_hashes),
+        len(_sweep_state.indexed_expression_ids),
+        _sweep_state.pending_segment_count(),
+        _sweep_state.unindexed_transcript_count(),
+    )
 
     _start_time = time.time()
     _write_pid_file(pid_path)
+
 
     server = await asyncio.start_unix_server(
         _handle_connection, 
@@ -359,9 +580,15 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     )
     logger.info("Daemon listening on %s (pid=%d)", socket_path, os.getpid())
 
-    # Start background RAG sync task
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _rag_consistency_sweep_sync)
+    # Start background RAG sync loop — runs in a daemon thread, sweeping every 5 min.
+    import threading
+    sweep_thread = threading.Thread(
+        target=_rag_consistency_sweep_sync,
+        name="rag-sweep",
+        daemon=True,  # killed automatically when the main process exits
+    )
+    sweep_thread.start()
+    logger.info("RAG sweep thread started (interval=300s).")
 
     # Set permissions so any user can connect (adjust to 0o600 for single-user)
     socket_path.chmod(0o666)
@@ -386,8 +613,23 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
 
 def run() -> None:
     """Entry point — start the daemon (blocks until SIGTERM/SIGINT)."""
+    from audiobench.core.logger_factory import setup_logging
+    setup_logging("DEBUG")
+    
+    import os
+    os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 4))
+    os.environ.setdefault("MKL_NUM_THREADS", str(os.cpu_count() or 4))
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    
     settings = get_settings()
     socket_path = Path(settings.daemon_socket_path)
     pid_path = Path(settings.daemon_pid_path)
+
+    from audiobench.observatory.db import init_journal_db
+    from audiobench.observatory.subscriber import get_subscriber
+    from audiobench.events import get_bus
+
+    init_journal_db()
+    get_bus().on("*", get_subscriber().record)
 
     asyncio.run(_serve(socket_path, pid_path))

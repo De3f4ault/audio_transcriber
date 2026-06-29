@@ -20,13 +20,10 @@ def test_factory_returns_daemon_if_alive(mock_exists: MagicMock, mock_is_alive: 
         assert client is mock_client
 
 
-@patch("audiobench.daemon.factory._start_daemon")
-@patch("audiobench.daemon.factory.Path.exists")
-def test_factory_fallback_on_start_failure(mock_exists: MagicMock, mock_start: MagicMock) -> None:
-    """If the socket is dead and auto-start fails, return LocalRetrievalClient."""
-    mock_exists.return_value = False
-    mock_start.return_value = False  # Auto-start failed / timed out
-
+@patch("audiobench.daemon.factory._is_socket_alive", return_value=False)
+@patch("audiobench.daemon.factory._FAST_PATH_TIMEOUT", new=0)  # skip polling loop
+def test_factory_fallback_on_start_failure(mock_alive: MagicMock) -> None:
+    """If the socket never comes up, get_daemon_client falls back to LocalRetrievalClient."""
     with patch("audiobench.daemon.factory.LocalRetrievalClient") as mock_local_cls:
         mock_local = MagicMock(spec=LocalRetrievalClient)
         mock_local_cls.return_value = mock_local
