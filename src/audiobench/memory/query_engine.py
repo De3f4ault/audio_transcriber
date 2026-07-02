@@ -14,7 +14,7 @@ Engineering standards applied (EQ-1 through EQ-4):
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,13 +25,14 @@ from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
 from audiobench.daemon.factory import get_daemon_client
 from audiobench.memory.enums import SourceType
-from audiobench.memory.rrf_fusion import FusedResult, rrf_merge
+from audiobench.memory.rrf_fusion import FusedResult, _temporal_dedup, rrf_merge
 from audiobench.memory.retrieval_streams import ColBERTStream, DenseStream, FTS5Stream
 from audiobench.storage.expression_repository import ExpressionRepository
 from audiobench.storage.models import BookmarkRecord
 
 logger = get_logger("memory.query")
 
+_search_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="search_stream")
 
 # ── Result types (EQ-3) ───────────────────────────────────────────────────────
 
@@ -425,6 +426,7 @@ class ResearchResult:
     streams_skipped: list[str] = field(default_factory=list)
     # True when HyDE was requested but fell back to direct query embedding
     hyde_fallback: bool = False
+    hyde_document: str | None = None
 
 
 class ResearchEngine:
@@ -438,9 +440,16 @@ class ResearchEngine:
     state between threads.
     """
 
-    _STREAM_TIMEOUT: float = 5.0  # seconds; streams that exceed this are skipped
+    _STREAM_TIMEOUT: float = 15.0  # seconds; streams that exceed this are skipped
 
-    def search(self, query: str, top_k: int = 10, preset: str = "balanced") -> ResearchResult:
+    def search(
+        self, 
+        query: str, 
+        top_k: int = 10, 
+        preset: str = "balanced",
+        mmr_lambda: float = 0.5,
+        focus_source: str | None = None,
+    ) -> ResearchResult:
         """Run all three streams in parallel, fuse via RRF, synthesise, return results.
 
         Preset flags:
@@ -458,13 +467,23 @@ class ResearchEngine:
         trace_id = start_trace()  # noqa: F841  — sets ContextVar for log_event
         t0 = time.perf_counter()
 
-        # ── Preset → stream flags ─────────────────────────────────────────────
+        # ── Preset → stream flags ──────────────────────────────────────────────
+        use_mmr = False
+        mmr_lam = 0.5
         if preset == "fast":
             use_colbert = False
             use_hyde = False
         elif preset == "deep":
             use_colbert = True
             use_hyde = True
+        elif preset == "synthesis":
+            # MMR diversifies the tail. We run ColBERT but restrict it internally
+            # to only return top 5, anchoring the highly relevant head in RRF 
+            # without destroying MMR diversity in the tail.
+            use_colbert = True
+            use_hyde = False
+            use_mmr = True
+            mmr_lam = 0.5
         else:  # balanced (default)
             use_colbert = True
             use_hyde = False
@@ -525,56 +544,78 @@ class ResearchEngine:
         colbert_hits: list = []
 
         # ── Stage 2: Parallel stream retrieval ───────────────────────────────
+        dense_extra: dict = {"preset": preset, "mmr_lambda": mmr_lambda, "focus_source": focus_source} if use_mmr else {"focus_source": focus_source}
+        fts_extra: dict = {"focus_source": focus_source}
+        
         stream_tasks: dict[str, tuple] = {
-            "fts5":  (FTS5Stream(),    fts_hits),
-            "dense": (DenseStream(),   dense_hits),
+            "fts5":  (FTS5Stream(),    fts_hits,    fts_extra),
+            "dense": (DenseStream(),   dense_hits,  dense_extra),
         }
         if use_colbert:
-            stream_tasks["colbert"] = (ColBERTStream(), colbert_hits)
+            stream_tasks["colbert"] = (ColBERTStream(), colbert_hits, {"preset": preset})
 
         stream_timings: dict[str, float] = {}
         streams_skipped: list[str] = []
 
-        def _timed_retrieve(name: str, stream: object, bucket: list) -> None:
+        def _timed_retrieve(name: str, stream: object, bucket: list, extra: dict) -> None:
             t_s = time.perf_counter()
-            hits = stream.retrieve(rq, top_k)  # type: ignore[attr-defined]
+            if extra:
+                hits = stream.retrieve(rq, top_k, **extra)  # type: ignore[attr-defined]
+            else:
+                hits = stream.retrieve(rq, top_k)  # type: ignore[attr-defined]
             elapsed_ms = (time.perf_counter() - t_s) * 1000
             bucket.extend(hits)
             stream_timings[name] = elapsed_ms
 
         import contextvars
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            future_to_name = {
-                pool.submit(contextvars.copy_context().run, _timed_retrieve, name, stream, bucket): name
-                for name, (stream, bucket) in stream_tasks.items()
-            }
+        future_to_name = {
+            _search_pool.submit(
+                contextvars.copy_context().run,
+                _timed_retrieve, name, stream, bucket, extra,
+            ): name
+            for name, (stream, bucket, extra) in stream_tasks.items()
+        }
 
-            for future in as_completed(future_to_name, timeout=self._STREAM_TIMEOUT * 2):
-                name = future_to_name[future]
-                try:
-                    future.result(timeout=self._STREAM_TIMEOUT)
-                    bucket = stream_tasks[name][1]
-                    hit_count = len(bucket)
-                    if hit_count == 0:
-                        streams_skipped.append(name)
-                    log_event(
-                        subsystem="memory.search",
-                        event_type=f"stream.{name}",
-                        message=f"Stream '{name}' returned {hit_count} hits",
-                        duration_ms=stream_timings.get(name),
-                        metadata={"hit_count": hit_count},
-                    )
-                except Exception as exc:  # noqa: BLE001
+        done, not_done = wait(future_to_name.keys(), timeout=self._STREAM_TIMEOUT * 2)
+
+        for future in done:
+            name = future_to_name[future]
+            try:
+                future.result()  # Should return immediately since it's in `done`
+                bucket = stream_tasks[name][1]
+                hit_count = len(bucket)
+                if hit_count == 0:
                     streams_skipped.append(name)
-                    logger.warning("Stream '%s' failed: %s — skipping", name, exc)
-                    log_event(
-                        subsystem="memory.search",
-                        event_type=f"stream.{name}",
-                        message=f"Stream '{name}' failed: {exc}",
-                        level="WARNING",
-                        metadata={"error": str(exc)},
-                    )
+                log_event(
+                    subsystem="memory.search",
+                    event_type=f"stream.{name}",
+                    message=f"Stream '{name}' returned {hit_count} hits",
+                    duration_ms=stream_timings.get(name),
+                    metadata={"hit_count": hit_count},
+                )
+            except Exception as exc:  # noqa: BLE001
+                streams_skipped.append(name)
+                logger.warning("Stream '%s' failed: %s — skipping", name, exc)
+                log_event(
+                    subsystem="memory.search",
+                    event_type=f"stream.{name}",
+                    message=f"Stream '{name}' failed: {exc}",
+                    level="WARNING",
+                    metadata={"error": str(exc)},
+                )
+
+        for future in not_done:
+            name = future_to_name[future]
+            streams_skipped.append(name)
+            logger.warning("Stream '%s' timed out after %.1fs — skipping", name, self._STREAM_TIMEOUT * 2)
+            log_event(
+                subsystem="memory.search",
+                event_type=f"stream.{name}.timeout",
+                message=f"Stream '{name}' timed out",
+                level="WARNING",
+                metadata={"timeout": self._STREAM_TIMEOUT * 2},
+            )
 
         # ── Stage 3: RRF fusion ──────────────────────────────────────────────
         t_fuse = time.perf_counter()
@@ -588,6 +629,18 @@ class ResearchEngine:
             metadata={"fused_count": len(fused)},
         )
 
+        # ── Stage 3.5: Temporal deduplication (always on) ─────────────────────
+        pre_dedup_count = len(fused)
+        fused = _temporal_dedup(fused)
+        dedup_removed = pre_dedup_count - len(fused)
+        if dedup_removed:
+            log_event(
+                subsystem="memory.search",
+                event_type="dedup.temporal",
+                message=f"Temporal dedup removed {dedup_removed} overlapping fragment(s)",
+                metadata={"removed": dedup_removed, "kept": len(fused)},
+            )
+
         if not fused:
             return ResearchResult(
                 query=query,
@@ -596,6 +649,7 @@ class ResearchEngine:
                 answer="No relevant segments found.",
                 streams_skipped=streams_skipped,
                 hyde_fallback=hyde_fallback,
+                hyde_document=rq.hyde_document,
             )
 
         # ── Stage 4: LLM synthesis ───────────────────────────────────────────
@@ -632,6 +686,7 @@ class ResearchEngine:
                     answer=answer,
                     streams_skipped=streams_skipped,
                     hyde_fallback=hyde_fallback,
+                    hyde_document=rq.hyde_document,
                 )
             case Err(error=reason):
                 synth_ms = (time.perf_counter() - t_synth) * 1000
@@ -653,4 +708,5 @@ class ResearchEngine:
                     synthesis_error=reason,
                     streams_skipped=streams_skipped,
                     hyde_fallback=hyde_fallback,
+                    hyde_document=rq.hyde_document,
                 )

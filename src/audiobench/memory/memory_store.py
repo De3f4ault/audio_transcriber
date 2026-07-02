@@ -81,13 +81,17 @@ class MemoryStore:
         content: str,
         source_type: str,
         speaker: str | None = None,
+        indexed_ids: set[int] | None = None,
     ) -> None:
-        """Embed and write an expression to LanceDB.
+        """Embed and write a single expression to LanceDB.
 
-        If the expression_id already exists, it will be updated (deleted and recreated).
+        If *indexed_ids* is provided (the in-memory O(1) set from SweepState),
+        the speculative delete is skipped for brand-new expressions, saving one
+        LanceDB round-trip. The set is updated in-place on success.
         """
-        # Delete if it exists to allow updates
-        self.delete_node(expression_id)
+        already_indexed = indexed_ids is not None and expression_id in indexed_ids
+        if indexed_ids is None or already_indexed:
+            self.delete_node(expression_id)
 
         vector = self._engine.embed_for_storage(content).tolist()
         now_str = datetime.datetime.now(datetime.UTC).isoformat()
@@ -103,9 +107,64 @@ class MemoryStore:
         )
         self.table.add([record])
 
-        # Optimize fts index occasionally, but for simplicity here we just ensure
-        # it gets picked up. LanceDB auto-updates FTS indices in newer versions,
-        # but we might need to recreate it if it gets out of sync.
+        if indexed_ids is not None:
+            indexed_ids.add(expression_id)
+
+    def batch_write_nodes(
+        self,
+        nodes: list[dict],
+        indexed_ids: set[int] | None = None,
+        batch_size: int = 64,
+    ) -> None:
+        """Embed and write a batch of expressions in one model forward-pass.
+
+        Args:
+            nodes:       List of dicts with keys: expression_id, content,
+                         source_type, speaker (optional).
+            indexed_ids: The in-memory set from SweepState.  Entries already in
+                         the set are deleted before re-insertion; genuinely new
+                         entries skip the delete entirely.  Updated in-place.
+            batch_size:  sentence-transformers sub-batch size (64 is safe).
+        """
+        if not nodes:
+            return
+
+        to_delete: list[int] = []
+        for n in nodes:
+            eid = int(n["expression_id"])
+            if indexed_ids is None or eid in indexed_ids:
+                to_delete.append(eid)
+
+        if to_delete:
+            id_list = ", ".join(str(i) for i in to_delete)
+            try:
+                self.table.delete(f"expression_id IN ({id_list})")
+            except Exception as exc:
+                logger.debug("batch_write_nodes: delete failed: %s", exc)
+
+        texts = [n["content"] for n in nodes]
+        vectors = self._engine.embed_batch_for_storage(texts, batch_size=batch_size)
+
+        now_str = datetime.datetime.now(datetime.UTC).isoformat()
+        records = [
+            ExpressionNode(
+                expression_id=int(n["expression_id"]),
+                vector=v,
+                content=n["content"],
+                embedding_model_version=self.model_version,
+                embedded_at=now_str,
+                source_type=n["source_type"],
+                speaker=n.get("speaker"),
+            )
+            for n, v in zip(nodes, vectors)
+        ]
+        self.table.add(records)
+
+        if indexed_ids is not None:
+            for n in nodes:
+                indexed_ids.add(int(n["expression_id"]))
+
+        logger.info("batch_write_nodes: wrote %d expressions to LanceDB", len(records))
 
     def search(
         self,
@@ -436,22 +495,69 @@ class SegmentVectorStore:
         self.table.add([record])
         logger.debug("Upserted segment_id=%d (pre-computed vector) into segment_vectors", segment_id)
 
+    def batch_upsert_segments(
+        self,
+        rows: list[dict],
+        vectors: list[list[float]],
+    ) -> None:
+        """Write a batch of pre-computed segment vectors to LanceDB in one operation."""
+        if not rows:
+            return
+        ids = [r["segment_id"] for r in rows]
+        id_list = ", ".join(str(i) for i in ids)
+        try:
+            self.table.delete(f"segment_id IN ({id_list})")
+        except Exception as exc:
+            logger.debug("Batch segment delete: %s", exc)
+
+        now_str = datetime.datetime.now(datetime.UTC).isoformat()
+        records = [
+            SegmentVectorNode(
+                segment_id=int(r["segment_id"]),
+                vector=v,
+                text=r["text"],
+                start_time=float(r["start_time"]),
+                end_time=float(r["end_time"]),
+                source_file=r["source_file"] or "",
+                embedded_at=now_str,
+            )
+            for r, v in zip(rows, vectors)
+        ]
+        self.table.add(records)
+        logger.info("Batch upserted %d segments into segment_vectors", len(records))
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
 
-    def search(self, query_vector: list[float], top_k: int = 10) -> list[dict]:
+    def search(
+        self,
+        query_vector: list[float],
+        top_k: int = 10,
+        return_vectors: bool = False,
+    ) -> list[dict]:
         """ANN search over segment embeddings.
 
         Returns a list of plain dicts with keys:
             segment_id, text, start_time, end_time, source_file, _distance
+        When ``return_vectors=True``, each dict also contains a ``vector``
+        key (list[float]) for downstream MMR cosine computation.
         """
         results = (
             self.table.search(query_vector, query_type="vector")
             .limit(top_k)
             .to_list()
         )
-        return results
+        out: list[dict] = []
+        for r in results:
+            row = {k: v for k, v in r.items() if k != "vector"}
+            if return_vectors:
+                raw_vec = r.get("vector")
+                if raw_vec is not None:
+                    row["vector"] = raw_vec.tolist() if hasattr(raw_vec, "tolist") else list(raw_vec)
+            out.append(row)
+        return out
+
 
     def count_embedded(self) -> int:
         """Total number of segments currently embedded."""

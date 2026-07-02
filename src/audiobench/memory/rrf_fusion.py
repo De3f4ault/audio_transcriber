@@ -22,6 +22,12 @@ class FusedResult:
     source_file: str = ""
     # Tuple of (stream_name, rank) pairs so callers can see which streams contributed
     stream_contributions: tuple[tuple[str, int], ...] = ()
+    # Segment IDs removed by temporal deduplication — stored here so the
+    # Fragment Reader can still navigate to them via H/L without gaps.
+    merged_segment_ids: tuple[int, ...] = ()
+    # FK → transcriptions.id; needed by the Fragment Reader for adjacency
+    # queries (prev/next segments in the same transcript).
+    transcription_id: int = 0
 
 
 def rrf_merge(
@@ -78,7 +84,68 @@ def rrf_merge(
                 text=hit.text,
                 rrf_score=scores[sid],
                 source_file=hit.source_file,
+                transcription_id=hit.transcription_id,
                 stream_contributions=tuple(sorted(contribs.items())),
             )
         )
     return results
+
+
+def _temporal_dedup(fused: list[FusedResult]) -> list[FusedResult]:
+    """Remove overlapping or near-adjacent fragments from the same source.
+
+    Iterates the RRF-sorted list top-to-bottom (highest score first). The
+    highest-scoring representative per time window survives. Fragments that
+    are deduplicated away are not discarded — their segment IDs are stashed
+    in ``merged_segment_ids`` on the surviving fragment so the Fragment
+    Reader can still navigate the full transcript without gaps.
+
+    Gap is self-calibrating: 60 % of the mean segment duration in the
+    result set. A corpus of 25-second segments gets a ~15 s proximity gap;
+    a corpus of 60-second segments gets a ~36 s gap. Zero configuration
+    required — the chunker granularity is always the ground truth.
+
+    Two fragments from the *same* ``source_file`` are considered duplicates
+    when their time windows overlap or are within ``gap`` seconds of each
+    other. Fragments from *different* sources are never deduplicated against
+    each other.
+    """
+    import dataclasses
+
+    if len(fused) < 2:
+        return fused
+
+    durations = [fr.end_time - fr.start_time for fr in fused]
+    mean_duration = sum(durations) / len(durations)
+    gap = mean_duration * 0.6
+
+    kept: list[FusedResult] = []
+    # source_file → list of (start_time, end_time, index_into_kept)
+    seen: dict[str, list[tuple[float, float, int]]] = {}
+
+    for fr in fused:  # already sorted by rrf_score descending — first = best
+        windows = seen.get(fr.source_file, [])
+        duplicate_of: int | None = None
+
+        for kept_start, kept_end, kept_idx in windows:
+            # Overlap test with proximity gap on both sides
+            if fr.start_time < (kept_end + gap) and fr.end_time > (kept_start - gap):
+                duplicate_of = kept_idx
+                break
+
+        if duplicate_of is None:
+            # New unique window — add to kept and register in seen
+            idx = len(kept)
+            seen.setdefault(fr.source_file, []).append(
+                (fr.start_time, fr.end_time, idx)
+            )
+            kept.append(fr)
+        else:
+            # Duplicate — stash this segment's id on the surviving representative
+            survivor = kept[duplicate_of]
+            kept[duplicate_of] = dataclasses.replace(
+                survivor,
+                merged_segment_ids=survivor.merged_segment_ids + (fr.segment_id,),
+            )
+
+    return kept

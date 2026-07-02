@@ -26,6 +26,11 @@ _boundary_lock = threading.Lock()
 
 _primary_embedder: Any = None
 _primary_lock = threading.Lock()
+# Separate lock that serialises *inference* calls (not just loading).
+# NomicBert's RoPE cache is lazily extended and not thread-safe: concurrent
+# encode() calls from the sweep thread + asyncio executor threads can race
+# to write the same cache entry, producing tensor-dimension mismatches.
+_primary_inference_lock = threading.RLock()
 
 _reranker: Any = None
 _reranker_lock = threading.Lock()
@@ -83,10 +88,25 @@ def get_boundary_embedder() -> Any:
 
                 try:
                     # Prefer local cache to avoid unauthenticated/slow HF pings
-                    _boundary_embedder = SentenceTransformer(
-                        "sentence-transformers/all-MiniLM-L6-v2", local_files_only=True
-                    )
-                except Exception:
+                    orig_hf = os.environ.get("HF_HUB_OFFLINE")
+                    orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                    try:
+                        _boundary_embedder = SentenceTransformer(
+                            "sentence-transformers/all-MiniLM-L6-v2", local_files_only=True
+                        )
+                    finally:
+                        if orig_hf is None:
+                            del os.environ["HF_HUB_OFFLINE"]
+                        else:
+                            os.environ["HF_HUB_OFFLINE"] = orig_hf
+                        if orig_tr is None:
+                            del os.environ["TRANSFORMERS_OFFLINE"]
+                        else:
+                            os.environ["TRANSFORMERS_OFFLINE"] = orig_tr
+                except Exception as e:
+                    logger.debug("Failed to load boundary embedder from cache: %s", e)
                     if is_offline:
                         raise
                     try:
@@ -118,12 +138,27 @@ def get_primary_embedder() -> Any:
 
                 try:
                     # Prefer local cache
-                    _primary_embedder = SentenceTransformer(
-                        "nomic-ai/nomic-embed-text-v1.5",
-                        trust_remote_code=True,
-                        local_files_only=True,
-                    )
-                except Exception:
+                    orig_hf = os.environ.get("HF_HUB_OFFLINE")
+                    orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                    try:
+                        _primary_embedder = SentenceTransformer(
+                            "nomic-ai/nomic-embed-text-v1.5",
+                            trust_remote_code=True,
+                            local_files_only=True,
+                        )
+                    finally:
+                        if orig_hf is None:
+                            del os.environ["HF_HUB_OFFLINE"]
+                        else:
+                            os.environ["HF_HUB_OFFLINE"] = orig_hf
+                        if orig_tr is None:
+                            del os.environ["TRANSFORMERS_OFFLINE"]
+                        else:
+                            os.environ["TRANSFORMERS_OFFLINE"] = orig_tr
+                except Exception as e:
+                    logger.debug("Failed to load primary embedder from cache: %s", e)
                     if is_offline:
                         raise
                     try:
@@ -136,6 +171,14 @@ def get_primary_embedder() -> Any:
                         _handle_load_error(e, "nomic-ai/nomic-embed-text-v1.5")
                 logger.info("Primary embedder loaded in %.2fs", time.time() - t0)
     return _primary_embedder
+
+
+def get_primary_inference_lock() -> threading.RLock:
+    """Return the inference lock that must be held during all encode() calls
+    on the primary embedder.  Using an RLock allows the same thread to
+    re-enter (e.g., warmup then sweep on the same thread).
+    """
+    return _primary_inference_lock
 
 
 def get_reranker() -> Any:
@@ -157,10 +200,25 @@ def get_reranker() -> Any:
 
                 try:
                     # Prefer local cache
-                    _reranker = CrossEncoder(
-                        "cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=True
-                    )
-                except Exception:
+                    orig_hf = os.environ.get("HF_HUB_OFFLINE")
+                    orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                    try:
+                        _reranker = CrossEncoder(
+                            "cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=True
+                        )
+                    finally:
+                        if orig_hf is None:
+                            del os.environ["HF_HUB_OFFLINE"]
+                        else:
+                            os.environ["HF_HUB_OFFLINE"] = orig_hf
+                        if orig_tr is None:
+                            del os.environ["TRANSFORMERS_OFFLINE"]
+                        else:
+                            os.environ["TRANSFORMERS_OFFLINE"] = orig_tr
+                except Exception as e:
+                    logger.debug("Failed to load reranker from cache: %s", e)
                     if is_offline:
                         raise
                     try:
@@ -205,18 +263,25 @@ def get_colbert_reranker() -> Any:
 
                     ColBERTModel.__init__ = patched_init
 
-                    # Temporarily force HF_HUB_OFFLINE to prevent network ping if cached
+                    # Temporarily force offline mode to prevent network ping if cached
                     original_hf_offline = os.environ.get("HF_HUB_OFFLINE")
+                    original_tr_offline = os.environ.get("TRANSFORMERS_OFFLINE")
                     os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
                     try:
                         _colbert_reranker = ColbertReranker(
                             model_name="answerdotai/answerai-colbert-small-v1", column="content"
                         )
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to load ColBERT reranker from cache: %s", e)
                         if original_hf_offline is not None:
                             os.environ["HF_HUB_OFFLINE"] = original_hf_offline
                         else:
                             del os.environ["HF_HUB_OFFLINE"]
+                        if original_tr_offline is not None:
+                            os.environ["TRANSFORMERS_OFFLINE"] = original_tr_offline
+                        else:
+                            del os.environ["TRANSFORMERS_OFFLINE"]
                         
                         if is_offline:
                             raise
@@ -227,10 +292,16 @@ def get_colbert_reranker() -> Any:
                         )
                     finally:
                         # Restore original environment if we had to retry
-                        if original_hf_offline is not None:
-                            os.environ["HF_HUB_OFFLINE"] = original_hf_offline
-                        elif "HF_HUB_OFFLINE" in os.environ and original_hf_offline is None and not is_offline:
-                            del os.environ["HF_HUB_OFFLINE"]
+                        if "HF_HUB_OFFLINE" in os.environ:
+                            if original_hf_offline is not None:
+                                os.environ["HF_HUB_OFFLINE"] = original_hf_offline
+                            else:
+                                del os.environ["HF_HUB_OFFLINE"]
+                        if "TRANSFORMERS_OFFLINE" in os.environ:
+                            if original_tr_offline is not None:
+                                os.environ["TRANSFORMERS_OFFLINE"] = original_tr_offline
+                            else:
+                                del os.environ["TRANSFORMERS_OFFLINE"]
                             
                     logger.info("ColBERT reranker loaded in %.2fs", time.time() - t0)
                 except (ImportError, ModuleNotFoundError) as e:

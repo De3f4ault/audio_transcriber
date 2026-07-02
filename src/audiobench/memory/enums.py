@@ -31,7 +31,8 @@ class RelationType(str, Enum):
     ELABORATES = "elaborates"
     RESUMES = "resumes"
     CONTRADICTS = "contradicts"
-
+    INSPIRED_BY = "inspired_by"
+    BELONGS_TO = "belongs_to"
 
 class InferenceStatus(str, Enum):
     ACTIVE = "active"

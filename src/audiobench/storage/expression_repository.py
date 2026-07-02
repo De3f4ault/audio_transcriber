@@ -83,7 +83,7 @@ class ExpressionRepository:
         if record.source_id is None:
             return
 
-        from audiobench.storage.note_repository import PendingRelation
+        from audiobench.storage.models import PendingRelation
         pending = session.query(PendingRelation).filter_by(
             to_expression_id_hint=record.source_id,
             to_source_type=record.source_type
@@ -101,6 +101,124 @@ class ExpressionRepository:
                 session.delete(p)
             session.commit()
             logger.info("Resolved %d pending relations for expression #%d", len(pending), record.id)
+
+    def register_batch(
+        self,
+        items: list[dict],
+        known_hashes: set[str] | None = None,
+    ) -> list[ExpressionRecord]:
+        """Register a batch of semantic expressions.
+
+        Args:
+            items:        List of dicts with keys: content, source_type,
+                          source_id (optional), speaker (optional).
+            known_hashes: The in-memory O(1) hash set from SweepState.
+                          When provided, deduplication is a pure RAM lookup —
+                          no SQL query fires for already-known content.
+                          New hashes are added to the set in-place.
+
+        Returns:
+            List of ExpressionRecords (newly created + deduplicated).
+        """
+        import hashlib
+
+        if not items:
+            return []
+
+        # ── Step 1: dedup within the incoming batch (pure Python) ──────────
+        unique_items: dict[str, dict] = {}
+        for item in items:
+            h = hashlib.sha256(item["content"].encode("utf-8")).hexdigest()
+            if h not in unique_items:
+                item["_hash"] = h
+                unique_items[h] = item
+
+        items_to_process = list(unique_items.values())
+
+        # ── Step 2: separate already-known from genuinely new ───────────────
+        if known_hashes is not None:
+            # O(1) per check — pure RAM, zero SQL
+            need_db_lookup: list[dict] = []
+            already_known: list[dict] = []
+            for item in items_to_process:
+                if item["_hash"] in known_hashes:
+                    already_known.append(item)
+                else:
+                    need_db_lookup.append(item)
+        else:
+            # No in-memory set — fall back to SQL IN() query
+            need_db_lookup = items_to_process
+            already_known = []
+
+        # ── Step 3: for items still uncertain, query DB once ────────────────
+        deduped: list[ExpressionRecord] = []
+        new_records: list[ExpressionRecord] = []
+
+        if need_db_lookup:
+            source_type = need_db_lookup[0]["source_type"]
+            db_hashes = [item["_hash"] for item in need_db_lookup]
+
+            with get_session() as session:
+                existing = (
+                    session.query(ExpressionRecord)
+                    .filter(
+                        ExpressionRecord.content_hash.in_(db_hashes),
+                        ExpressionRecord.source_type == source_type,
+                    )
+                    .all()
+                )
+                existing_by_hash = {r.content_hash: r for r in existing}
+
+                for item in need_db_lookup:
+                    if item["_hash"] in existing_by_hash:
+                        rec = existing_by_hash[item["_hash"]]
+                        logger.debug(
+                            "Deduplicated expression #%d via content_hash (DB lookup)",
+                            rec.id,
+                        )
+                        deduped.append(rec)
+                        # Teach the set so next batch hits RAM only
+                        if known_hashes is not None:
+                            known_hashes.add(item["_hash"])
+                    else:
+                        rec = ExpressionRecord(
+                            content=item["content"],
+                            content_hash=item["_hash"],
+                            source_type=item["source_type"],
+                            source_id=item.get("source_id"),
+                            speaker=item.get("speaker"),
+                        )
+                        session.add(rec)
+                        new_records.append(rec)
+
+                if new_records:
+                    session.flush()
+                    for rec in new_records:
+                        self._resolve_pending_relations(session, rec)
+                    session.commit()
+                    if known_hashes is not None:
+                        for rec in new_records:
+                            if rec.content_hash:
+                                known_hashes.add(rec.content_hash)
+                    logger.info(
+                        "Registered %d new + %d deduplicated expressions",
+                        len(new_records),
+                        len(deduped) + len(already_known),
+                    )
+
+                for rec in list(existing) + new_records:
+                    try:
+                        session.expunge(rec)
+                    except Exception:
+                        pass
+
+        if already_known:
+            logger.debug(
+                "Skipped %d expressions via O(1) in-memory hash set",
+                len(already_known),
+            )
+
+        return deduped + new_records
 
     def get_by_id(self, expression_id: int) -> ExpressionRecord | None:
         """Get a single expression by ID."""
