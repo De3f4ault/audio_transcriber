@@ -28,6 +28,7 @@ class ChatRepository:
         model: str,
         transcript_ids: list[int] | None = None,
         title: str = "Untitled Chat",
+        session_type: str = "chat",
     ) -> int:
         """Create a new chat conversation.
 
@@ -35,6 +36,7 @@ class ChatRepository:
             model: The Ollama model name.
             transcript_ids: List of transcript IDs loaded as context.
             title: Conversation title (will be AI-generated later).
+            session_type: Type of session (chat, search_followup, etc).
 
         Returns:
             The conversation ID.
@@ -44,6 +46,7 @@ class ChatRepository:
                 title=title,
                 model_name=model,
                 transcript_ids=json.dumps(transcript_ids or []),
+                session_type=session_type,
                 message_count=0,
             )
             session.add(conv)
@@ -94,29 +97,24 @@ class ChatRepository:
             # --- PHASE 5: Expression Registration ---
             if role != "system":
                 try:
-                    from audiobench.daemon.factory import get_daemon_client
-                    from audiobench.memory.enums import SourceType
-                    from audiobench.storage.expression_repository import ExpressionRepository
-
-                    expr_repo = ExpressionRepository()
-                    expr = expr_repo.register(
-                        content=content,
-                        source_type=SourceType.CHAT_MESSAGE.value,
-                        source_id=msg.id,
-                        session_type="chat",
-                        session_id=conversation_id,
-                        speaker="assistant" if role == "assistant" else "user",
-                    )
-
-                    daemon = get_daemon_client()
-                    daemon.embed(
-                        expression_id=expr.id,
-                        content=content,
-                        source_type=SourceType.CHAT_MESSAGE,
-                        speaker="assistant" if role == "assistant" else "user",
-                    )
+                    from audiobench.memory.knowledge_ingester import KnowledgeIngester
+                    import threading
+                    
+                    ingester = KnowledgeIngester()
+                    
+                    # session.expunge is needed to detach the objects so they can be accessed safely from the thread
+                    session.expunge(msg)
+                    if conv:
+                        session.expunge(conv)
+                    
+                    # Run ingestion in a background thread to not block the chat
+                    threading.Thread(
+                        target=ingester.ingest_chat_message,
+                        args=(msg, conv),
+                        daemon=True
+                    ).start()
                 except Exception as e:
-                    logger.error("Failed to register chat message %d as expression: %s", msg.id, e)
+                    logger.error("Failed to spawn ingestion thread for chat message %d: %s", msg.id, e)
 
             return msg.id
 
