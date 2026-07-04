@@ -174,13 +174,15 @@ class BookmarkRepository:
         audio_file_id: int,
         current_time: float,
         direction: str = "next",
+        window: float | None = None,
     ) -> dict | None:
-        """Find the nearest bookmark in a given direction.
+        """Find the nearest bookmark in a given direction or within a window.
 
         Args:
             audio_file_id: The audio file.
             current_time: Current playback position in seconds.
-            direction: "next" or "prev".
+            direction: "next" or "prev". Only used if window is None.
+            window: Optional — if provided, finds the nearest bookmark within absolute distance `window`.
 
         Returns:
             The nearest bookmark dict, or None.
@@ -188,18 +190,29 @@ class BookmarkRepository:
         with get_session() as session:
             query = session.query(BookmarkRecord).filter_by(audio_file_id=audio_file_id)
 
-            if direction == "next":
+            if window is not None:
+                from sqlalchemy import func
                 rec = (
-                    query.filter(BookmarkRecord.timestamp > current_time + 0.5)
-                    .order_by(asc(BookmarkRecord.timestamp))
+                    query.filter(
+                        BookmarkRecord.timestamp >= current_time - window,
+                        BookmarkRecord.timestamp <= current_time + window
+                    )
+                    .order_by(func.abs(BookmarkRecord.timestamp - current_time))
                     .first()
                 )
-            else:  # prev
-                rec = (
-                    query.filter(BookmarkRecord.timestamp < current_time - 0.5)
-                    .order_by(desc(BookmarkRecord.timestamp))
-                    .first()
-                )
+            else:
+                if direction == "next":
+                    rec = (
+                        query.filter(BookmarkRecord.timestamp > current_time + 0.5)
+                        .order_by(asc(BookmarkRecord.timestamp))
+                        .first()
+                    )
+                else:  # prev
+                    rec = (
+                        query.filter(BookmarkRecord.timestamp < current_time - 0.5)
+                        .order_by(desc(BookmarkRecord.timestamp))
+                        .first()
+                    )
 
             return self._to_dict(rec) if rec else None
 

@@ -254,12 +254,15 @@ class TranscriptionPipeline:
 
             def _do_transcribe():
                 if is_gemini:
+                    # Gemini is a cloud model — send the original, full-quality
+                    # file rather than the Whisper-optimised 16 kHz mono WAV.
                     return engine.transcribe(
-                        wav_path,
+                        str(file_path),
                         language=language or self._settings.language,
                         task=task,
                         word_timestamps=word_ts,
                         on_phase=emit,
+                        on_segment=on_segment,
                         diarize=enable_diarization,
                     )
                 else:

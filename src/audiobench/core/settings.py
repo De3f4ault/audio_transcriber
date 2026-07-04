@@ -247,11 +247,12 @@ class AudioBenchSettings(BaseSettings):
         description="Gemini model to use for transcription",
     )
     gemini_inline_max_mb: int = Field(
-        default=20,
+        default=100,
         ge=1,
         description=(
             "Files below this size (MB) are sent inline in the request body. "
-            "Larger files are uploaded via the Gemini Files API."
+            "Larger files are uploaded via the Gemini Files API. "
+            "Google increased the inline payload limit from 20 MB to 100 MB in early 2026."
         ),
     )
     gemini_chunk_threshold_min: int = Field(
@@ -282,6 +283,10 @@ class AudioBenchSettings(BaseSettings):
 
     # --- Logging ---
     log_level: str = Field(default="INFO", description="Logging level")
+    observatory: dict = Field(
+        default_factory=dict,
+        description="Configuration for observatory and thresholds (e.g. {'thresholds': {'transcribe.confidence': ['lt', 0.6, 'WARN']}})",
+    )
 
     # --- Diarization ---
     hf_token: str | None = Field(

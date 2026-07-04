@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential_jitter,
 )
@@ -37,9 +37,10 @@ from audiobench.core.prompts import (
     GEMINI_TRANSLATE_PROMPT,
 )
 
-# Default inline upload threshold (20 MB).
+# Default inline upload threshold (100 MB).
 # Overridden at runtime from settings.gemini_inline_max_mb.
-_INLINE_MAX_BYTES_DEFAULT = 20 * 1024 * 1024
+# Google increased the inline payload limit from 20 MB to 100 MB in early 2026.
+_INLINE_MAX_BYTES_DEFAULT = 100 * 1024 * 1024
 
 # ── Chunking constants ──────────────────────────────────────
 _CHUNK_DURATION = 15 * 60  # 15 minutes per chunk (seconds)
@@ -137,6 +138,7 @@ class GeminiEngine(TranscriptionEngine):
         word_timestamps: bool = True,
         beam_size: int = 5,
         on_phase: object | None = None,
+        on_segment: object | None = None,
         **kwargs,
     ) -> Transcript:
         """Send audio to Gemini and return a Transcript.
@@ -197,9 +199,10 @@ class GeminiEngine(TranscriptionEngine):
                 prompt,
                 on_phase,
                 duration,
+                on_segment,
             )
 
-        return self._transcribe_single(audio_path, prompt, on_phase)
+        return self._transcribe_single(audio_path, prompt, on_phase, on_segment)
 
     # ── Retry-wrapped generate call ─────────────────────────
 
@@ -213,28 +216,25 @@ class GeminiEngine(TranscriptionEngine):
 
         def is_retryable(exc):
             from google.genai.errors import APIError
+            import socket
 
             if isinstance(exc, APIError):
                 return exc.code == 429 or exc.code >= 500
+            if isinstance(exc, (socket.gaierror, ConnectionError, TimeoutError, OSError)):
+                return True
             return False
 
         @retry(
-            retry=retry_if_exception_type(Exception),
+            retry=retry_if_exception(is_retryable),
             wait=wait_exponential_jitter(initial=2, max=60, jitter=5),
             stop=stop_after_attempt(self._max_retries),
             reraise=True,
         )
         def _generate_with_retry(model_name: str, contents: list) -> Any:
-            try:
-                return self._client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                )
-            except Exception as e:
-                if is_retryable(e):
-                    raise e
-                # Do not retry other exceptions
-                raise e
+            return self._client.models.generate_content(
+                model=model_name,
+                contents=contents,
+            )
 
         return _generate_with_retry
 
@@ -248,15 +248,16 @@ class GeminiEngine(TranscriptionEngine):
             _generate = self._make_generate_caller()
             return _generate(self._model_name, contents)
         except Exception as exc:
-            # Check if it's a quota error (429) and we have a fallback.
+            # Check if it's a quota error (429) or overloaded (503) and we have a fallback.
             try:
                 from google.genai.errors import APIError
 
-                is_quota = isinstance(exc, APIError) and exc.code == 429
+                should_fallback = isinstance(exc, APIError) and exc.code in (429, 503)
             except ImportError:
-                is_quota = "quota" in str(exc).lower() or "429" in str(exc)
+                exc_str = str(exc).lower()
+                should_fallback = "quota" in exc_str or "429" in exc_str or "503" in exc_str
 
-            if is_quota and self._fallback_model != self._model_name:
+            if should_fallback and self._fallback_model != self._model_name:
                 logger.warning(
                     "Primary model %s quota exhausted after %d retries — "
                     "switching to fallback model %s",
@@ -305,13 +306,21 @@ class GeminiEngine(TranscriptionEngine):
         )
 
         try:
-            uploaded = self._client.files.upload(
-                file=str(audio_path),
-                config=gtypes.UploadFileConfig(
-                    mime_type=mime,
-                    display_name=audio_path.name,
-                ),
+            @retry(
+                retry=retry_if_exception(lambda exc: True),  # Retry any upload failure
+                wait=wait_exponential_jitter(initial=2, max=30, jitter=5),
+                stop=stop_after_attempt(self._max_retries),
+                reraise=True,
             )
+            def _upload():
+                return self._client.files.upload(
+                    file=str(audio_path),
+                    config=gtypes.UploadFileConfig(
+                        mime_type=mime,
+                        display_name=audio_path.name,
+                    ),
+                )
+            uploaded = _upload()
         except Exception as e:
             raise EngineError(
                 message="Gemini Files API upload failed",
@@ -375,6 +384,7 @@ class GeminiEngine(TranscriptionEngine):
         audio_path: Path,
         prompt: str,
         on_phase: object | None = None,
+        on_segment: object | None = None,
     ) -> Transcript:
         """Transcribe a single (non-chunked) audio file.
 
@@ -458,7 +468,11 @@ class GeminiEngine(TranscriptionEngine):
                         del_exc,
                     )
 
-        return self._parse_response(response, audio_path)
+        transcript = self._parse_response(response, audio_path)
+        if on_segment and callable(on_segment):
+            for seg in transcript.segments:
+                on_segment(seg)
+        return transcript
 
     def _transcribe_chunked(
         self,
@@ -466,6 +480,7 @@ class GeminiEngine(TranscriptionEngine):
         prompt: str,
         on_phase: object | None = None,
         total_duration: float = 0.0,
+        on_segment: object | None = None,
     ) -> Transcript:
         """Split long audio into chunks, transcribe each, and stitch."""
         import shutil
@@ -506,11 +521,12 @@ class GeminiEngine(TranscriptionEngine):
                 )
 
                 try:
-                    # Don't forward on_phase to individual chunks —
+                    # Don't forward on_phase or on_segment to individual chunks —
                     # _transcribe_chunked already emits chunk-level progress.
                     transcript = self._transcribe_single(
                         chunk_path,
                         prompt,
+                        None,
                         None,
                     )
                     chunk_results.append((transcript, time_offset))
@@ -532,7 +548,11 @@ class GeminiEngine(TranscriptionEngine):
                 details="Every chunk transcription attempt failed.",
             )
 
-        return self._stitch_transcripts(chunk_results, audio_path)
+        transcript = self._stitch_transcripts(chunk_results, audio_path)
+        if on_segment and callable(on_segment):
+            for seg in transcript.segments:
+                on_segment(seg)
+        return transcript
 
     @staticmethod
     def _stitch_transcripts(
@@ -751,7 +771,57 @@ class GeminiEngine(TranscriptionEngine):
 
     def _parse_response(self, response, audio_path: Path) -> Transcript:
         """Parse Gemini's JSON response into a Transcript."""
-        raw_text = response.text.strip()
+        # ── Guard: check for blocked / empty responses ────────────────────────
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            candidate = candidates[0]
+            finish_reason = getattr(candidate, "finish_reason", None)
+            finish_name = finish_reason.name if hasattr(finish_reason, "name") else str(finish_reason)
+            if finish_name not in ("STOP", "1", "FINISH_REASON_STOP"):
+                safety_ratings = getattr(candidate, "safety_ratings", [])
+                logger.warning(
+                    "Gemini response finish_reason=%s for %s — safety_ratings=%s",
+                    finish_name,
+                    audio_path.name,
+                    safety_ratings,
+                )
+                if finish_name in ("SAFETY", "RECITATION"):
+                    raise EngineError(
+                        message=f"Gemini blocked the response (finish_reason={finish_name})",
+                        details=(
+                            f"File: {audio_path.name}. "
+                            "The audio may have triggered a content safety filter. "
+                            f"Safety ratings: {safety_ratings}"
+                        ),
+                    )
+
+        # Safe text extraction — response.text raises if content is empty
+        try:
+            raw_text = response.text
+        except Exception:
+            raw_text = ""
+            for cand in candidates:
+                for part in getattr(getattr(cand, "content", None), "parts", []) or []:
+                    t = getattr(part, "text", None)
+                    if t:
+                        raw_text += t
+
+        if not raw_text or not raw_text.strip():
+            logger.error(
+                "Gemini returned empty text for %s. candidates=%s",
+                audio_path.name,
+                candidates,
+            )
+            raise EngineError(
+                message="Gemini returned an empty transcription",
+                details=(
+                    f"No text content in response for '{audio_path.name}'. "
+                    "This can happen due to safety filters, an unsupported audio "
+                    "encoding, or a transient API error. Check the log for finish_reason."
+                ),
+            )
+
+        raw_text = raw_text.strip()
 
         # Strip markdown fences if Gemini wraps the JSON.
         if raw_text.startswith("```"):
