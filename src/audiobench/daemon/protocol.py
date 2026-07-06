@@ -43,15 +43,39 @@ class ChunkArgs(TypedDict):
 
 class DaemonRequest(TypedDict):
     cmd: str
-    args: dict
+    args: dict[str, Any]
+    request_id: str
+
+
+class DaemonError(TypedDict):
+    code: str      # "MODEL_NOT_LOADED" | "INDEX_NOT_READY" | "INVALID_REQUEST" | "OPERATION_FAILED"
+    message: str
     request_id: str
 
 
 class DaemonResponse(TypedDict):
-    success: bool
-    data: NotRequired[dict]
-    error: NotRequired[str]
+    status: str  # "ok" | "error" | "progress"
+    success: NotRequired[bool]  # deprecated, use status="ok"
+    data: NotRequired[dict[str, Any]]
+    error: NotRequired[DaemonError | str]
     request_id: str
+
+
+class ProgressFrame(TypedDict):
+    status: str  # always "progress"
+    step: str
+    pct: float
+    message: NotRequired[str]
+    request_id: str
+
+
+class PipelineStep(TypedDict):
+    name: str
+    args: dict[str, Any]
+
+
+class PipelineArgs(TypedDict):
+    steps: list[PipelineStep]
 
 
 class SearchResult(TypedDict):

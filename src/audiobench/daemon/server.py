@@ -24,11 +24,13 @@ from audiobench.memory.chunking import content_aware_router
 from audiobench.memory.memory_store import MemoryStore, SegmentVectorStore
 from audiobench.memory.singletons import get_primary_embedder, get_reranker, pre_warm_retrieval_pipeline
 from audiobench.storage.models import TranscriptionRecord
+from audiobench.supervisor.registry import upsert_process
 
 logger = get_logger("daemon.server")
 
 # Module-level state (lives for the lifetime of the daemon process)
 _start_time: float = 0.0
+_last_request_time: float = time.time()
 _memory_store: MemoryStore | None = None
 _segment_store: SegmentVectorStore | None = None
 _sweep_state = None  # audiobench.daemon.sweep_state.SweepState — loaded lazily
@@ -54,12 +56,38 @@ def _get_segment_store() -> SegmentVectorStore:
 
 
 def _handle_ping(args: dict[str, Any]) -> dict[str, Any]:
-    """Return daemon liveness info."""
-    settings = get_settings()
+    """Return daemon health and stats."""
+    import psutil
+    from audiobench.daemon.sweep_state import get_sweep_state
+    from audiobench.daemon.intelligence.calibration import get_calibration_tracker
+    from audiobench.daemon.intelligence.timing_model import get_timing_model
+    
+    process = psutil.Process()
+    memory_mb = process.memory_info().rss / (1024 * 1024)
+
+    try:
+        state = get_sweep_state()
+        queue_depth = state.unindexed_transcript_count() + state.pending_segment_count()
+    except Exception:
+        queue_depth = 0
+
+    store_version = _get_store().model_version if _memory_store else "unknown"
+
+    tracker = get_calibration_tracker()
+    timing = get_timing_model()
+
     return {
         "alive": True,
+        "status": "ok",
         "uptime_seconds": round(time.time() - _start_time, 2),
-        "embedding_model_version": _get_store().model_version,
+        "embedding_model_version": store_version,
+        "memory_mb": round(memory_mb, 2),
+        "queue_depth": queue_depth,
+        "models": {
+            "embedding": store_version,
+        },
+        "calibration": tracker.get_summary(),
+        "timing": timing.get_summary()
     }
 
 
@@ -79,6 +107,8 @@ def _handle_search(args: dict[str, Any]) -> dict[str, Any]:
     query = str(args["query"])
     top_k = int(args.get("top_k", 5))
     speaker_filter = args.get("speaker_filter")
+    audio_file_id = args.get("audio_file_id")
+    work_id = args.get("work_id")
     hyde_document = args.get("hyde_document")
     use_bm25 = args.get("use_bm25", True)
     use_dense = args.get("use_dense", True)
@@ -88,6 +118,8 @@ def _handle_search(args: dict[str, Any]) -> dict[str, Any]:
         query=query,
         top_k=top_k,
         speaker_filter=speaker_filter,
+        audio_file_id=audio_file_id,
+        work_id=work_id,
         hyde_document=hyde_document,
         use_bm25=use_bm25,
         use_dense=use_dense,
@@ -105,13 +137,51 @@ def _handle_delete(args: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_status(args: dict[str, Any]) -> dict[str, Any]:
     """Return daemon and store statistics."""
+    from audiobench.daemon.intelligence.timing_model import get_timing_model
     store = _get_store()
     node_count = store.count_nodes()
+    timing_summary = get_timing_model().get_summary()
     return {
         "uptime_seconds": round(time.time() - _start_time, 2),
         "embedding_model_version": store.model_version,
         "total_nodes": node_count,
+        "timing_model": timing_summary,
     }
+
+
+def _handle_register_process(args: dict[str, Any]) -> dict[str, Any]:
+    """Register a CLI subprocess in the managed_processes table."""
+    name = str(args.get("name", ""))
+    pid = args.get("pid")
+    upsert_process(name, "running", pid=pid)
+    return {"ok": True}
+
+
+def _handle_unregister_process(args: dict[str, Any]) -> dict[str, Any]:
+    """Mark a CLI subprocess as stopped in the managed_processes table."""
+    name = str(args.get("name", ""))
+    exit_code = args.get("exit_code", 0)
+    upsert_process(name, "stopped", last_exit_code=exit_code)
+    return {"ok": True}
+
+
+def _handle_log_events(args: dict[str, Any]) -> dict[str, Any]:
+    """Receive a batch of event payloads from a CLI process and record them
+    via the daemon's in-process ObservabilitySubscriber.
+
+    This lets CLI subprocesses forward observability events to the daemon's
+    already-open journal.db writer thread instead of each opening their own
+    connection."""
+    from audiobench.observatory.subscriber import get_subscriber
+
+    payloads: list[dict] = args.get("payloads", [])
+    if not isinstance(payloads, list):
+        return {"ok": False, "error": "payloads must be a list"}
+    sub = get_subscriber()
+    for payload in payloads:
+        if isinstance(payload, dict):
+            sub.record(**payload)
+    return {"ok": True, "count": len(payloads)}
 
 
 def _handle_chunk(args: dict[str, Any]) -> dict[str, Any]:
@@ -243,6 +313,140 @@ def _handle_write_cache(args: dict[str, Any]) -> dict[str, Any]:
     return {"cached": True}
 
 
+async def _handle_pipeline(args: dict[str, Any]) -> Any:
+    """Execute a multi-step pipeline."""
+    from audiobench.daemon.pipeline import PipelineExecutor
+    executor = PipelineExecutor()
+    async for frame in executor.run(args):
+        yield frame
+
+
+async def _handle_operate(args: dict[str, Any]) -> Any:
+    """Execute a semantic operation via operators.py."""
+    from audiobench.daemon.operators import operate_on
+    target = args["target"]
+    verb = str(args["verb"])
+    context = args.get("context", {})
+    store = _get_store()
+    async for frame in operate_on(target, verb, context, store):
+        yield frame
+
+
+def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
+    """Semantic autocomplete fast-path."""
+    from audiobench.daemon.autocomplete import get_autocomplete_index
+    from audiobench.memory.singletons import get_primary_embedder, get_primary_inference_lock
+    
+    prefix = str(args.get("prefix", ""))
+    if not prefix:
+        return {"results": []}
+        
+    index = get_autocomplete_index()
+    if not index.ready:
+        return {"error": "INDEX_NOT_READY"}
+        
+    model = get_primary_embedder()
+    with get_primary_inference_lock():
+        vector = model.encode(f"search_query: {prefix}").tolist()
+        
+    results = index.lookup(vector, k=int(args.get("top_k", 5)))
+    return {"results": results}
+
+
+def _handle_confirm_inference(args: dict[str, Any]) -> dict[str, Any]:
+    """Confirm a proposed system inference."""
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session
+    from audiobench.daemon.intelligence.calibration import get_calibration_tracker
+    
+    expression_id = int(args["expression_id"])
+    with get_session() as session:
+        session.execute(
+            sql_text("UPDATE expressions SET inference_status = 'confirmed' WHERE id = :eid"),
+            {"eid": expression_id}
+        )
+        session.commit()
+        
+    get_calibration_tracker().record_confirm(expression_id)
+    return {"status": "ok", "expression_id": expression_id, "action": "confirmed"}
+
+
+def _handle_reject_inference(args: dict[str, Any]) -> dict[str, Any]:
+    """Reject a proposed system inference."""
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session
+    from audiobench.daemon.intelligence.calibration import get_calibration_tracker
+    
+    expression_id = int(args["expression_id"])
+    with get_session() as session:
+        session.execute(
+            sql_text("UPDATE expressions SET inference_status = 'rejected' WHERE id = :eid"),
+            {"eid": expression_id}
+        )
+        session.commit()
+        
+    get_calibration_tracker().record_reject(expression_id)
+    return {"status": "ok", "expression_id": expression_id, "action": "rejected"}
+
+
+def _handle_authorize_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Authorize a daemon_proposal: write confirmed to DB and hot-register the operator."""
+    from audiobench.daemon.intelligence.operator_registry import get_operator_registry
+
+    expression_id = int(args["expression_id"])
+    get_operator_registry().authorize(expression_id)
+    return {"status": "ok", "expression_id": expression_id, "action": "authorized"}
+
+
+def _handle_get_inferences(args: dict[str, Any]) -> dict[str, Any]:
+    """Return proposed system inferences for the InferencesFeed panel."""
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session
+
+    with get_session() as session:
+        rows = session.execute(
+            sql_text("""
+            SELECT id, source_type, content, created_at
+            FROM expressions
+            WHERE source_type IN ('system_inference', 'drift_observation', 'potential_relation')
+              AND inference_status = 'proposed'
+            ORDER BY created_at DESC
+            LIMIT 200
+            """)
+        ).fetchall()
+
+    inferences = [
+        {"id": r[0], "source_type": r[1], "content": r[2], "created_at": str(r[3])}
+        for r in rows
+    ]
+    return {"inferences": inferences}
+
+
+def _handle_get_proposals(args: dict[str, Any]) -> dict[str, Any]:
+    """Return pending daemon proposals for the ProposalsFeed panel."""
+    from sqlalchemy import text as sql_text
+    from audiobench.core.db_session import get_session
+
+    with get_session() as session:
+        rows = session.execute(
+            sql_text("""
+            SELECT id, source_type, content, created_at
+            FROM expressions
+            WHERE source_type = 'daemon_proposal'
+              AND inference_status IN ('proposed', 'deferred')
+            ORDER BY created_at DESC
+            LIMIT 100
+            """)
+        ).fetchall()
+
+    proposals = [
+        {"id": r[0], "source_type": r[1], "content": r[2], "created_at": str(r[3])}
+        for r in rows
+    ]
+    return {"proposals": proposals}
+
+
+
 _HANDLERS: dict[str, Any] = {
     "ping": _handle_ping,
     "embed": _handle_embed,
@@ -255,6 +459,17 @@ _HANDLERS: dict[str, Any] = {
     "write_cache": _handle_write_cache,
     "embed_query": _handle_embed_query,
     "embed_segment": _handle_embed_segment,
+    "pipeline": _handle_pipeline,
+    "operate": _handle_operate,
+    "autocomplete": _handle_autocomplete,
+    "confirm_inference": _handle_confirm_inference,
+    "reject_inference": _handle_reject_inference,
+    "authorize_proposal": _handle_authorize_proposal,
+    "get_inferences": _handle_get_inferences,
+    "get_proposals": _handle_get_proposals,
+    "register_process": _handle_register_process,
+    "unregister_process": _handle_unregister_process,
+    "log_events": _handle_log_events,
 }
 
 
@@ -263,8 +478,14 @@ _HANDLERS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-def _dispatch(raw: str) -> str:
-    """Parse a JSON request line, call handler, return JSON response line."""
+from typing import AsyncGenerator
+import inspect
+
+async def _dispatch(raw: str) -> AsyncGenerator[str, None]:
+    """Parse a JSON request line, call handler, yield JSON response lines."""
+    global _last_request_time
+    _last_request_time = time.time()
+    
     request_id = "unknown"
     try:
         req: DaemonRequest = json.loads(raw)
@@ -276,13 +497,24 @@ def _dispatch(raw: str) -> str:
         if handler is None:
             raise ValueError(f"Unknown command: {cmd!r}")
 
-        data = handler(args)
-        response: DaemonResponse = {"success": True, "data": data, "request_id": request_id}
+        if inspect.isasyncgenfunction(handler):
+            async for frame in handler(args):
+                frame["request_id"] = request_id
+                yield json.dumps(frame)
+        else:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, handler, args)
+            response: DaemonResponse = {"status": "ok", "success": True, "data": data, "request_id": request_id}
+            yield json.dumps(response)
     except Exception as exc:
         logger.exception("Error handling request %s", request_id)
-        response = {"success": False, "error": str(exc), "request_id": request_id}
-
-    return json.dumps(response)
+        error_payload = {
+            "code": "OPERATION_FAILED",
+            "message": str(exc),
+            "request_id": request_id
+        }
+        response = {"status": "error", "success": False, "error": error_payload, "request_id": request_id}
+        yield json.dumps(response)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +523,7 @@ def _dispatch(raw: str) -> str:
 
 
 async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Handle a single client connection — reads one request, writes one response."""
+    """Handle a single client connection — reads one request, yields multiple response frames."""
     peer = writer.get_extra_info("peername", "<unknown>")
     try:
         raw = await asyncio.wait_for(reader.readline(), timeout=10.0)
@@ -300,15 +532,19 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
         raw_str = raw.decode("utf-8").strip()
         logger.debug("Received from %s: %s", peer, raw_str[:120])
 
-        # Run the (potentially blocking) handler in the default thread executor
-        # to keep the event loop free for new connections
-        loop = asyncio.get_running_loop()
-        response_str = await loop.run_in_executor(None, _dispatch, raw_str)
+        async for response_str in _dispatch(raw_str):
+            writer.write((response_str + "\n").encode("utf-8"))
+            await writer.drain()
 
-        writer.write((response_str + "\n").encode("utf-8"))
-        await writer.drain()
     except TimeoutError:
         logger.warning("Connection from %s timed out", peer)
+        try:
+            err = {"code": "TIMEOUT", "message": "Connection timed out", "request_id": "unknown"}
+            res = {"status": "error", "success": False, "error": err, "request_id": "unknown"}
+            writer.write((json.dumps(res) + "\n").encode("utf-8"))
+            await writer.drain()
+        except Exception:
+            pass
     except (ConnectionResetError, BrokenPipeError):
         logger.warning("Client %s disconnected before response could be sent", peer)
     except Exception:
@@ -382,6 +618,7 @@ def _do_sweep_once() -> None:
                                 "source_type": SourceType.AUDIO_TRANSCRIPT.value,
                                 "source_id": transcript.id,
                                 "speaker": chunk.speaker,
+                                "work_id": transcript.audio_file.work_id if transcript.audio_file else None,
                             }
                             for chunk in chunks
                         ]
@@ -397,6 +634,10 @@ def _do_sweep_once() -> None:
                                 "content": expr.content,
                                 "source_type": SourceType.AUDIO_TRANSCRIPT.value,
                                 "speaker": expr.speaker,
+                                "audio_file_id": transcript.audio_file_id,
+                                "confidence": transcript.language_probability,
+                                "original_language": transcript.language,
+                                "work_id": expr.work_id,
                             }
                             for expr in registered
                         ]
@@ -451,10 +692,19 @@ def _do_sweep_once() -> None:
                 with get_primary_inference_lock():
                     vectors = model.encode(
                         texts, batch_size=64, show_progress_bar=False,
-                        sort_by_length=True,
                     ).tolist()
+                mapped_rows = [
+                    dict(
+                        segment_id=r["id"],
+                        text=r["text"],
+                        start_time=r["start_time"],
+                        end_time=r["end_time"],
+                        source_file=r["file_path"],
+                    )
+                    for r in rows
+                ]
                 seg_store.batch_upsert_segments(
-                    rows=[dict(r) for r in rows], vectors=vectors
+                    rows=mapped_rows, vectors=vectors
                 )
                 done_ids = [int(r["id"]) for r in rows]
                 with get_session() as upd:
@@ -473,6 +723,45 @@ def _do_sweep_once() -> None:
                     "RAG sweep: failed to batch vectorize segments: %s", seg_exc
                 )
                 state.requeue_segments(seg_ids)
+
+    reconciled = _reconcile_metadata()
+    if reconciled > 0:
+        logger.info("RAG sweep: reconciled metadata for %d expressions.", reconciled)
+
+
+def _reconcile_metadata() -> int:
+    """Drain the reconciliation_queue and update LanceDB metadata."""
+    from audiobench.observatory.db import get_journal_db_path
+    import sqlite3
+    
+    conn = sqlite3.connect(str(get_journal_db_path()), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT id, expression_id, work_id FROM reconciliation_queue LIMIT 1000"
+        ).fetchall()
+        if not rows:
+            return 0
+        
+        store = _get_store()
+        for row in rows:
+            store.update_expression_work_id(
+                expression_id=row["expression_id"],
+                work_id=row["work_id"]
+            )
+            
+        ids = [row["id"] for row in rows]
+        conn.execute(
+            f"DELETE FROM reconciliation_queue WHERE id IN ({','.join('?' * len(ids))})", 
+            ids
+        )
+        conn.commit()
+        return len(rows)
+    except Exception as e:
+        logger.error("RAG sweep: metadata reconciliation failed: %s", e)
+        return 0
+    finally:
+        conn.close()
 
 
 def _refresh_sweep_state_incremental(state) -> None:
@@ -569,10 +858,37 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
         _sweep_state.unindexed_transcript_count(),
     )
 
+    from audiobench.daemon.recovery import get_startup_recovery
+    recovery = get_startup_recovery()
+    await asyncio.get_running_loop().run_in_executor(None, recovery.run)
+
+    from audiobench.jobs.runner import start_pid_watcher
+    start_pid_watcher()
+
+    from audiobench.daemon.autocomplete import get_autocomplete_index
+    await asyncio.get_running_loop().run_in_executor(None, get_autocomplete_index().build)
+
+    from audiobench.daemon.intelligence import IntelligenceScheduler
+    from audiobench.daemon.intelligence.pattern_detector import PatternDetector
+    from audiobench.daemon.intelligence.drift_detector import DriftDetector
+    from audiobench.daemon.intelligence.connection_surfer import ConnectionSurfer
+    from audiobench.daemon.intelligence.blind_spot_detector import BlindSpotDetector
+    from audiobench.daemon.intelligence.proposal_generator import ProposalGenerator
+    from audiobench.daemon.intelligence.operator_registry import get_operator_registry
+    
+    # Load dynamic operators
+    get_operator_registry().load_from_db(_get_store() if _memory_store else None)
+    
+    scheduler = IntelligenceScheduler()
+    scheduler.register(PatternDetector())
+    scheduler.register(DriftDetector())
+    scheduler.register(ConnectionSurfer())
+    scheduler.register(BlindSpotDetector())
+    scheduler.register(ProposalGenerator())
+    asyncio.create_task(scheduler.run_loop())
+
     _start_time = time.time()
     _write_pid_file(pid_path)
-
-
     server = await asyncio.start_unix_server(
         _handle_connection, 
         path=str(socket_path), 
@@ -611,6 +927,45 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     _cleanup(socket_path, pid_path)
 
 
+def _handle_work_assigned(audio_file_id: int, work_id: int, **kwargs: Any) -> None:
+    """Handle a work_assigned event (W3 stub / W4 queue insert)."""
+    logger.info("Received work_assigned event for audio_file_id=%d -> work_id=%d", audio_file_id, work_id)
+    
+    from audiobench.core.db_session import get_session
+    from audiobench.storage.models import ExpressionRecord, TranscriptionRecord
+    from audiobench.memory.enums import SourceType
+    from audiobench.observatory.db import get_journal_db_path
+    import sqlite3
+
+    try:
+        with get_session() as session:
+            exprs = session.query(ExpressionRecord.id).filter(
+                ExpressionRecord.source_id.in_(
+                    session.query(TranscriptionRecord.id)
+                    .filter_by(audio_file_id=audio_file_id)
+                ),
+                ExpressionRecord.source_type == SourceType.AUDIO_TRANSCRIPT.value
+            ).all()
+            expr_ids = [e.id for e in exprs]
+
+        if not expr_ids:
+            return
+
+        conn = sqlite3.connect(str(get_journal_db_path()), timeout=5.0)
+        try:
+            tuples = [(eid, work_id) for eid in expr_ids]
+            conn.executemany(
+                "INSERT INTO reconciliation_queue (expression_id, work_id) VALUES (?, ?)", 
+                tuples
+            )
+            conn.commit()
+            logger.info("Queued %d expressions for work_id=%d reconciliation", len(expr_ids), work_id)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("Failed to queue expressions for reconciliation: %s", e)
+
+
 def run() -> None:
     """Entry point — start the daemon (blocks until SIGTERM/SIGINT)."""
     from audiobench.core.logger_factory import setup_logging
@@ -631,5 +986,6 @@ def run() -> None:
 
     init_journal_db()
     get_bus().on("*", get_subscriber().record)
+    get_bus().on("work_assigned", _handle_work_assigned)
 
     asyncio.run(_serve(socket_path, pid_path))

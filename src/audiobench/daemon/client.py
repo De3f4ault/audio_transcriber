@@ -75,14 +75,10 @@ class DaemonClient:
         except Exception:
             return False
 
-    def _send(self, cmd: str, args: dict, _is_retry: bool = False) -> dict:
-        """Send one JSON request and read one JSON response.
+    from typing import Any, Generator
 
-        Raises:
-            ConnectionRefusedError: if socket is absent or daemon is not running (after retry).
-            TimeoutError: if the daemon doesn't respond within the timeout.
-            RuntimeError: if the daemon returns an error response.
-        """
+    def _stream(self, cmd: str, args: dict[str, Any], _is_retry: bool = False) -> Generator[dict[str, Any], None, None]:
+        """Send one JSON request and yield JSON response frames as they arrive."""
         request_id = str(uuid.uuid4())
         payload = json.dumps({"cmd": cmd, "args": args, "request_id": request_id}) + "\n"
 
@@ -92,38 +88,69 @@ class DaemonClient:
             sock.connect(str(self._socket_path))
             sock.sendall(payload.encode("utf-8"))
 
-            # Read until newline
-            chunks: list[bytes] = []
+            buf = bytearray()
             while True:
                 chunk = sock.recv(4096)
                 if not chunk:
                     break
-                chunks.append(chunk)
-                if b"\n" in chunk:
-                    break
-            raw = b"".join(chunks).strip()
+                buf.extend(chunk)
+                
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    
+                    response = json.loads(line.decode("utf-8"))
+                    yield response
+                    if response.get("status") in ("ok", "error") or ("success" in response and response.get("status") != "progress"):
+                        return
+
         except (ConnectionRefusedError, FileNotFoundError):
             sock.close()
             if not _is_retry:
                 logger.debug("Daemon not reachable, attempting auto-start...")
                 self._ensure_daemon_running()
-                return self._send(cmd, args, _is_retry=True)
+                yield from self._stream(cmd, args, _is_retry=True)
+                return
             raise
         finally:
-            # We already closed the socket if there was an exception, but close it here on success
             sock.close()
 
-        response: dict = json.loads(raw)
-        if not response.get("success"):
-            raise RuntimeError(f"Daemon error [{cmd}]: {response.get('error', 'unknown')}")
-        return dict(response.get("data", {}))
+    def _send(self, cmd: str, args: dict[str, Any], _is_retry: bool = False) -> dict[str, Any]:
+        """Send one JSON request and read one JSON response.
+
+        Raises:
+            ConnectionRefusedError: if socket is absent or daemon is not running (after retry).
+            TimeoutError: if the daemon doesn't respond within the timeout.
+            RuntimeError: if the daemon returns an error response.
+        """
+        terminal_response = None
+        for response in self._stream(cmd, args, _is_retry):
+            if response.get("status") == "progress":
+                continue
+            terminal_response = response
+            break
+
+        if terminal_response is None:
+            raise RuntimeError(f"Daemon error [{cmd}]: Connection closed before terminal response")
+
+        if terminal_response.get("status") == "error" or not terminal_response.get("success", True):
+            err = terminal_response.get("error", "unknown")
+            if isinstance(err, dict):
+                err = err.get("message", str(err))
+            raise RuntimeError(f"Daemon error [{cmd}]: {err}")
+
+        return dict(terminal_response.get("data", {}))
 
     # ------------------------------------------------------------------
     # RetrievalClient interface
     # ------------------------------------------------------------------
 
-    def ping(self) -> bool:
-        """Return True if the daemon is alive and responsive."""
+    def daemon_is_healthy(self) -> dict[str, Any] | None:
+        """Ping daemon and return the full health response dict.
+        
+        Returns None if daemon is not running or unreachable.
+        """
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(0.5)
@@ -132,19 +159,37 @@ class DaemonClient:
                 request_id = str(uuid.uuid4())
                 payload = json.dumps({"cmd": "ping", "args": {}, "request_id": request_id}) + "\n"
                 sock.sendall(payload.encode("utf-8"))
-                raw = sock.recv(4096)
-                response = json.loads(raw)
-                return bool(response.get("success"))
+                
+                buf = bytearray()
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    if b"\n" in buf:
+                        line, _ = buf.split(b"\n", 1)
+                        response = json.loads(line.decode("utf-8"))
+                        if response.get("status") == "ok" or response.get("success"):
+                            data = response.get("data", response)
+                            return dict(data)
+                        break
             finally:
                 sock.close()
         except Exception:
-            return False
+            pass
+        return None
+
+    def ping(self) -> bool:
+        """Return True if the daemon is alive and responsive."""
+        return bool(self.daemon_is_healthy())
 
     def search(
         self,
         query: str,
         top_k: int = 5,
         speaker_filter: str | None = None,
+        audio_file_id: int | None = None,
+        work_id: int | None = None,
         hyde_document: str | None = None,
         use_bm25: bool = True,
         use_dense: bool = True,
@@ -155,6 +200,8 @@ class DaemonClient:
             "query": query,
             "top_k": top_k,
             "speaker_filter": speaker_filter,
+            "audio_file_id": audio_file_id,
+            "work_id": work_id,
             "hyde_document": hyde_document,
             "use_bm25": use_bm25,
             "use_dense": use_dense,
@@ -203,17 +250,139 @@ class DaemonClient:
         data = self._send("rerank", {"query": query, "docs": docs})
         return list(data.get("scores", []))
 
+    def operate_on(self, target: int | str, verb: str, context: dict | None = None) -> dict:
+        """Execute a universal semantic operation via the daemon."""
+        args = {
+            "target": target,
+            "verb": verb,
+            "context": context or {},
+        }
+        data = self._send("operate", args)
+        return dict(data)
+
+    def operate_stream(self, target: int | str, verb: str, context: dict | None = None):
+        """Execute a universal semantic operation and stream progress frames."""
+        args = {
+            "target": target,
+            "verb": verb,
+            "context": context or {},
+        }
+        
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(60.0)
+        sock.connect(str(self._socket_path))
+        
+        request_id = str(uuid.uuid4())
+        payload = json.dumps({"cmd": "operate", "args": args, "request_id": request_id}) + "\n"
+        sock.sendall(payload.encode("utf-8"))
+        
+        buf = bytearray()
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    response = json.loads(line.decode("utf-8"))
+                    
+                    if response.get("status") == "progress":
+                        yield response
+                    elif response.get("status") == "ok":
+                        return response.get("data")
+                    elif response.get("status") == "error":
+                        raise RuntimeError(f"Operation failed: {response.get('error')}")
+        finally:
+            sock.close()
+
+    def pipeline_stream(
+        self,
+        steps: list[dict],
+        timeout: float = 120.0,
+    ):
+        """Execute a multi-step pipeline and stream progress frames back.
+
+        Yields every ``{"status": "progress", ...}`` frame as it arrives.
+        Consumes the terminal ``{"status": "ok" | "error"}`` frame internally;
+        raises RuntimeError on error.
+
+        Args:
+            steps: List of ``{verb, params}`` dicts defining the pipeline.
+            timeout: Per-socket timeout in seconds (default 120 s for long runs).
+        """
+        args = {"steps": steps}
+        for response in self._stream("pipeline", args):
+            status = response.get("status")
+            if status == "progress":
+                yield response
+            elif status == "ok":
+                return
+            elif status == "error":
+                raise RuntimeError(
+                    f"Pipeline error: {response.get('error', response)}"
+                )
+
+    def autocomplete(self, prefix: str, top_k: int = 5) -> list[dict]:
+        """Fetch semantic autocomplete results via the daemon fast-path."""
+        data = self._send("autocomplete", {"prefix": prefix, "top_k": top_k})
+        if "error" in data:
+            return []
+        return data.get("results", [])
+
     def check_cache(self, query: str, distance_threshold: float = 0.05) -> dict | None:
         """Check semantic cache via daemon."""
         data = self._send("check_cache", {"query": query, "distance_threshold": distance_threshold})
-        return data.get("result")
+        return dict(data) if data else None
 
     def write_cache(self, query: str, answer: str, hyde_document: str | None = None) -> None:
         """Write to semantic cache via daemon."""
-        args = {"query": query, "answer": answer}
-        if hyde_document:
-            args["hyde_document"] = hyde_document
-        self._send("write_cache", args)
+        self._send("write_cache", {"query": query, "answer": answer, "hyde_document": hyde_document})
+
+    def confirm_inference(self, expression_id: int) -> dict:
+        """Confirm a system inference."""
+        return self._send("confirm_inference", {"expression_id": expression_id})
+
+    def reject_inference(self, expression_id: int) -> dict:
+        """Reject a system inference."""
+        return self._send("reject_inference", {"expression_id": expression_id})
+
+    def authorize_proposal(self, expression_id: int) -> dict:
+        """Authorize a daemon proposal to hot-register an operator."""
+        return self._send("authorize_proposal", {"expression_id": expression_id})
+
+    def get_inferences(self) -> list[dict]:
+        """Return proposed system inferences (system_inference, drift_observation, potential_relation)."""
+        result = self._send("get_inferences", {})
+        return result.get("inferences", []) if result else []
+
+    def get_proposals(self) -> list[dict]:
+        """Return pending daemon proposals (proposed or deferred)."""
+        result = self._send("get_proposals", {})
+        return result.get("proposals", []) if result else []
+
+    def register_process(self, name: str, pid: int | None = None) -> None:
+        """Register this process in the Observatory managed_processes table."""
+        args: dict = {"name": name}
+        if pid is not None:
+            args["pid"] = pid
+        self._send("register_process", args)
+
+    def unregister_process(self, name: str, exit_code: int = 0) -> None:
+        """Mark this process stopped in the Observatory managed_processes table."""
+        self._send("unregister_process", {"name": name, "exit_code": exit_code})
+
+    def log_events(self, payloads: list[dict]) -> None:
+        """Forward a batch of observability event payloads to the daemon.
+
+        The daemon records them via its in-process ObservabilitySubscriber,
+        writing to journal.db without the CLI process needing its own
+        SQLite connection.
+
+        Raises on connection errors so callers can fall back to local SQLite.
+        """
+        self._send("log_events", {"payloads": payloads})
 
     def embed_query(self, text: str) -> list[float]:
         """Embed a query string using the daemon's warm Nomic model.
@@ -249,3 +418,4 @@ class DaemonClient:
                 "source_file": source_file,
             },
         )
+
