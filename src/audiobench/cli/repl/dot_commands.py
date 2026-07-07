@@ -257,6 +257,65 @@ def _resolve_provenance(expr) -> dict:
     return info
 
 
+def _render_results_ddm(
+    display_results: list[tuple],  # (expr_or_stub, score, prov, is_redacted)
+    query: str,
+    mode: str = "semantic",
+) -> None:
+    """Render DDM-aware search results.
+
+    Visible results render normally. Redacted results render as locked blocks
+    with the exact tier required to unlock, so the user always knows what
+    sensitive content exists without seeing it.
+    """
+    mode_label = "LanceDB Semantic" if mode == "semantic" else "SQLite FTS5"
+    console.print(f"\n  [{BOLD}]Semantic Results — {mode_label}[/]")
+    console.print(f"  [{DIM}]{'─' * 60}[/]")
+
+    for i, (expr_or_stub, score, prov, is_redacted) in enumerate(display_results, 1):
+        score_str = f"[{score:.2f}]" if mode == "semantic" else ""
+
+        if is_redacted:
+            stub = expr_or_stub
+            tier_label = stub.get("tier_label", "Tier ?")
+            tier_num = stub.get("privacy_tier", "?")
+            icon = _SOURCE_ICONS.get(stub.get("source_type", ""), "●")
+            label = _SOURCE_LABELS.get(stub.get("source_type", ""), "memory")
+            console.print(
+                f"  [{WARNING}][{i}][/] [{DIM}]{score_str}[/] "
+                f"[bold]{icon}[/] [{WARNING}]{label}[/]  "
+                f"[{WARNING}][REDACTED — {tier_label} required][/]"
+            )
+            console.print(f"       [{WARNING}]{'█' * 42}  🔒[/]")
+            console.print(
+                f"       [{DIM}]Run [{ACCENT}]\\unlock {tier_num}[/] to access this memory.[/]"
+            )
+            console.print()
+        else:
+            expr = expr_or_stub
+            icon = _SOURCE_ICONS.get(expr.source_type, "●")
+            label = _SOURCE_LABELS.get(expr.source_type, expr.source_type)
+            prov_parts = []
+            if prov.get("file_name"):
+                prov_parts.append(prov["file_name"])
+            elif prov.get("session_label"):
+                prov_parts.append(prov["session_label"])
+            elif prov.get("note_title"):
+                prov_parts.append(prov["note_title"])
+            prov_label = f'  "{prov_parts[0]}"' if prov_parts else ""
+            content = expr.content.strip().replace("\n", " ")
+            if len(content) > 120:
+                content = content[:117] + "..."
+            console.print(
+                f"  [{ACCENT}][{i}][/] [{DIM}]{score_str}[/] "
+                f"[bold]{icon}[/] [{ACCENT}]{label}[/]{prov_label}"
+            )
+            console.print(f"       [{DIM}]\"{content}\"[/]")
+            console.print()
+
+    console.print(f"  [{DIM}]{'─' * 60}[/]")
+
+
 def _render_results(
     results: list[tuple],  # list of (expr, score, provenance_dict)
     query: str,
@@ -473,6 +532,54 @@ def _chain_to_ask(session: ReplSession, expr) -> None:
         console.print(f"  [{DIM}]No focused transcript. Set focus with [{ACCENT}]\\focus <id>[/] first.[/]")
 
 
+# ── Dynamic Data Masking (DDM) intercept ────────────────────
+
+def _apply_ddm(
+    enriched: list[tuple],
+    session: ReplSession,
+) -> tuple[list[tuple], int]:
+    """Apply Dynamic Data Masking to search results.
+
+    Searches the ENTIRE corpus (no WHERE filter — this is DDM, not RLS).
+    After retrieval, results whose privacy_tier exceeds the session's
+    effective_tier() have their content replaced with a redaction stub.
+
+    Returns:
+        (display_results, redacted_count) where display_results is a list
+        of (expr_or_stub, score, prov, is_redacted) tuples.
+
+    Design:
+        - Public results (Tier 0) always visible.
+        - Redacted items still appear in the list with their position and
+          score so the user knows relevant-but-locked memories exist.
+        - The stub tells the user exactly which \\unlock tier they need.
+    """
+    current_tier = session.effective_tier()
+    display_results = []
+    redacted_count = 0
+
+    for expr, score, prov in enriched:
+        expr_tier = getattr(expr, "privacy_tier", 0)
+        if expr_tier <= current_tier:
+            display_results.append((expr, score, prov, False))
+        else:
+            tier_labels = {1: "Relational", 2: "Intimate", 3: "Override"}
+            tier_label = tier_labels.get(expr_tier, f"Tier {expr_tier}")
+            # Build a minimal stub dict to carry the redaction metadata
+            stub = {
+                "_redacted": True,
+                "privacy_tier": expr_tier,
+                "tier_label": tier_label,
+                "score": score,
+                # Preserve provenance so the user can see WHAT source it's from
+                "source_type": expr.source_type,
+            }
+            display_results.append((stub, score, prov, True))
+            redacted_count += 1
+
+    return display_results, redacted_count
+
+
 @register_dot("search")
 def dot_search(session: ReplSession, args: str) -> None:
     """Semantic search across the unified expression namespace.
@@ -531,14 +638,14 @@ def dot_search(session: ReplSession, args: str) -> None:
         # ── Semantic path: LanceDB ────────────────────────────
         console.print(f"  [{DIM}]Searching the expression namespace...[/]")
         try:
-            from audiobench.memory.memory_store import MemoryStore
-
+            from audiobench.daemon.factory import get_daemon_client
+            
             use_bm25 = preset in ("balanced", "deep")
             use_dense = True
             use_colbert = preset in ("balanced", "deep")
 
-            store = MemoryStore()
-            raw_results = store.search(
+            client = get_daemon_client()
+            raw_results = client.search(
                 query=query,
                 top_k=top_k,
                 use_bm25=use_bm25,
@@ -572,8 +679,20 @@ def dot_search(session: ReplSession, args: str) -> None:
             console.print(f"  [{DIM}]No results matched after filtering.[/]")
             return
 
-        _render_results(enriched, query, mode="semantic")
-        _interactive_result_loop(session, enriched, expr_repo)
+        # ── DDM: mask results above session tier ────────────────────────────
+        display_results, redacted_count = _apply_ddm(enriched, session)
+
+        if redacted_count > 0:
+            noun = "memory" if redacted_count == 1 else "memories"
+            console.print(
+                f"  [yellow]⚠[/]  [{WARNING}]{redacted_count} {noun} relevant but locked.[/] "
+                f"[{DIM}]Run [{ACCENT}]\\unlock[/] for full access.[/]"
+            )
+
+        # Pass only non-redacted items to the interactive loop
+        visible = [(e, s, p) for e, s, p, r in display_results if not r]
+        _render_results_ddm(display_results, query, mode="semantic")
+        _interactive_result_loop(session, visible, expr_repo)
 
     else:
         # ── Fallback: SQLite FTS ──────────────────────────────

@@ -9,7 +9,34 @@ from audiobench.cli.display.theme import ACCENT, BOLD, DIM, error_panel
 console = Console()
 
 
-def run_import_flow(session=None, restore_state=None, initial_mode="MODE_AUDIO") -> list[int]:
+def extract_metadata(file_path: Path) -> tuple[str | None, str | None]:
+    title, author = None, None
+    try:
+        import mutagen
+        m = mutagen.File(file_path, easy=True)
+        if m:
+            title = m.get("title", [None])[0]
+            if not title:
+                title = m.get("album", [None])[0]
+            author = m.get("artist", [None])[0]
+            if not author:
+                author = m.get("albumartist", [None])[0]
+    except ImportError:
+        pass
+    except Exception:
+        pass
+        
+    if not title:
+        name = file_path.stem
+        if " - " in name:
+            parts = name.split(" - ", 1)
+            if len(parts) >= 2:
+                author = parts[0].strip()
+                title = parts[1].strip()
+    return title, author
+
+
+def run_import_flow(session=None, restore_state=None, initial_mode="MODE_AUDIO", override_title=None, override_author=None) -> list[int]:
     """Run the import flow and return a list of newly imported or updated audio_file IDs."""
     try:
         import questionary
@@ -136,7 +163,8 @@ def run_import_flow(session=None, restore_state=None, initial_mode="MODE_AUDIO")
 
     # 5. Register to Database
     from audiobench.core.db_session import get_session
-    from audiobench.storage.models import AudioFileRecord
+    from audiobench.storage.models import AudioFileRecord, WorkRecord
+    from audiobench.observatory.context import log_event
 
     imported_ids = []
     with get_session() as session:
@@ -156,6 +184,19 @@ def run_import_flow(session=None, restore_state=None, initial_mode="MODE_AUDIO")
                         f"  [{DIM}]Skipped duplicate data for '{dest.name}', but updated engine to {engine}.[/]"
                     )
             else:
+                title, author = extract_metadata(dest)
+                if override_title: title = override_title
+                if override_author: author = override_author
+                
+                work_id = None
+                if title:
+                    work_record = session.query(WorkRecord).filter_by(title=title, author=author).first()
+                    if not work_record:
+                        work_record = WorkRecord(title=title, author=author)
+                        session.add(work_record)
+                        session.flush()
+                    work_id = work_record.id
+
                 # Create AudioFileRecord for the newly imported file
                 audio_record = AudioFileRecord(
                     file_path=str(dest),
@@ -164,9 +205,20 @@ def run_import_flow(session=None, restore_state=None, initial_mode="MODE_AUDIO")
                     format=dest.suffix.lstrip("."),
                     file_hash=file_hash,
                     tags=f'["engine_preference: {engine}"]',
+                    work_id=work_id,
                 )
                 session.add(audio_record)
                 session.flush()  # flush to get the id
+                
+                if not work_id:
+                    log_event(
+                        "import", 
+                        "work_unassigned", 
+                        f"Work could not be assigned for {dest.name}", 
+                        entity_type="audio_file", 
+                        entity_id=audio_record.id
+                    )
+                
                 imported_ids.append(audio_record.id)
         session.commit()
 
@@ -192,7 +244,9 @@ def run_import_flow(session=None, restore_state=None, initial_mode="MODE_AUDIO")
 @click.option("-T", "--transcript", is_flag=True, help="Reverse import: select transcript file first")
 @click.option("--batch", is_flag=True, help="Batch mode for --transcript (folder-to-folder mapping)")
 @click.option("--auto-detect", is_flag=True, help="Auto-detect mode: recursively scan and pair audio and transcript files")
-def import_cmd(transcript: bool, batch: bool, auto_detect: bool):
+@click.option("--title", default=None, help="Force assign a work title to imported files")
+@click.option("--author", default=None, help="Force assign a work author to imported files")
+def import_cmd(transcript: bool, batch: bool, auto_detect: bool, title: str | None, author: str | None):
     """Import audio files into the internal library.
 
     \b
@@ -213,4 +267,4 @@ def import_cmd(transcript: bool, batch: bool, auto_detect: bool):
     elif not any([transcript, batch, auto_detect]):
         initial_mode = "main_menu"
 
-    run_import_flow(initial_mode=initial_mode)
+    run_import_flow(initial_mode=initial_mode, override_title=title, override_author=author)

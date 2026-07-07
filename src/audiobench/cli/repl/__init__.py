@@ -232,6 +232,20 @@ def repl(transcript_id: int | None) -> None:
         return
 
     session = ReplSession(cli_group)
+
+    # ── Security gate (runs BEFORE any UI is shown) ───────────────────────────
+    # First-run: prompts to set passphrase + recovery key.
+    # Returning user: 3-attempt passphrase check; recovery key fallback.
+    # If auth fails fatally, exit before touching any data.
+    from audiobench.security.auth import run_startup_gate
+    from audiobench.core.settings import get_settings as _get_settings
+    if not run_startup_gate():
+        raise SystemExit(1)
+
+    # Start idle-lock watcher (daemon thread; no-op if idle_lock_seconds=0)
+    _security_settings = _get_settings()
+    session.start_idle_lock_watcher(idle_seconds=_security_settings.idle_lock_seconds)
+
     session.maybe_resume()
     session._load_history_ids()
     setup_completion(session)
@@ -272,6 +286,8 @@ def repl(transcript_id: int | None) -> None:
         complete_while_typing=False,  # only on Tab — never interrupt typing
     )
 
+    from datetime import UTC, datetime as _dt
+
     while True:
         try:
             user_input = prompt_session.prompt(session.prompt).strip()
@@ -280,6 +296,12 @@ def repl(transcript_id: int | None) -> None:
             log_event(subsystem="repl", event_type="session_ended", message="REPL session ended", level="INFO", session_id=SESSION_ID)
             print_goodbye(session)
             break
+
+        # ── Security: record keypress + show idle-lock notice ─────────────────
+        session.last_keystroke_at = _dt.now(UTC)
+        if session._idle_lock_fired:
+            console.print(f"  [{DIM}]● Auto-locked (idle).[/]")
+            session._idle_lock_fired = False
 
         if not user_input:
             continue

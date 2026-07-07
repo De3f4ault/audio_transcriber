@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import contextlib
 import json
-import contextlib
-import json
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import click
@@ -22,6 +23,9 @@ from prompt_toolkit.history import FileHistory
 
 from audiobench.cli.display.theme import DIM, SUCCESS, WARNING, console
 from audiobench.core.focused_entity import FocusedEntity
+from audiobench.core.logger_factory import get_logger
+
+logger = get_logger("cli.repl.session")
 
 
 # ── Navigation Stack ─────────────────────────────────────────
@@ -80,6 +84,18 @@ class ReplSession:
         # ── Navigation stack ──
         self.navigation_stack: deque[NavigationFrame] = deque()
         self._stack_path = _data_dir / "session_stack.json"
+
+        # ── Security / Privacy Tier ──────────────────────────────────────
+        # 0 = public (default), 1 = relational (10-min TTL), 2+ = intimate
+        self.unlocked_tier: int = 0
+        self.tier1_unlocked_at: datetime | None = None
+        self.last_keystroke_at: datetime = datetime.now(UTC)
+        # Set to True by the idle-lock watcher thread; cleared on next prompt
+        self._idle_lock_fired: bool = False
+        # Session-level unlock: stays active for the whole REPL session.
+        # Only cleared by \lock or the idle-lock watcher.
+        # Tier 3 is intentionally excluded — it is always per-query.
+        self.session_unlock_tier: int = 0
 
     def _get_repo(self):
         """Lazy-init the transcription repository."""
@@ -183,8 +199,14 @@ class ReplSession:
 
     @property
     def prompt(self) -> Any:
-        """Return the dynamic prompt, formatted for prompt_toolkit."""
-        # Navigation depth signal: [↓2] when inside the stack
+        """Return the dynamic prompt, formatted for prompt_toolkit.
+
+        Badge order (left → right):
+            [N job(s)]   background job indicator
+            ★N           session-unlock tier (only when session_unlock_tier > 0)
+            ↓N           navigation stack depth
+            label ❯      focus label + arrow
+        """
         job_badge = ""
         try:
             from audiobench.core.settings import get_settings
@@ -200,21 +222,30 @@ class ReplSession:
         except Exception:
             pass
 
-        # Navigation depth signal: [↓2] when inside the stack
+        # ★N — permanent session-unlock indicator.
+        # Visible whenever session_unlock_tier > 0, reminding the user their
+        # session is elevated even when not actively typing security commands.
+        sec_badge = ""
+        if self.session_unlock_tier > 0:
+            sec_badge = f"<ansigreen>★{self.session_unlock_tier}</ansigreen> "
+
         depth = len(self.navigation_stack)
         depth_badge = f"<style color='gray'>↓{depth}</style> " if depth > 0 else ""
 
         if self.focus:
             label = self.focus.display_label
-            # Escape HTML characters in label just in case
             label = label.replace("<", "&lt;").replace(">", "&gt;")
             return HTML(
                 f"{job_badge}"
+                f"{sec_badge}"
                 f"<ansicyan><b>{label}</b></ansicyan> "
                 f"{depth_badge}"
                 f"<ansimagenta><b>❯</b></ansimagenta> "
             )
-        return HTML(f"{job_badge}{depth_badge}<ansimagenta><b>❯</b></ansimagenta> ")
+        return HTML(
+            f"{job_badge}{sec_badge}{depth_badge}"
+            f"<ansimagenta><b>❯</b></ansimagenta> "
+        )
 
     # ── Variable expansion ──
 
@@ -312,6 +343,73 @@ class ReplSession:
         """Refresh the current context if needed."""
         # Refresh logic is implicit now since last_id fetches live from DB
         pass
+
+    # ── Security / Privacy Tier ──────────────────────────────────────────
+
+    def effective_tier(self) -> int:
+        """Return the current effective unlocked tier.
+
+        Priority (highest wins):
+          1. session_unlock_tier  — set by \\unlock N --session, persists for
+                                    the whole REPL session (cleared by \\lock
+                                    or idle-lock only).
+          2. unlocked_tier        — set by \\unlock N without --session.
+                                    Tier 1 has a 10-minute TTL; Tier 2+ is
+                                    per-query (no TTL, re-auth each time).
+
+        Tier 3 can never get a session_unlock_tier — it is always per-query.
+        """
+        # Session unlock wins if it's higher than the per-query unlock
+        if self.session_unlock_tier > 0:
+            return max(self.session_unlock_tier, self._per_query_tier())
+        return self._per_query_tier()
+
+    def _per_query_tier(self) -> int:
+        """Evaluate the per-query unlock tier with TTL logic."""
+        now = datetime.now(UTC)
+        if self.unlocked_tier >= 2:
+            return self.unlocked_tier
+        if self.unlocked_tier == 1 and self.tier1_unlocked_at is not None:
+            elapsed = (now - self.tier1_unlocked_at).total_seconds()
+            if elapsed < 600:  # 10 minutes
+                return 1
+            # TTL expired — silently demote
+            self.unlocked_tier = 0
+            self.tier1_unlocked_at = None
+        return 0
+
+    def start_idle_lock_watcher(self, idle_seconds: int = 180) -> None:
+        """Start a daemon thread that drops the unlock tier after N seconds idle.
+
+        Idle is defined as time elapsed since the last keypress recorded
+        in ``last_keystroke_at``. Background jobs, daemons, and AI responses
+        do NOT reset the idle clock — only physical keyboard input does.
+
+        When the lock fires, ``_idle_lock_fired`` is set to True so the
+        next prompt render can display a non-intrusive notice.
+
+        Args:
+            idle_seconds: Inactivity threshold in seconds (0 = disabled).
+        """
+        if idle_seconds <= 0:
+            return
+
+        def _watcher() -> None:
+            while True:
+                time.sleep(15)          # poll every 15 s
+                if self.unlocked_tier == 0 and self.session_unlock_tier == 0:
+                    continue            # nothing to lock, skip cheaply
+                idle = (datetime.now(UTC) - self.last_keystroke_at).total_seconds()
+                if idle >= idle_seconds:
+                    self.unlocked_tier = 0
+                    self.tier1_unlocked_at = None
+                    self.session_unlock_tier = 0   # session unlock cleared on idle
+                    self._idle_lock_fired = True
+                    logger.debug("Idle-lock fired after %.0fs of inactivity", idle)
+
+        t = threading.Thread(target=_watcher, daemon=True, name="ab-idle-lock")
+        t.start()
+        logger.debug("Idle-lock watcher started (threshold: %ds)", idle_seconds)
 
     # ── Navigation stack ─────────────────────────────────────
 

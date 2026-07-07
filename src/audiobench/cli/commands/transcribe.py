@@ -240,6 +240,11 @@ from audiobench.core.settings import get_settings
     is_flag=True,
     help="Guided wizard: prompts for engine, model, diarization, and other options",
 )
+@click.option(
+    "--sensitive",
+    is_flag=True,
+    help="Mark transcription as Tier 3 (Override) immediately, bypassing biometric engine",
+)
 def transcribe(
     files: tuple[str, ...],
     output_format: str | None,
@@ -283,6 +288,7 @@ def transcribe(
     skip_ghost: bool,
     parallel_gpus: bool,
     workers: int,
+    sensitive: bool,
 ) -> None:
     """Transcribe audio or video files to text.
 
@@ -920,6 +926,7 @@ def transcribe(
             "skip_ghost": skip_ghost,
             "workers": workers,
             "model": settings.model_name,
+            "sensitive": sensitive,
         }
         
         pt = ParallelTranscriber()
@@ -1010,6 +1017,7 @@ def transcribe(
                 enable_diarization=diarize,
                 diarize_mode=diarize_mode,
                 diarize_threshold=diarize_threshold,
+                sensitive=sensitive,
                 map_speakers=map_speakers,
                 auto_name=auto_name,
                 on_phase=tracker.update,
