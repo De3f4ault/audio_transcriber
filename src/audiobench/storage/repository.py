@@ -100,16 +100,21 @@ class TranscriptionRepository:
         chapter_id: int | None = None,
         on_phase: object | None = None,
         overwrite: bool = False,
+        privacy_tier: int = 0,
     ) -> int:
         """
         Save a complete transcription to the database.
-        
+
         Args:
-            transcript: The transcript to save.
+            transcript:   The transcript to save.
             audio_metadata: Source audio metadata (for dedup by hash).
-            chapter_id: Optional chapter ID if this is a chapter transcription.
-            on_phase: Optional callback for phase progress.
-            overwrite: If True, deletes any existing transcription for this audio.
+            chapter_id:   Optional chapter ID if this is a chapter transcription.
+            on_phase:     Optional callback for phase progress.
+            overwrite:    If True, deletes any existing transcription for this audio.
+            privacy_tier: Minimum privacy tier to stamp on all segments.
+                          0 = public (default, biometric pass may upgrade).
+                          2 = intimate (--sensitive flag, stamps all segments Tier 2
+                              regardless of voiceprint match).
 
         Returns:
             The transcription record ID.
@@ -243,7 +248,8 @@ class TranscriptionRepository:
             session.add(tx_record)
             session.flush()
 
-            # Save segments
+            # Save segments — stamp privacy_tier from --sensitive flag (or 0 default)
+            saved_segment_ids = []
             for seg in transcript.segments:
                 seg_record = SegmentRecord(
                     transcription_id=tx_record.id,
@@ -253,8 +259,11 @@ class TranscriptionRepository:
                     end_time=seg.end,
                     speaker=seg.speaker,
                     chapter_id=chapter_id,
+                    privacy_tier=privacy_tier,
                 )
                 session.add(seg_record)
+                session.flush()  # get the ID
+                saved_segment_ids.append(seg_record.id)
 
             if chapter_record:
                 chapter_record.transcription_id = tx_record.id
@@ -262,8 +271,18 @@ class TranscriptionRepository:
 
             session.commit()
             logger.info(
-                "Saved transcription #%d (%d segments)", tx_record.id, len(transcript.segments)
+                "Saved transcription #%d (%d segments, privacy_tier=%d)",
+                tx_record.id, len(transcript.segments), privacy_tier,
             )
+
+            # ── Background biometric pass ──────────────────────────────────────────
+            # Only run if: voiceprint enrolled AND segments not already manually
+            # stamped at Tier 2 via --sensitive (biometric pass would be redundant).
+            # This is fire-and-forget in a daemon thread so it never blocks the REPL.
+            if privacy_tier < 2:
+                audio_path = audio_metadata.file_path if audio_metadata else None
+                tx_id_for_pass = tx_record.id
+                self._schedule_biometric_pass(saved_segment_ids, audio_path, tx_id_for_pass)
 
             # --- PHASE 5: Expression Registration & Chunking ---
             try:
@@ -274,6 +293,67 @@ class TranscriptionRepository:
                 )
 
             return tx_record.id
+
+    def _schedule_biometric_pass(
+        self,
+        segment_ids: list[int],
+        audio_path: str | None,
+        tx_id: int,
+    ) -> None:
+        """Launch a background biometric pass for newly saved segments.
+
+        Fire-and-forget: spawns a daemon thread so the REPL is never blocked.
+        Skips silently if no voiceprint is enrolled or no audio path given.
+        """
+        import threading
+
+        def _run() -> None:
+            try:
+                from audiobench.security.voiceprint import (
+                    is_enrolled, tag_segments_batch, _load_audio, _load_ecapa,
+                    _voiceprint_path,
+                )
+                import numpy as np
+                from pathlib import Path
+
+                if not is_enrolled() or not audio_path or not Path(audio_path).exists():
+                    return
+
+                from audiobench.core.db_session import get_session as db_session
+                from audiobench.storage.models import SegmentRecord
+
+                waveform, sr = _load_audio(Path(audio_path))
+                model = _load_ecapa()
+
+                # Collect audio slices for segments in this transcription
+                with db_session() as s:
+                    segs = (
+                        s.query(SegmentRecord)
+                        .filter(SegmentRecord.id.in_(segment_ids))
+                        .filter(SegmentRecord.privacy_tier == 0)
+                        .order_by(SegmentRecord.segment_index)
+                        .all()
+                    )
+                    slices = []
+                    ids = []
+                    for seg in segs:
+                        start = int(seg.start_time * sr)
+                        end = int(seg.end_time * sr)
+                        audio_slice = waveform[start:end]
+                        if len(audio_slice) >= int(sr * 0.5):
+                            slices.append(audio_slice)
+                            ids.append(seg.id)
+
+                tag_segments_batch(ids, slices, sr, model=model)
+                logger.info(
+                    "Biometric pass complete for tx #%d (%d segments evaluated)",
+                    tx_id, len(ids),
+                )
+            except Exception as exc:
+                logger.warning("Background biometric pass failed for tx #%d: %s", tx_id, exc)
+
+        t = threading.Thread(target=_run, daemon=True, name=f"bio-pass-tx{tx_id}")
+        t.start()
 
     def _register_expressions(
         self, transcription_id: int, transcript: Transcript, chapter_id: int | None, on_phase: object | None = None

@@ -23,6 +23,25 @@ class Base(DeclarativeBase):
     pass
 
 
+class WorkRecord(Base):
+    """A semantic work that groups audio files and expressions."""
+
+    __tablename__ = "works"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    author: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    # Relationships
+    audio_files: Mapped[list[AudioFileRecord]] = relationship(back_populates="work")
+    expressions: Mapped[list[ExpressionRecord]] = relationship(back_populates="work")
+
+    def __repr__(self) -> str:
+        author_str = f", author='{self.author}'" if self.author else ""
+        return f"<Work(id={self.id}, title='{self.title[:30]}'{author_str})>"
+
+
 class AudioFileRecord(Base):
     """Persisted audio file metadata."""
 
@@ -39,8 +58,12 @@ class AudioFileRecord(Base):
     file_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
     tags: Mapped[str] = mapped_column(Text, default="[]")
+    work_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("works.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     # Relationships
+    work: Mapped[WorkRecord | None] = relationship(back_populates="audio_files")
     chapters: Mapped[list[ChapterRecord]] = relationship(
         back_populates="audio_file",
         cascade="all, delete-orphan",
@@ -185,6 +208,8 @@ class SegmentRecord(Base):
     chapter_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("chapters.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Security: 0=public, 1=relational, 2=intimate (voiceprint), 3=manual override
+    privacy_tier: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
 
     # Relationships
     transcription: Mapped[TranscriptionRecord] = relationship(back_populates="segments")
@@ -348,11 +373,17 @@ class ExpressionRecord(Base):
     speaker: Mapped[str | None] = mapped_column(String(64), nullable=True)
     inference_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     inference_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    work_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("works.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Security: mirrors segments.privacy_tier — inherited during expression creation
+    privacy_tier: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC), index=True
     )
 
     # Relationships
+    work: Mapped[WorkRecord | None] = relationship(back_populates="expressions")
     relations_from: Mapped[list[ExpressionRelation]] = relationship(
         "ExpressionRelation",
         foreign_keys="ExpressionRelation.from_expression_id",

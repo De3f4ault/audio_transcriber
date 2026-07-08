@@ -167,7 +167,8 @@ def init_db() -> None:
             except Exception as e:
                 logger.warning("Migration m011 failed (non-fatal): %s", e)
 
-            # Run the new idempotent SQL migrations (Phase 0/1)
+            # Run the new idempotent SQL migrations (Phase 0/1 and security layer)
+            # Includes: 001–024 (core schema) and 025 (privacy_tier — security layer)
             try:
                 from pathlib import Path
 
