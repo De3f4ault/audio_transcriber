@@ -30,6 +30,8 @@ from audiobench.cli.tui.panels.events import LiveEventsPanel
 from audiobench.cli.tui.panels.health import HealthPanel
 from audiobench.cli.tui.panels.processes import ProcessesPanel
 from audiobench.cli.tui.panels.operations import OperationsPanel
+from audiobench.cli.tui.panels.inferences import InferencesFeed
+from audiobench.cli.tui.panels.proposals import ProposalsFeed
 
 
 # ── TCSS ──────────────────────────────────────────────────────────────────────
@@ -138,6 +140,40 @@ HealthPanel {
     background: #101010;
 }
 OperationsPanel {
+    background: #101010;
+    height: 1fr;
+}
+
+/* ── Intelligence row (inferences + proposals) ── */
+#intelligence-row {
+    layout: horizontal;
+    height: 14;
+}
+
+#inferences-box {
+    width: 1fr;
+    height: 1fr;
+    border: solid #2a2a2a;
+    border-title-color: #3d9a50;
+    border-title-style: bold;
+    padding: 0;
+    background: #101010;
+}
+InferencesFeed {
+    background: #101010;
+    height: 1fr;
+}
+
+#proposals-box {
+    width: 1fr;
+    height: 1fr;
+    border: solid #2a2a2a;
+    border-title-color: #b54800;
+    border-title-style: bold;
+    padding: 0;
+    background: #101010;
+}
+ProposalsFeed {
     background: #101010;
     height: 1fr;
 }
@@ -301,7 +337,7 @@ class ObservatoryApp(App):
                     id="events-panel",
                 )
 
-            # Bottom half
+            # Bottom half: processes / health / jobs
             with Horizontal(id="bottom-row"):
                 with Vertical(id="processes-box"):
                     yield ProcessesPanel(id="processes-panel")
@@ -309,6 +345,16 @@ class ObservatoryApp(App):
                     yield HealthPanel(id="health-panel")
                 with Vertical(id="ops-box"):
                     yield OperationsPanel(id="ops-panel")
+
+            # Intelligence row: inferences + proposals
+            # Both panels were built and unit-tested in isolation (2026-07-05)
+            # but were not mounted here until this fix — regression tests in
+            # tests/test_daemon/test_observatory_app.py guard this connection.
+            with Horizontal(id="intelligence-row"):
+                with Vertical(id="inferences-box"):
+                    yield InferencesFeed(id="inferences-panel")
+                with Vertical(id="proposals-box"):
+                    yield ProposalsFeed(id="proposals-panel")
 
         yield Footer()
 
@@ -337,10 +383,12 @@ class ObservatoryApp(App):
         return f" Events  sub:{sub}  lvl:{lvl}  {noise} "
 
     def _update_titles(self) -> None:
-        self.query_one("#events-box").border_title     = self._events_title()
-        self.query_one("#processes-box").border_title  = " Processes "
-        self.query_one("#health-box").border_title     = " Health "
-        self.query_one("#ops-box").border_title        = " Jobs "
+        self.query_one("#events-box").border_title       = self._events_title()
+        self.query_one("#processes-box").border_title    = " Processes "
+        self.query_one("#health-box").border_title       = " Health "
+        self.query_one("#ops-box").border_title          = " Jobs "
+        self.query_one("#inferences-box").border_title   = " Inferences "
+        self.query_one("#proposals-box").border_title    = " Proposals "
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
@@ -388,9 +436,11 @@ class ObservatoryApp(App):
         self.notify(f"Subsystem → {label}", timeout=1)
 
     def action_force_refresh(self) -> None:
-        self.query_one("#health-panel",    HealthPanel)._refresh()
-        self.query_one("#processes-panel", ProcessesPanel)._refresh()
-        self.query_one("#ops-panel",       OperationsPanel)._refresh()
+        self.query_one("#health-panel",      HealthPanel)._refresh()
+        self.query_one("#processes-panel",   ProcessesPanel)._refresh()
+        self.query_one("#ops-panel",         OperationsPanel)._refresh()
+        self.query_one("#inferences-panel",  InferencesFeed)._refresh_feed()
+        self.query_one("#proposals-panel",   ProposalsFeed)._refresh_feed()
         self.notify("Panels refreshed", timeout=1)
 
     def on_live_events_panel_open_detail(self, message: LiveEventsPanel.OpenDetail) -> None:

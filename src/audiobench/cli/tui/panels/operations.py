@@ -99,91 +99,66 @@ class OperationsPanel(DataTable):
         try:
             from audiobench.core.settings import get_settings
             from audiobench.jobs.runner import get_job_phase
-            
+
             db_path = Path(get_settings().database_url.replace("sqlite:///", ""))
             conn = sqlite3.connect(str(db_path))
-            
-            # 1. Daemon-queued jobs
-            queue_rows = conn.execute(
-                "SELECT id, file_path, engine, status, created_at "
-                "FROM job_queue WHERE status IN ('pending', 'processing') "
-                "ORDER BY created_at ASC LIMIT 10"
+
+            rows = conn.execute(
+                "SELECT id, source, label, engine, status, started_at "
+                "FROM all_jobs "
+                "WHERE status IN ('running', 'pending', 'processing') "
+                "ORDER BY started_at ASC LIMIT 20"
             ).fetchall()
-            
-            # 2. CLI background jobs
-            cli_rows = conn.execute(
-                "SELECT id, command, audio_file, status, started_at "
-                "FROM jobs WHERE status = 'running' "
-                "ORDER BY started_at ASC LIMIT 10"
-            ).fetchall()
-            
+
             conn.close()
         except Exception:
             return
 
-        # We must track selected row to restore it after clear
+        # Preserve selected row key across refresh
         selected_key = None
         if self.cursor_row is not None:
             try:
-                selected_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key.value
+                selected_key = self.coordinate_to_cell_key(
+                    self.cursor_coordinate
+                ).row_key.value
             except Exception:
                 pass
 
         self.clear()
 
-        if not queue_rows and not cli_rows:
+        if not rows:
             return
 
-        # Add CLI background jobs first
-        for job_id, command, audio_file, status, created_at in cli_rows:
+        for job_id, source, label, engine, status, started_at in rows:
             color = _STATUS_COLOR.get(status, "white")
             icon  = _STATUS_ICON.get(status, "?")
-            
-            short_path = (audio_file or command.split()[-1] if command else "—")
-            p = Path(short_path)
-            display_path = p.name if len(str(p)) > 38 else short_path
-            short_ts = (created_at or "")[:16] if created_at else "—"
-            
-            phase_raw = get_job_phase(job_id)
+
+            short_label = label or "—"
+            p = Path(short_label)
+            display_label = p.name if len(str(p)) > 38 else short_label
+            short_ts = (started_at or "")[:16] if started_at else "—"
+
+            phase_raw = get_job_phase(job_id) if source == "jobs" else status
             phase = phase_raw
             progress_bar = Text("—", style="dim")
-            
+
             if "%" in phase_raw:
                 match = re.search(r'(\d+)%', phase_raw)
                 if match:
                     pct = float(match.group(1)) / 100.0
                     progress_bar = _bar(pct)
                     phase = phase_raw.split()[0]
-            
+
             self.add_row(
                 Text(icon, style=f"bold {color}"),
-                Text(display_path, style="#cfd8dc"),
-                Text("cli", style="bold #90a4ae"),
+                Text(display_label, style="#cfd8dc"),
+                Text(engine or ("cli" if source == "jobs" else "—"), style="bold #90a4ae"),
                 Text(phase, style=color),
                 progress_bar,
                 Text(short_ts, style="dim"),
-                key=f"cli:{job_id}"
+                key=f"{source}:{job_id}",
             )
 
-        # Add queue jobs
-        for job_id, file_path, engine, status, created_at in queue_rows:
-            color = _STATUS_COLOR.get(status, "white")
-            icon  = _STATUS_ICON.get(status, "?")
-            short_path = (file_path or "—")
-            p = Path(short_path)
-            display_path = p.name if len(str(p)) > 38 else short_path
-            short_ts = (created_at or "")[:16] if created_at else "—"
-
-            self.add_row(
-                Text(icon, style=f"bold {color}"),
-                Text(display_path, style="#cfd8dc"),
-                Text(engine or "—", style="#90a4ae"),
-                Text(status, style=color),
-                Text("—", style="dim"),
-                Text(short_ts, style="dim"),
-                key=f"queue:{job_id}"
-            )
-            
         # Restore selection
         if selected_key:
             for i, row_key in enumerate(self.rows):

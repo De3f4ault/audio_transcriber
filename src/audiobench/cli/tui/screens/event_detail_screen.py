@@ -98,10 +98,10 @@ class EventDetailScreen(Screen):
         self._load_data()
 
     def _load_data(self) -> None:
-        from audiobench.core.settings import get_settings
-        db_path = Path(get_settings().database_url.replace("sqlite:///", ""))
+        from audiobench.observatory.db import get_journal_db_path
+        db_path = get_journal_db_path()
         
-        query = "SELECT timestamp, level, subsystem, event_type, message FROM events "
+        query = "SELECT timestamp, level, subsystem, event_type, message FROM system_events "
         params = []
         conditions = []
 
