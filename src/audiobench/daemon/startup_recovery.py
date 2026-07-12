@@ -127,17 +127,18 @@ def UnindexedExpressionRecovery(sweep_state=None) -> int:
     with get_session() as session:
         rows = session.execute(
             sql_text("""
-            SELECT id FROM expressions
-            WHERE source_type IN ('audio_transcript', 'system_inference',
-                                  'drift_observation', 'potential_relation')
+            SELECT e.id, e.source_id 
+            FROM expressions e
+            JOIN transcriptions t ON e.source_id = t.id
+            WHERE e.source_type = 'audio_transcript'
             """)
         ).fetchall()
 
-    missing = [r[0] for r in rows if r[0] not in indexed_ids]
-    if missing:
-        sweep_state.unindexed_transcript_ids.extend(missing)
-        logger.info("UnindexedExpressionRecovery: queued %d expression(s).", len(missing))
-    return len(missing)
+    missing_tx = {r[1] for r in rows if r[0] not in indexed_ids and r[1] is not None}
+    if missing_tx:
+        sweep_state.unindexed_transcript_ids.extend(list(missing_tx))
+        logger.info("UnindexedExpressionRecovery: queued %d transcript(s) to recover missing expressions.", len(missing_tx))
+    return len(missing_tx)
 
 
 def WorkAssignedBackfill() -> int:

@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,12 @@ _start_time: float = 0.0
 _last_request_time: float = time.time()
 _memory_store: MemoryStore | None = None
 _segment_store: SegmentVectorStore | None = None
-_sweep_state = None  # audiobench.daemon.sweep_state.SweepState — loaded lazily
+import threading
+from audiobench.daemon.sweep_state import SweepState  # type hinting
+_sweep_state: SweepState | None = None  # loaded lazily
+
+_optimize_lock = threading.Lock()
+_optimize_in_progress: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +453,24 @@ def _handle_get_proposals(args: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _handle_optimize(args: dict[str, Any]) -> dict[str, Any]:
+    """Run LanceDB optimize on all tables (on-demand via CLI)."""
+    from audiobench.daemon.lancedb_optimizer import _do_optimize_all_tables
+    global _optimize_in_progress
+    
+    with _optimize_lock:
+        if _optimize_in_progress:
+            return {"error": "Optimization already in progress"}
+        _optimize_in_progress = True
+        
+    try:
+        result = _do_optimize_all_tables(triggered_by="cli_command")
+        return result
+    finally:
+        with _optimize_lock:
+            _optimize_in_progress = False
+
+
 _HANDLERS: dict[str, Any] = {
     "ping": _handle_ping,
     "embed": _handle_embed,
@@ -470,6 +494,7 @@ _HANDLERS: dict[str, Any] = {
     "register_process": _handle_register_process,
     "unregister_process": _handle_unregister_process,
     "log_events": _handle_log_events,
+    "optimize": _handle_optimize,
 }
 
 
@@ -645,6 +670,9 @@ def _do_sweep_once() -> None:
                             nodes,
                             indexed_ids=state.indexed_expression_ids,
                         )
+                        from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
+                        increment_unoptimized_writes(len(nodes))
+                        _maybe_trigger_threshold_optimize()
 
                     transcript.is_indexed = 1
                     success_ids.append(transcript.id)
@@ -671,7 +699,8 @@ def _do_sweep_once() -> None:
     else:
         logger.info("RAG sweep: vectorizing %d segments from deque...", len(seg_ids))
         with get_session() as session:
-            placeholders = ", ".join(str(i) for i in seg_ids)
+            named_params = {f"id{i}": sid for i, sid in enumerate(seg_ids)}
+            placeholders = ", ".join(f":id{i}" for i in range(len(seg_ids)))
             rows = session.execute(
                 sql_text(
                     f"SELECT s.id, s.text, s.start_time, s.end_time, af.file_path "
@@ -679,7 +708,8 @@ def _do_sweep_once() -> None:
                     f"JOIN transcriptions t ON s.transcription_id = t.id "
                     f"JOIN audio_files af ON t.audio_file_id = af.id "
                     f"WHERE s.id IN ({placeholders})"
-                )
+                ),
+                named_params,
             ).mappings().all()
             rows = list(rows)
 
@@ -706,13 +736,19 @@ def _do_sweep_once() -> None:
                 seg_store.batch_upsert_segments(
                     rows=mapped_rows, vectors=vectors
                 )
+                from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
+                increment_unoptimized_writes(len(mapped_rows))
+                _maybe_trigger_threshold_optimize()
+
                 done_ids = [int(r["id"]) for r in rows]
                 with get_session() as upd:
-                    id_list = ", ".join(str(i) for i in done_ids)
+                    upd_params = {f"id{i}": sid for i, sid in enumerate(done_ids)}
+                    id_placeholders = ", ".join(f":id{i}" for i in range(len(done_ids)))
                     upd.execute(
                         sql_text(
-                            f"UPDATE segments SET vector_indexed=1 WHERE id IN ({id_list})"
-                        )
+                            f"UPDATE segments SET vector_indexed=1 WHERE id IN ({id_placeholders})"
+                        ),
+                        upd_params,
                     )
                     upd.commit()
                 logger.info(
@@ -727,6 +763,8 @@ def _do_sweep_once() -> None:
     reconciled = _reconcile_metadata()
     if reconciled > 0:
         logger.info("RAG sweep: reconciled metadata for %d expressions.", reconciled)
+        
+    _maybe_trigger_threshold_optimize()
 
 
 def _reconcile_metadata() -> int:
@@ -762,6 +800,43 @@ def _reconcile_metadata() -> int:
         return 0
     finally:
         conn.close()
+
+
+def _maybe_trigger_threshold_optimize() -> None:
+    """Check write threshold and run optimize in background if exceeded."""
+    from audiobench.core.settings import get_settings
+    from audiobench.daemon.lancedb_optimizer import read_optimize_state
+    
+    settings = get_settings()
+    threshold = settings.lancedb_optimize_write_threshold
+    if threshold <= 0:
+        return
+        
+    state = read_optimize_state()
+    current_writes = state["unoptimized_writes"]
+        
+    if current_writes >= threshold:
+        global _optimize_in_progress
+        with _optimize_lock:
+            if _optimize_in_progress:
+                return
+            _optimize_in_progress = True
+            
+        logger.info("Write threshold reached (%d >= %d). Triggering background optimize.", current_writes, threshold)
+        
+        def run_bg() -> None:
+            from audiobench.daemon.lancedb_optimizer import _do_optimize_all_tables
+            global _optimize_in_progress
+            
+            try:
+                _do_optimize_all_tables(triggered_by="write_threshold")
+            except Exception as e:
+                logger.error("Background optimize failed: %s", e)
+            finally:
+                with _optimize_lock:
+                    _optimize_in_progress = False
+                    
+        threading.Thread(target=run_bg, name="lancedb-optimize-bg", daemon=True).start()
 
 
 def _refresh_sweep_state_incremental(state) -> None:
@@ -816,6 +891,26 @@ def _rag_consistency_sweep_sync() -> None:
 
     # Initial delay — let the daemon become ready first.
     time.sleep(10)
+    
+    settings = get_settings()
+    from audiobench.daemon.lancedb_optimizer import _should_optimize_on_startup
+    if _should_optimize_on_startup(settings.lancedb_optimize_interval_days):
+        logger.info("Startup policy: running LanceDB optimize (stale or first run).")
+        def run_bg_startup() -> None:
+            from audiobench.daemon.lancedb_optimizer import _do_optimize_all_tables
+            global _optimize_in_progress
+            with _optimize_lock:
+                if _optimize_in_progress:
+                    return
+                _optimize_in_progress = True
+            try:
+                _do_optimize_all_tables(triggered_by="startup_check")
+            except Exception as e:
+                logger.error("Startup optimization failed: %s", e)
+            finally:
+                with _optimize_lock:
+                    _optimize_in_progress = False
+        threading.Thread(target=run_bg_startup, name="lancedb-optimize-startup", daemon=True).start()
 
     while True:
         try:

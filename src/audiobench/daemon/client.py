@@ -419,3 +419,7 @@ class DaemonClient:
             },
         )
 
+    def optimize(self) -> dict:
+        """Request LanceDB optimization from the daemon."""
+        return self._send("optimize", {})
+

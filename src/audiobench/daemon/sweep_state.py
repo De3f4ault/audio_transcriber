@@ -132,9 +132,11 @@ class SweepState:
             db = lancedb.connect(str(lancedb_dir))
             if "expressions" in db.table_names():
                 table = db.open_table("expressions")
+                # Use to_arrow() for a full, unlimited scan of the table.
+                # table.search() has a default 7000-row limit that would cause
+                # indexed_expression_ids to be incomplete for large tables.
                 ids = [
-                    int(r["expression_id"])
-                    for r in table.search().select(["expression_id"]).to_list()
+                    int(x) for x in table.to_arrow()["expression_id"].to_pylist()
                 ]
                 with self._lock:
                     self.indexed_expression_ids = set(ids)

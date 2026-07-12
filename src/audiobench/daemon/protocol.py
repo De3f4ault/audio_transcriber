@@ -91,3 +91,10 @@ class ChunkResult(TypedDict):
     uuid: str
     tier: int
     speaker: NotRequired[str]
+
+
+class OptimizeResult(TypedDict):
+    tables_optimized: list[str]
+    duration_seconds: float
+    last_optimized_at: str
+    bytes_freed: NotRequired[int]
