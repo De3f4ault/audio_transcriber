@@ -244,3 +244,48 @@ def index_transcripts(tx_id: int | None) -> None:
             session.commit()
 
         console.print(f"[bold green]✓ Indexed {success}/{len(records)} transcript(s).[/bold green]")
+
+
+@daemon_group.command(name="optimize")
+def optimize_lancedb() -> None:
+    """Optimize LanceDB tables: compact fragments and remove old versions.
+
+    Sends the request to the running daemon if available (safe, coordinated).
+    Falls back to in-process optimization if the daemon is not running.
+    """
+    client = DaemonClient()
+    
+    def _format_bytes(size: int) -> str:
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} PB"
+
+    def _print_result(result: dict) -> None:
+        for table in result.get("tables_optimized", []):
+            console.print(f"  [green]✓[/green] Optimized {table}")
+            
+        bytes_freed = result.get("bytes_freed", 0)
+        freed_str = f" | Freed {_format_bytes(bytes_freed)}" if bytes_freed > 0 else ""
+        
+        cleared_writes = result.get("cleared_writes", 0)
+        writes_str = f"Cleared {cleared_writes} fragmented writes" if cleared_writes > 0 else "No fragmented writes"
+        
+        console.print(f"[bold green]✓ Optimization complete in {result.get('duration_seconds', 0.0):.2f}s ({writes_str}{freed_str}).[/bold green]")
+
+    if client.ping():
+        console.print("Daemon is ONLINE — sending optimize request...")
+        try:
+            result = client.optimize()
+            _print_result(result)
+        except Exception as e:
+            console.print(f"[bold red]Failed to optimize via daemon:[/bold red] {e}")
+    else:
+        console.print("Daemon is OFFLINE — running in-process optimization...")
+        try:
+            from audiobench.daemon.lancedb_optimizer import _do_optimize_all_tables
+            result = _do_optimize_all_tables(triggered_by="cli_fallback")
+            _print_result(result)
+        except Exception as e:
+            console.print(f"[bold red]Failed to optimize:[/bold red] {e}")

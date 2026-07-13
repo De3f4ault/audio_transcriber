@@ -12,8 +12,8 @@ class FocusedEntity:
     is treated as a derived property of the focused file.
     """
 
-    type: Literal["file", "transcript", "project"]
-    id: int  # AudioFileRecord.id or TranscriptionRecord.id
+    type: Literal["file", "transcript", "project", "work"]
+    id: int  # AudioFileRecord.id, TranscriptionRecord.id, or WorkRecord.id
     label: str  # e.g., "meeting.mp4" or "Transcript #42"
     chapter_index: int | None = None
     chapter_title: str | None = None

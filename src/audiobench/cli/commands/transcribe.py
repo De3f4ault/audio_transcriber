@@ -175,6 +175,11 @@ from audiobench.core.settings import get_settings
     help="Transcription engine: whisper (local, default) or gemini (cloud)",
 )
 @click.option(
+    "--align/--no-align",
+    default=None,
+    help="Force hybrid alignment (or disable it) for long audio on Gemini engine",
+)
+@click.option(
     "-b",
     "--background",
     is_flag=True,
@@ -289,6 +294,7 @@ def transcribe(
     parallel_gpus: bool,
     workers: int,
     sensitive: bool,
+    align: bool | None,
 ) -> None:
     """Transcribe audio or video files to text.
 
@@ -437,6 +443,24 @@ def transcribe(
             )
             engine_name = chosen_engine
 
+            # Align (Gemini only)
+            if chosen_engine == "gemini":
+                chosen_align = prompt_menu(
+                    "Hybrid Alignment (Gemini)",
+                    [
+                        ("auto", "Enable automatically for long files", "auto"),
+                        ("yes", "Force enable alignment", "yes"),
+                        ("no", "Force disable alignment", "no"),
+                    ],
+                    default_idx=0,
+                )
+                if chosen_align == "yes":
+                    align = True
+                elif chosen_align == "no":
+                    align = False
+                else:
+                    align = None
+
             # Model (only shown for Whisper)
             if chosen_engine == "whisper" and not model:
                 model = prompt_menu(
@@ -515,6 +539,9 @@ def transcribe(
             if detected_chapters:
                 console.print(f"    [{DIM}]Chapters:[/] {target_chapters if target_chapters else 'all'}")
             console.print(f"    [{DIM}]Engine:[/]   {engine_name}")
+            if engine_name == "gemini":
+                align_str = "auto" if align is None else ("yes" if align else "no")
+                console.print(f"    [{DIM}]Align:[/]    {align_str}")
             if model:
                 console.print(f"    [{DIM}]Model:[/]    {model}")
             console.print(f"    [{DIM}]Speed:[/]    {speed_preset}")
@@ -607,6 +634,8 @@ def transcribe(
             clean_args.append("--id-only")
         if engine_name:
             clean_args += ["--engine", engine_name]
+        if align is not None:
+            clean_args.append("--align" if align else "--no-align")
         if map_speakers:
             clean_args += ["--map-speakers", map_speakers]
         if auto_name:
@@ -927,6 +956,7 @@ def transcribe(
             "workers": workers,
             "model": settings.model_name,
             "sensitive": sensitive,
+            "align": align,
         }
         
         pt = ParallelTranscriber()
@@ -1029,6 +1059,7 @@ def transcribe(
                 resume=resume,
                 parallel=parallel,
                 skip_ghost=skip_ghost,
+                align=align,
             )
 
             if job_id:
@@ -1036,9 +1067,9 @@ def transcribe(
 
                 JobRepository().mark_job_done(job_id)
 
-            # For non-streaming engines (Gemini), segments aren't emitted
-            # during generation, so force a final update to show them.
-            if engine_name == "gemini":
+            # For non-streaming engines (Gemini), segments aren't always emitted
+            # during generation, so force a final update to show them if missing.
+            if engine_name == "gemini" and not tracker.segments:
                 for seg in transcript.segments:
                     tracker.on_segment(seg)
 

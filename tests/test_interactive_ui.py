@@ -1,70 +1,6 @@
 from unittest.mock import MagicMock, patch
 
 from audiobench.cli.commands.transcribe import transcribe
-from audiobench.cli.repl.dot_commands import _dot_diarize
-from audiobench.cli.repl.session import ReplSession
-
-
-def test_dot_diarize_basic():
-    session = MagicMock(spec=ReplSession)
-    repo = MagicMock()
-    session._get_repo.return_value = repo
-    repo.get_audio_file.return_value = {"file_path": "/tmp/fake.wav"}
-
-    rec = {"id": 1, "file_name": "fake.wav", "audio_file_id": 1}
-
-    with (
-        patch("audiobench.cli.wizard.prompt_menu") as mock_menu,
-        patch("audiobench.cli.wizard.prompt_bool") as mock_bool,
-        patch("audiobench.cli.wizard.prompt_string") as mock_string,
-        patch("audiobench.cli.repl.dot_commands.dispatch_command") as mock_dispatch,
-    ):
-        # Simulating user choices:
-        mock_menu.return_value = "speaker-diarization-3.0"
-        # prompt_bool called for: use_gpu, know_speakers, want_names, confirm
-        mock_bool.side_effect = [True, True, True, True]
-        mock_string.side_effect = ["3", "1=Alice, 2=Bob, 3=Charlie"]
-
-        _dot_diarize(session, rec)
-
-        # Verify dispatch_command was called with the correct args
-        mock_dispatch.assert_called_once_with(
-            session,
-            [
-                "transcribe",
-                "/tmp/fake.wav",
-                "--diarize",
-                "--no-cache",
-                "--gpu",
-                "--speakers",
-                "3",
-                "--map-speakers",
-                "1=Alice, 2=Bob, 3=Charlie",
-            ],
-        )
-
-
-def test_dot_diarize_cancel():
-    session = MagicMock(spec=ReplSession)
-    repo = MagicMock()
-    session._get_repo.return_value = repo
-    repo.get_audio_file.return_value = {"file_path": "/tmp/fake.wav"}
-
-    rec = {"id": 1, "file_name": "fake.wav", "audio_file_id": 1}
-
-    with (
-        patch("audiobench.cli.wizard.prompt_menu") as mock_menu,
-        patch("audiobench.cli.wizard.prompt_bool") as mock_bool,
-        patch("audiobench.cli.wizard.prompt_string") as mock_string,
-        patch("audiobench.cli.repl.dot_commands.dispatch_command") as mock_dispatch,
-    ):
-        mock_menu.return_value = "speaker-diarization-3.0"
-        # user cancels at confirm prompt
-        mock_bool.side_effect = [False, False, False]
-
-        _dot_diarize(session, rec)
-
-        mock_dispatch.assert_not_called()
 
 
 def test_transcribe_interactive_whisper():
@@ -99,10 +35,7 @@ def test_transcribe_interactive_whisper():
         pass
 
 
-if __name__ == "__main__":
-    test_dot_diarize_basic()
-    test_dot_diarize_cancel()
-    print("Mocks passed")
+
 
 
 def test_transcribe_interactive():

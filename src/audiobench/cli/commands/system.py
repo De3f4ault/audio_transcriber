@@ -276,6 +276,18 @@ def status() -> None:
     table.add_row("Total Audio", f"{hours:.1f} hours")
     table.add_row("Total Words", f"{total_words:,}")
     table.add_row("Database Size", format_size(db_size))
+    
+    # LanceDB stats
+    lancedb_size = dir_size(settings.lancedb_path)
+    from audiobench.daemon.lancedb_optimizer import read_optimize_state
+    opt_state = read_optimize_state()
+    unopt_writes = opt_state.get("unoptimized_writes", 0)
+    thresh = settings.lancedb_optimize_write_threshold
+    frag_status = f"{unopt_writes} / {thresh} writes" if thresh > 0 else f"{unopt_writes} writes"
+    
+    table.add_row("LanceDB Size", format_size(lancedb_size))
+    table.add_row("LanceDB Fragmentation", frag_status)
+    
     table.add_row("Model Cache", format_size(models_size))
     table.add_row("Voice Cache", format_size(voices_size))
     table.add_row("Saved Presets", str(presets_count))

@@ -230,6 +230,23 @@ class AudioBenchSettings(BaseSettings):
         default_factory=lambda: _DATA_DIR / "lancedb",
         description="Path to embedded LanceDB directory",
     )
+    lancedb_optimize_interval_days: int = Field(
+        default=3,
+        ge=-1,
+        description=(
+            "Days between automatic LanceDB optimize runs (startup check). "
+            "Set to 0 to optimize on every startup. Set to -1 to disable startup check."
+        ),
+    )
+    lancedb_optimize_write_threshold: int = Field(
+        default=10_000,
+        ge=0,
+        description=(
+            "Combined number of new expression + segment vector writes that trigger "
+            "a background LanceDB optimize after a sweep pass completes. "
+            "Set to 0 to disable write-count trigger."
+        ),
+    )
 
     # --- Engine Selection ---
     engine: str = Field(
@@ -243,7 +260,7 @@ class AudioBenchSettings(BaseSettings):
         description="API key for Google Gemini (enable with --engine gemini)",
     )
     gemini_model: str = Field(
-        default="gemini-2.5-pro",
+        default="gemini-2.5-flash",
         description="Gemini model to use for transcription",
     )
     gemini_inline_max_mb: int = Field(
@@ -256,12 +273,25 @@ class AudioBenchSettings(BaseSettings):
         ),
     )
     gemini_chunk_threshold_min: int = Field(
-        default=45,
+        default=2,
         ge=1,
         description=(
-            "Audio longer than this duration (minutes) is split into overlapping chunks "
-            "before transcription. 45 min is safe with the Files API (2 GB / file limit)."
+            "Audio duration in minutes above which to chunk for Gemini. "
+            "Gemini models have an 8192 output token limit, which is exhausted quickly "
+            "when word-level timestamps are enabled. Chunking prevents truncation."
         ),
+    )
+    align_threshold_min: int = Field(
+        default=15,
+        ge=1,
+        description=(
+            "Audio duration in minutes above which to automatically trigger the hybrid "
+            "forced alignment pipeline when using Gemini."
+        ),
+    )
+    align_device: str = Field(
+        default="cpu",
+        description="Device to use for the forced alignment model (cpu, cuda).",
     )
     gemini_upload_fallback_model: str = Field(
         default="gemini-2.0-flash",
@@ -292,6 +322,31 @@ class AudioBenchSettings(BaseSettings):
     hf_token: str | None = Field(
         default_factory=lambda: os.environ.get("HF_TOKEN"),
         description="HuggingFace token for pyannote model download",
+    )
+
+    # --- Security Layer ---
+    voiceprint_threshold: float = Field(
+        default=0.75,
+        description=(
+            "Cosine similarity threshold for SpeechBrain ECAPA-TDNN voiceprint matching. "
+            "Higher = stricter (fewer false positives). Lower = looser (better recall). "
+            "Range: 0.0–1.0. Recommended: 0.70–0.80."
+        ),
+    )
+    idle_lock_seconds: int = Field(
+        default=180,
+        ge=0,
+        description=(
+            "Seconds of keyboard idle before the session auto-locks (drops unlocked_tier to 0). "
+            "Set to 0 to disable idle locking entirely."
+        ),
+    )
+    security_dir: Path = Field(
+        default_factory=lambda: _DATA_DIR / "security",
+        description=(
+            "Directory for security artefacts: security.json (passphrase hashes) "
+            "and voiceprint.npy (enrolled ECAPA-TDNN embedding)."
+        ),
     )
 
     # --- Validators ---

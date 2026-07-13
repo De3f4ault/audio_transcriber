@@ -109,3 +109,49 @@ Rules:
 - Split into natural segments (sentences or clauses).
 - Return raw JSON only. No explanation, no markdown fences.
 """
+
+GEMINI_TRANSCRIPTION_TEXT_ONLY_PROMPT = """\
+Transcribe the following audio accurately and completely.
+
+Return ONLY a valid JSON object with this exact structure (no markdown, no fences):
+{
+  "language": "<ISO 639-1 code>",
+  "segments": [
+    {
+      "id": 0,
+      "text": "The transcribed text for this segment."
+    }
+  ]
+}
+
+Rules:
+- Split into natural segments (sentences or clauses, ~5-15 seconds each).
+- Detect the spoken language automatically.
+- Preserve the original language — do NOT translate unless asked.
+- Do NOT include any timestamps.
+- Return raw JSON only. No explanation, no markdown fences.
+"""
+
+GEMINI_DIARIZATION_TEXT_ONLY_PROMPT = """\
+Transcribe the following audio accurately and completely, identifying each speaker.
+
+Return ONLY a valid JSON object with this exact structure (no markdown, no fences):
+{
+  "language": "<ISO 639-1 code>",
+  "segments": [
+    {
+      "id": 0,
+      "text": "The transcribed text for this segment.",
+      "speaker": "Speaker 1"
+    }
+  ]
+}
+
+Rules:
+- Identify each distinct speaker and label them consistently (Speaker 1, Speaker 2, etc.).
+- Start a new segment ONLY when the speaker changes. Put all contiguous speech by the same speaker into a single segment, even if it is long.
+- Detect the spoken language automatically.
+- Preserve the original language — do NOT translate unless asked.
+- Do NOT include any timestamps.
+- Return raw JSON only. No explanation, no markdown fences.
+"""

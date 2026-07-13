@@ -75,8 +75,10 @@ def setup_logging(level: str = "INFO") -> None:
         "httpx",
         "torch",
         "pyannote",
+        "transformers",
+        "sentence_transformers",
     ]:
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+        logging.getLogger(noisy_logger).setLevel(logging.ERROR)
 
     logger.debug("Logging configured at %s level", level.upper())
 
