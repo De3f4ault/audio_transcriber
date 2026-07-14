@@ -287,6 +287,8 @@ class TranscriptionRepository:
             # --- PHASE 5: Expression Registration & Chunking ---
             try:
                 self._register_expressions(tx_record.id, transcript, chapter_id, on_phase)
+                tx_record.is_indexed = 1
+                session.commit()
             except Exception as e:
                 logger.error(
                     "Failed to register expressions for transcription %d: %s", tx_record.id, e
@@ -498,6 +500,8 @@ class TranscriptionRepository:
 
             try:
                 self._register_expressions(tx_record.id, transcript, None, on_phase)
+                tx_record.is_indexed = 1
+                session.commit()
             except Exception as e:
                 logger.error(
                     "Failed to register expressions for live session %d: %s", tx_record.id, e
@@ -788,7 +792,7 @@ class TranscriptionRepository:
                 "duration": rec.duration_seconds,
                 "word_count": rec.word_count,
                 "segment_count": rec.segment_count,
-                "status": rec.status,
+                "status": rec.pipeline_phase,
                 "refined_at": rec.refined_at.isoformat() if rec.refined_at else None,
                 "created_at": rec.created_at.isoformat() if rec.created_at else "",
                 "segments": [
@@ -951,3 +955,317 @@ class TranscriptionRepository:
             session.commit()
             logger.info("Deleted %d transcription(s)", count)
             return count
+
+    def begin_transcription(
+        self,
+        audio_metadata: AudioMetadata | None,
+        engine: str,
+        model_name: str,
+        chapter_id: int | None = None,
+        overwrite: bool = False,
+    ) -> int:
+        """
+        Insert a TranscriptionRecord with status='transcribing'.
+        Returns the new tx_id. Called BEFORE the Gemini/Whisper API call.
+        """
+        with get_session() as session:
+            audio_record = None
+            chapter_record = None
+
+            if chapter_id:
+                chapter_record = session.query(ChapterRecord).get(chapter_id)
+                if chapter_record:
+                    audio_record = session.query(AudioFileRecord).get(chapter_record.audio_file_id)
+            elif audio_metadata and audio_metadata.file_hash:
+                audio_record = (
+                    session.query(AudioFileRecord)
+                    .filter_by(file_hash=audio_metadata.file_hash)
+                    .first()
+                )
+
+            # --- DEDUPLICATION ENFORCEMENT ---
+            if audio_record and not chapter_id:
+                existing_txs = session.query(TranscriptionRecord).filter_by(audio_file_id=audio_record.id).all()
+                if existing_txs:
+                    if not overwrite:
+                        raise ValueError("Transcription already exists for this audio file.")
+                    
+                    from audiobench.daemon.factory import get_daemon_client
+                    from audiobench.core.settings import get_settings
+                    
+                    daemon_client = None
+                    if not get_settings().disable_memory:
+                        try:
+                            daemon_client = get_daemon_client()
+                        except Exception as e:
+                            logger.warning("Could not connect to daemon to delete expressions: %s", e)
+                        
+                    from audiobench.memory.enums import SourceType
+                    from audiobench.storage.models import ExpressionRecord
+                    for old_tx in existing_txs:
+                        if daemon_client:
+                            old_exprs = session.query(ExpressionRecord).filter_by(
+                                source_type=SourceType.AUDIO_TRANSCRIPT.value, 
+                                source_id=old_tx.id
+                            ).all()
+                            for expr in old_exprs:
+                                try:
+                                    daemon_client.delete(expr.id)
+                                except Exception as e:
+                                    logger.warning("Failed to delete expression %d from daemon: %s", expr.id, e)
+                        session.delete(old_tx)
+                    session.commit()
+
+            if audio_record is None and audio_metadata and not chapter_id:
+                # Import file to library
+                new_path = self._import_to_library(audio_metadata.file_path)
+
+                audio_record = AudioFileRecord(
+                    file_path=new_path,
+                    file_name=audio_metadata.file_name,
+                    file_size_bytes=audio_metadata.file_size_bytes,
+                    format=audio_metadata.format,
+                    duration_seconds=audio_metadata.duration_seconds,
+                    sample_rate=audio_metadata.sample_rate,
+                    channels=audio_metadata.channels,
+                    file_hash=audio_metadata.file_hash,
+                )
+                session.add(audio_record)
+                session.flush()
+
+                from pathlib import Path
+                from audiobench.chapters.detector import ChapterDetector
+                try:
+                    detector = ChapterDetector()
+                    chapters_info = detector.detect(Path(new_path))
+                    if chapters_info:
+                        chap_dicts = [
+                            {
+                                "index": c.index,
+                                "title": c.title,
+                                "start_time": c.start_time,
+                                "end_time": c.end_time,
+                                "is_ghost": c.is_ghost,
+                            }
+                            for c in chapters_info
+                        ]
+                        session.commit()
+                        from audiobench.storage.chapter_repository import get_chapter_repo
+                        get_chapter_repo().save_chapters(audio_record.id, chap_dicts)
+                        logger.info("Auto-detected and saved %d chapters for %s", len(chapters_info), audio_record.file_name)
+                except Exception as e:
+                    logger.warning("Failed to auto-detect chapters for %s: %s", audio_record.file_name, e)
+
+            # Create the record in transcribing status
+            tx_record = TranscriptionRecord(
+                audio_file_id=audio_record.id if audio_record else None,
+                source="file",
+                file_name=audio_metadata.file_name if audio_metadata else "",
+                full_text="",
+                language="en",
+                language_probability=0.0,
+                engine=engine,
+                model_name=model_name,
+                duration_seconds=0.0,
+                word_count=0,
+                segment_count=0,
+                pipeline_phase="transcribing",  # mapped to DB status
+                attempt_count=0,
+                speaker_map="{}",
+            )
+            session.add(tx_record)
+            session.flush()
+            tx_id = tx_record.id
+            session.commit()
+            return tx_id
+
+    def commit_transcript_text(
+        self,
+        tx_id: int,
+        transcript: Transcript,
+        chapter_id: int | None = None,
+        privacy_tier: int = 0,
+    ) -> None:
+        """
+        After engine.transcribe() completes: write full_text, segments, language, duration.
+        Atomic UPDATE status='transcribed', attempt_count=0.
+        """
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if not tx_record:
+                raise ValueError(f"TranscriptionRecord {tx_id} not found.")
+
+            tx_record.full_text = transcript.text
+            tx_record.language = transcript.language
+            tx_record.language_probability = transcript.language_probability
+            tx_record.duration_seconds = transcript.duration_seconds
+            tx_record.word_count = transcript.word_count
+            tx_record.segment_count = transcript.segment_count
+            tx_record.pipeline_phase = "transcribed"
+            tx_record.attempt_count = 0
+
+            # Delete old segments if this is a retry
+            session.query(SegmentRecord).filter_by(transcription_id=tx_id).delete()
+
+            for seg in transcript.segments:
+                seg_record = SegmentRecord(
+                    transcription_id=tx_record.id,
+                    segment_index=seg.id,
+                    text=seg.text,
+                    start_time=seg.start,
+                    end_time=seg.end,
+                    speaker=seg.speaker,
+                    chapter_id=chapter_id,
+                    privacy_tier=privacy_tier,
+                )
+                session.add(seg_record)
+                
+            session.commit()
+            
+    def commit_alignment(self, tx_id: int, transcript: Transcript) -> None:
+        """
+        After align_transcript() completes: UPDATE segment start_time/end_time.
+        Atomic UPDATE status='aligned', attempt_count=0.
+        """
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if not tx_record:
+                return
+
+            # Update segments
+            for seg in transcript.segments:
+                session.query(SegmentRecord).filter_by(
+                    transcription_id=tx_id, segment_index=seg.id
+                ).update({
+                    "start_time": seg.start,
+                    "end_time": seg.end,
+                })
+
+            tx_record.pipeline_phase = "aligned"
+            tx_record.attempt_count = 0
+            session.commit()
+
+    def commit_diarization(self, tx_id: int, transcript: Transcript) -> None:
+        """
+        After diarization completes: UPDATE segment.speaker, transcript.speaker_map.
+        Atomic UPDATE status='diarized', attempt_count=0.
+        """
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if not tx_record:
+                return
+
+            for seg in transcript.segments:
+                session.query(SegmentRecord).filter_by(
+                    transcription_id=tx_id, segment_index=seg.id
+                ).update({"speaker": seg.speaker})
+
+            tx_record.speaker_map = json.dumps(transcript.speaker_map)
+            tx_record.pipeline_phase = "diarized"
+            tx_record.attempt_count = 0
+            session.commit()
+
+    def finalize_transcription(
+        self,
+        tx_id: int,
+        transcript: Transcript,
+        chapter_id: int | None = None,
+        on_phase: Any = None,
+        privacy_tier: int = 0,
+        audio_metadata: AudioMetadata | None = None,
+    ) -> None:
+        """
+        After speaker naming: UPDATE status='complete', attempt_count=0.
+        Triggers _register_expressions() and background biometric pass.
+        """
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if not tx_record:
+                return
+
+            tx_record.speaker_map = json.dumps(transcript.speaker_map)
+            tx_record.pipeline_phase = "complete"
+            tx_record.attempt_count = 0
+
+            if chapter_id:
+                chapter_record = session.query(ChapterRecord).get(chapter_id)
+                if chapter_record:
+                    chapter_record.transcription_id = tx_id
+                    chapter_record.transcription_status = "completed"
+
+            # Get saved segment ids for biometric pass
+            saved_segment_ids = [s.id for s in session.query(SegmentRecord.id).filter_by(transcription_id=tx_id).all()]
+            session.commit()
+
+            # ── Background biometric pass ──────────────────────────────────────────
+            if privacy_tier < 2:
+                audio_path = audio_metadata.file_path if audio_metadata else None
+                self._schedule_biometric_pass(saved_segment_ids, audio_path, tx_id)
+
+            # --- PHASE 5: Expression Registration & Chunking ---
+            try:
+                self._register_expressions(tx_id, transcript, chapter_id, on_phase)
+                with get_session() as s2:
+                    tx2 = s2.query(TranscriptionRecord).get(tx_id)
+                    tx2.is_indexed = 1
+                    s2.commit()
+            except Exception as e:
+                logger.error("Failed to register expressions for transcription %d: %s", tx_id, e)
+
+    def mark_transcription_failed(
+        self,
+        tx_id: int,
+        reason: str,
+        failed_phase: str,
+    ) -> None:
+        """
+        Set status='failed' when transcribing phase fails.
+        """
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if tx_record:
+                tx_record.pipeline_phase = "failed"
+                tx_record.failure_reason = reason
+                session.commit()
+
+    def mark_transcription_degraded(
+        self,
+        tx_id: int,
+        reason: str,
+        failed_phase: str,
+    ) -> None:
+        """
+        Set status='degraded' when a post-processing phase fails repeatedly.
+        """
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if tx_record:
+                tx_record.pipeline_phase = "degraded"
+                tx_record.failure_reason = reason
+                session.commit()
+
+    def increment_attempt_count(self, tx_id: int) -> int:
+        """
+        Atomically increments attempt_count. Returns new count.
+        """
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if tx_record:
+                tx_record.attempt_count += 1
+                new_count = tx_record.attempt_count
+                session.commit()
+                return new_count
+        return 0
+
+    def get_incomplete_transcriptions(self, max_age_minutes: int = 5) -> list[TranscriptionRecord]:
+        """
+        Returns all records where pipeline_phase NOT IN ('complete', 'degraded', 'failed')
+        AND updated_at < now() - max_age_minutes.
+        """
+        from datetime import datetime, UTC, timedelta
+        cutoff = datetime.now(UTC) - timedelta(minutes=max_age_minutes)
+        with get_session() as session:
+            return session.query(TranscriptionRecord).filter(
+                ~TranscriptionRecord.pipeline_phase.in_(["complete", "degraded", "failed"]),
+                TranscriptionRecord.updated_at < cutoff
+            ).all()

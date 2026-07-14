@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
+from typing import Any
 
 import lancedb
 from lancedb.pydantic import LanceModel, Vector
@@ -30,6 +31,10 @@ class ExpressionNode(LanceModel):
     embedded_at: str
     source_type: str
     speaker: str | None = None
+    audio_file_id: int | None = None
+    confidence: float | None = None
+    original_language: str | None = None
+    work_id: int | None = None
 
 
 class QueryCacheNode(LanceModel):
@@ -69,11 +74,77 @@ class MemoryStore:
 
         if self.table_name not in self.db.table_names():
             logger.info("Creating LanceDB table '%s'", self.table_name)
-            self.table = self.db.create_table(self.table_name, schema=ExpressionNode)
-            # Create full-text search index
-            self.table.create_fts_index("content")
-        else:
-            self.table = self.db.open_table(self.table_name)
+            self.db.create_table(self.table_name, schema=ExpressionNode)
+            # NOTE: No FTS index created. The FTS (inverted) index triggered a
+            # Rust panic in lance-index 7.0.0 (builder.rs out-of-bounds) when
+            # optimize() ran on a fragmented table, causing silent data loss.
+            # All retrieval uses vector similarity search — FTS is not needed.
+
+    @property
+    def table(self) -> Any:
+        """Dynamically fetch the latest table manifest to avoid stale fragment crashes."""
+        return self.db.open_table(self.table_name)
+
+    def add_expression(
+        self,
+        content: str,
+        source_type: str,
+        *,
+        inference_status: str | None = None,  # accepted for compat; stored in SQLite if column exists
+        source_id: int | None = None,
+        speaker: str | None = None,
+    ) -> None:
+        """Register a new expression in SQLite and immediately embed it into LanceDB.
+
+        This is the convenience entry-point used by all intelligence tasks
+        (PatternDetector, ConnectionSurfer, BlindSpotDetector, etc.).  It:
+        1. Delegates to ExpressionRepository.register() for SQLite persistence
+           and content-hash deduplication.
+        2. Calls write_node() to compute the Nomic vector and add it to LanceDB.
+
+        Args:
+            content:          The text of the expression.
+            source_type:      Category label (e.g. 'system_inference', 'daemon_calibration').
+            inference_status: Optional status tag; stored on the SQLite record when
+                              the ExpressionRecord has an inference_status column.
+            source_id:        Optional FK to the originating row.
+            speaker:          Optional speaker label.
+        """
+        from audiobench.storage.expression_repository import ExpressionRepository
+
+        repo = ExpressionRepository()
+        record = repo.register(
+            content=content,
+            source_type=source_type,
+            source_id=source_id,
+            speaker=speaker,
+        )
+
+        # Persist the inference_status flag if the column exists on the model
+        if inference_status is not None:
+            try:
+                from audiobench.core.db_session import get_session as _gs
+                from sqlalchemy import text as _t
+                with _gs() as _s:
+                    _s.execute(
+                        _t("UPDATE expressions SET inference_status = :status WHERE id = :id"),
+                        {"status": inference_status, "id": record.id},
+                    )
+                    _s.commit()
+            except Exception as exc:
+                # Column may not exist in older migrations — non-fatal
+                logger.debug("add_expression: could not set inference_status: %s", exc)
+
+        # Write vector to LanceDB so the expression is immediately searchable
+        try:
+            self.write_node(
+                expression_id=record.id,
+                content=content,
+                source_type=source_type,
+                speaker=speaker,
+            )
+        except Exception as exc:
+            logger.error("add_expression: LanceDB write failed for expression #%d: %s", record.id, exc)
 
     def write_node(
         self,
@@ -155,6 +226,10 @@ class MemoryStore:
                 embedded_at=now_str,
                 source_type=n["source_type"],
                 speaker=n.get("speaker"),
+                audio_file_id=n.get("audio_file_id"),
+                confidence=n.get("confidence"),
+                original_language=n.get("original_language"),
+                work_id=n.get("work_id"),
             )
             for n, v in zip(nodes, vectors)
         ]
@@ -166,11 +241,20 @@ class MemoryStore:
 
         logger.info("batch_write_nodes: wrote %d expressions to LanceDB", len(records))
 
+    def update_expression_work_id(self, expression_id: int, work_id: int) -> None:
+        """Update the work_id of an existing expression in LanceDB."""
+        try:
+            self.table.update(where=f"expression_id = {expression_id}", values={"work_id": work_id})
+        except Exception as e:
+            logger.error("Failed to update work_id for expression_id=%d: %s", expression_id, e)
+
     def search(
         self,
         query: str,
         top_k: int = 5,
         speaker_filter: str | None = None,
+        audio_file_id: int | None = None,
+        work_id: int | None = None,
         hyde_document: str | None = None,
         use_bm25: bool = True,
         use_dense: bool = True,
@@ -204,8 +288,17 @@ class MemoryStore:
 
         search_query = search_query.limit(top_k * 3)
 
+        where_clauses = []
         if speaker_filter:
-            search_query = search_query.where(f"speaker = '{speaker_filter}'")
+            where_clauses.append(f"speaker = '{speaker_filter}'")
+        if audio_file_id is not None:
+            where_clauses.append(f"audio_file_id = {audio_file_id}")
+        if work_id is not None:
+            where_clauses.append(f"work_id = {work_id}")
+
+        prefilter = " AND ".join(where_clauses) if where_clauses else None
+        if prefilter:
+            search_query = search_query.where(prefilter)
 
         # Apply ColBERT reranking if enabled
         if use_colbert:
@@ -243,9 +336,16 @@ class MemoryStore:
         return final_results
 
     def delete_node(self, expression_id: int) -> None:
-        """Delete a node by expression_id."""
-        # LanceDB delete
+        """Delete an expression node from LanceDB."""
         self.table.delete(f"expression_id = {expression_id}")
+
+    def get_vectors(self, expression_ids: list[int]) -> dict[int, list[float]]:
+        """Retrieve vectors for a list of expression IDs."""
+        if not expression_ids:
+            return {}
+        ids_str = ", ".join(str(i) for i in expression_ids)
+        rows = self.table.search().where(f"expression_id IN ({ids_str})").to_list()
+        return {int(r["expression_id"]): r["vector"] for r in rows}
 
     def count_nodes(self) -> int:
         """Get the total number of nodes in the store."""
@@ -266,9 +366,12 @@ class QueryCacheStore:
 
         if self.table_name not in self.db.table_names():
             logger.info("Creating LanceDB cache table '%s'", self.table_name)
-            self.table = self.db.create_table(self.table_name, schema=QueryCacheNode)
-        else:
-            self.table = self.db.open_table(self.table_name)
+            self.db.create_table(self.table_name, schema=QueryCacheNode)
+
+    @property
+    def table(self) -> Any:
+        """Dynamically fetch the latest table manifest to avoid stale fragment crashes."""
+        return self.db.open_table(self.table_name)
 
     def check_cache(self, query: str, distance_threshold: float = 0.05) -> dict | None:
         """Check if a semantically identical query exists in the cache."""
@@ -319,9 +422,12 @@ class SpeakerProfileStore:
 
         if self.table_name not in self.db.table_names():
             logger.info("Creating LanceDB speaker profiles table '%s'", self.table_name)
-            self.table = self.db.create_table(self.table_name, schema=SpeakerProfileNode)
-        else:
-            self.table = self.db.open_table(self.table_name)
+            self.db.create_table(self.table_name, schema=SpeakerProfileNode)
+
+    @property
+    def table(self) -> Any:
+        """Dynamically fetch the latest table manifest to avoid stale fragment crashes."""
+        return self.db.open_table(self.table_name)
 
     def identify_speaker(self, voice_print: list[float], threshold: float = 0.82) -> str | None:
         """Find the closest known speaker for a given voice print.
@@ -421,9 +527,12 @@ class SegmentVectorStore:
 
         if self.table_name not in self.db.table_names():
             logger.info("Creating LanceDB segment vectors table '%s'", self.table_name)
-            self.table = self.db.create_table(self.table_name, schema=SegmentVectorNode)
-        else:
-            self.table = self.db.open_table(self.table_name)
+            self.db.create_table(self.table_name, schema=SegmentVectorNode)
+
+    @property
+    def table(self) -> Any:
+        """Dynamically fetch the latest table manifest to avoid stale fragment crashes."""
+        return self.db.open_table(self.table_name)
 
     # ------------------------------------------------------------------
     # Write

@@ -58,7 +58,7 @@ def mock_all_llm_fail(monkeypatch):
     # Stub FTS5 to return hits so we have sources
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.FTS5Stream.retrieve",
-        lambda self, rq, top_k: [
+        lambda self, rq, top_k, **kw: [
             __import__(
                 "audiobench.memory.retrieval_streams",
                 fromlist=["SegmentHit"]
@@ -73,11 +73,11 @@ def mock_all_llm_fail(monkeypatch):
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.DenseStream.retrieve",
-        lambda self, rq, top_k: [],
+        lambda self, rq, top_k, **kw: [],
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.ColBERTStream.retrieve",
-        lambda self, rq, top_k: [],
+        lambda self, rq, top_k, **kw: [],
     )
 
 
@@ -120,12 +120,18 @@ def test_cli_displays_segments_on_synthesis_failure(capsys):
 
 
 def test_cli_shows_panel_prompt_on_synthesis_failure(mock_input_quit, capsys):
-    """Even on synthesis failure, the [E]xpand [C]hat [Q]uit panel must appear."""
-    from audiobench.cli.commands.memory_cmd import _run_search_panel
+    """Even on synthesis failure, the inner loop prompt must appear."""
+    from audiobench.cli.commands.memory_cmd import _run_search_loop, SearchSessionState
+    from unittest.mock import MagicMock
+    
     result = make_failed_query_result(sources=2)
-    _run_search_panel(result)  # mock_input_quit makes user "press Q"
-    # Must not raise, must not exit process
-
+    mock_engine = MagicMock()
+    mock_engine.search.return_value = result
+    
+    _run_search_loop(mock_engine, "test", SearchSessionState())  # mock_input_quit makes user "press Q"
+    
+    captured = capsys.readouterr()
+    assert "[Q]" in captured.out or "quit" in captured.out.lower()
 
 def test_research_result_synthesis_fields_default_to_not_failed():
     """New ResearchResult must default to synthesis_failed=False and answer=None."""

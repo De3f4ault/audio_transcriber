@@ -116,7 +116,5 @@ class EmbeddingEngine:
                 prefixed,
                 batch_size=batch_size,
                 show_progress_bar=False,
-                # sort_by_length reduces intra-batch padding — sentence-transformers ≥ 2.2
-                sort_by_length=True,
             )
         return result.tolist()

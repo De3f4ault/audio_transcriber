@@ -36,17 +36,17 @@ def test_all_three_streams_called_in_parallel(monkeypatch):
     """FTS5, dense, and ColBERT must be called concurrently, not sequentially."""
     call_times: dict[str, float] = {}
 
-    def slow_fts(self, rq, top_k):
+    def slow_fts(self, rq, top_k, **kwargs):
         call_times["fts_start"] = time.perf_counter()
         time.sleep(0.1)
         return []
 
-    def slow_dense(self, rq, top_k):
+    def slow_dense(self, rq, top_k, **kwargs):
         call_times["dense_start"] = time.perf_counter()
         time.sleep(0.1)
         return []
 
-    def slow_colbert(self, rq, top_k):
+    def slow_colbert(self, rq, top_k, **kwargs):
         call_times["colbert_start"] = time.perf_counter()
         time.sleep(0.1)
         return []
@@ -83,15 +83,15 @@ def test_research_engine_result_has_timestamps(monkeypatch):
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.FTS5Stream.retrieve",
-        lambda self, rq, top_k: [_make_hit(1, 10.0, 20.0), _make_hit(2, 25.0, 35.0)],
+        lambda self, rq, top_k, **kw: [_make_hit(1, 10.0, 20.0), _make_hit(2, 25.0, 35.0)],
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.DenseStream.retrieve",
-        lambda self, rq, top_k: [],
+        lambda self, rq, top_k, **kw: [],
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.ColBERTStream.retrieve",
-        lambda self, rq, top_k: [],
+        lambda self, rq, top_k, **kw: [],
     )
 
     result = ResearchEngine().search("learning")
@@ -109,15 +109,15 @@ def test_research_engine_result_is_immutable(monkeypatch):
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.FTS5Stream.retrieve",
-        lambda self, rq, top_k: [_make_hit(1, 1.0, 2.0)],
+        lambda self, rq, top_k, **kw: [_make_hit(1, 1.0, 2.0)],
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.DenseStream.retrieve",
-        lambda self, rq, top_k: [],
+        lambda self, rq, top_k, **kw: [],
     )
     monkeypatch.setattr(
         "audiobench.memory.retrieval_streams.ColBERTStream.retrieve",
-        lambda self, rq, top_k: [],
+        lambda self, rq, top_k, **kw: [],
     )
 
     result = ResearchEngine().search("test")
@@ -148,6 +148,7 @@ def test_fts5_stream_not_using_model_inference(monkeypatch):
 def test_dense_and_colbert_route_through_daemon_not_singletons(monkeypatch):
     """Dense and ColBERT streams must NOT call local singletons directly."""
     from audiobench.memory.retrieval_streams import ColBERTStream, DenseStream
+    from unittest.mock import MagicMock
 
     singleton_calls: list[str] = []
     try:
@@ -162,6 +163,16 @@ def test_dense_and_colbert_route_through_daemon_not_singletons(monkeypatch):
     except AttributeError:
         pass
 
+    # Mock get_daemon_client so we don't fall back to LocalDaemonClient in tests
+    # (LocalDaemonClient intentionally loads singletons)
+    mock_client = MagicMock()
+    monkeypatch.setattr("audiobench.daemon.factory.get_daemon_client", lambda: mock_client)
+
     DenseStream().retrieve(any_rq(), top_k=5)
     ColBERTStream().retrieve(any_rq(), top_k=5)
     assert singleton_calls == [], "Streams must use daemon, not local singletons"
+
+
+def _no_retrieve(self, rq, top_k, **kwargs):
+    """Stub used for retrieve patches that must survive **extra kwargs."""
+    return []

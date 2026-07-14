@@ -170,12 +170,18 @@ class TranscriptionRecord(Base):
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     word_count: Mapped[int] = mapped_column(Integer, default=0)
     segment_count: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(20), default="completed")
+    # Renamed status to pipeline_phase, mapping to the same DB column
+    pipeline_phase: Mapped[str] = mapped_column("status", String(20), default="complete")
+    failure_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     speaker_map: Mapped[str] = mapped_column(Text, default="{}")
     refined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
     is_indexed: Mapped[int] = mapped_column(Integer, default=0, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
     )
 
     # Relationships

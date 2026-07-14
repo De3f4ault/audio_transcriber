@@ -25,6 +25,7 @@ from pathlib import Path
 from audiobench.core.db_engine import init_db
 from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
+from audiobench.observatory.context import log_event
 from audiobench.storage.repository import TranscriptionRepository
 from audiobench.transcribe.audio_converter import AudioLoader
 from audiobench.transcribe.engines.engine_protocol import TranscriptionEngine
@@ -82,6 +83,8 @@ class TranscriptionPipeline:
         chapter_id: int | None = None,
         diarize_mode: str = "fast",
         diarize_threshold: float = 0.65,
+        sensitive: bool = False,
+        align: bool | None = None,
     ) -> Transcript:
         """Transcribe an audio file through the full pipeline.
 
@@ -145,6 +148,8 @@ class TranscriptionPipeline:
                     skip_ghost=skip_ghost,
                     diarize_mode=diarize_mode,
                     diarize_threshold=diarize_threshold,
+                    sensitive=sensitive,
+                    align=align,
                 )
             else:
                 transcript = self._run_single_pipeline(
@@ -166,6 +171,8 @@ class TranscriptionPipeline:
                     job_id=job_id,
                     diarize_mode=diarize_mode,
                     diarize_threshold=diarize_threshold,
+                    sensitive=sensitive,
+                    align=align,
                 )
 
             if output_path:
@@ -208,6 +215,8 @@ class TranscriptionPipeline:
         job_id: int | None,
         diarize_mode: str = "fast",
         diarize_threshold: float = 0.65,
+        sensitive: bool = False,
+        align: bool | None = None,
     ) -> Transcript:
         """Load, transcribe, diarize, and save a single audio file."""
         is_gemini = engine.engine_name == "gemini"
@@ -246,12 +255,27 @@ class TranscriptionPipeline:
 
             # Transcribe
             task = "translate" if translate else "transcribe"
-            emit("transcribing", "Translating to English..." if translate else "Transcribing...", 0.0)
-            logger.info("Pipeline: transcribing with %s (preset=%s)", engine.engine_name, preset)
-
+            emit("transcribing", "Starting transcription pipeline...", 0.0)
+            
+            try:
+                tx_id = self._repository.begin_transcription(
+                    audio_metadata=metadata,
+                    engine="gemini" if is_gemini else "faster-whisper",
+                    model_name=getattr(engine, "model_name", getattr(self._settings, "model", "default")),
+                    chapter_id=chapter_id,
+                    overwrite=skip_cache,
+                )
+            except ValueError as e:
+                if "already exists" in str(e):
+                    logger.info("Transcription already exists, skipping")
+                    return None
+                raise
+                
+            new_attempt_count = self._repository.increment_attempt_count(tx_id)
+            logger.info("Starting attempt %d for tx_id %d", new_attempt_count, tx_id)
+            
             def _progress(pct: float) -> None:
                 emit("transcribing", "Transcribing...", pct)
-
             def _do_transcribe():
                 if is_gemini:
                     # Gemini is a cloud model — send the original, full-quality
@@ -264,6 +288,7 @@ class TranscriptionPipeline:
                         on_phase=emit,
                         on_segment=on_segment,
                         diarize=enable_diarization,
+                        align=align,
                     )
                 else:
                     return engine.transcribe(
@@ -298,44 +323,95 @@ class TranscriptionPipeline:
 
             if is_concurrent_capable:
                 logger.info("Running transcription and diarization concurrently on separate GPUs")
-                from audiobench.diarization.engine import PyannoteDiarizer
-                diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token, device=diarize_device)
-                
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    ft = ex.submit(_do_transcribe)
-                    fd = ex.submit(diarizer.get_speaker_turns, wav_path)
+                try:
+                    from audiobench.diarization.engine import PyannoteDiarizer
+                    diarizer = PyannoteDiarizer(hf_token=self._settings.hf_token, device=diarize_device)
                     
-                    transcript = ft.result()
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        ft = ex.submit(_do_transcribe)
+                        fd = ex.submit(diarizer.get_speaker_turns, wav_path)
+                        
+                        transcript = ft.result()
+                        transcript.audio = metadata
+                        
+                        try:
+                            turns = fd.result()
+                            transcript = diarizer.assign_speakers(transcript, turns, audio_path=wav_path)
+                            logger.info("Pipeline: diarization complete")
+                        except Exception as e:
+                            logger.warning("Concurrent diarization failed (continuing without): %s", e)
+                except Exception as e:
+                    logger.warning("Failed to initialize concurrent diarization (continuing without): %s", e)
+                    transcript = _do_transcribe()
                     transcript.audio = metadata
-                    
-                    try:
-                        turns = fd.result()
-                        transcript = diarizer.assign_speakers(transcript, turns, audio_path=wav_path)
-                        logger.info("Pipeline: diarization complete")
-                    except Exception as e:
-                        logger.warning("Concurrent diarization failed (continuing without): %s", e)
             else:
                 transcript = _do_transcribe()
                 transcript.audio = metadata
-                if enable_diarization and not is_gemini:
+                    
+            self._repository.commit_transcript_text(tx_id, transcript, chapter_id, privacy_tier=3 if sensitive else 0)
+            logger.info("Pipeline: transcript text committed")
+
+            if enable_diarization and not is_gemini and not is_concurrent_capable:
+                try:
                     transcript = self._run_diarization(wav_path, transcript, emit, diarize_mode, diarize_threshold)
+                    self._repository.commit_diarization(tx_id, transcript)
+                except Exception as e:
+                    logger.warning("Sequential diarization failed (continuing without): %s", e)
+                    self._repository.mark_transcription_degraded(tx_id, str(e), "diarizing")
+
+            # Post-process: forced alignment (engine-agnostic)
+            align_threshold = getattr(self._settings, "align_threshold_min", 15) * 60
+            should_align = (
+                align is True
+                or (align is None
+                    and is_gemini
+                    and transcript.duration_seconds > align_threshold)
+            )
+
+            if should_align:
+                try:
+                    from audiobench.transcribe.alignment_pipeline import load_align_model, align_transcript
+                    
+                    emit("aligning", "Aligning timestamps...", 0.0)
+                    logger.info("Pipeline: starting forced alignment")
+                    align_model = load_align_model(device=getattr(self._settings, "align_device", "cpu"))
+                    
+                    transcript = align_transcript(
+                        transcript=transcript,
+                        audio_path=file_path,
+                        model=align_model,
+                        on_progress=on_segment,
+                    )
+                    self._repository.commit_alignment(tx_id, transcript)
+                    logger.info("Pipeline: forced alignment committed")
+                except Exception as exc:
+                    logger.warning("Forced alignment failed — saving transcript without timestamps: %s", exc)
+                    self._repository.mark_transcription_degraded(tx_id, str(exc), "aligning")
+                    if on_segment:
+                        for seg in transcript.segments:
+                            on_segment(seg)
+            elif on_segment and is_gemini and align is not False and transcript.duration_seconds > align_threshold:
+                # If align was false but we chunked, fire the segments now
+                for seg in transcript.segments:
+                    on_segment(seg)
 
             # Speaker naming
             self._apply_speaker_naming(
                 transcript, map_speakers, auto_name, enable_diarization, emit
             )
 
-            # Save
-            emit("saving", "Saving to database...")
-            tx_id = self._repository.save_transcription(
-                transcript, 
-                metadata, 
-                chapter_id=chapter_id, 
-                on_phase=emit, 
-                overwrite=skip_cache
+            # Finalize
+            emit("saving", "Finalizing transcription...")
+            self._repository.finalize_transcription(
+                tx_id=tx_id,
+                transcript=transcript,
+                chapter_id=chapter_id,
+                on_phase=emit,
+                privacy_tier=3 if sensitive else 0,
+                audio_metadata=metadata,
             )
             logger.info("Pipeline: saved as transcription #%d", tx_id)
-
+            
             # Fire plugin hook
             try:
                 from audiobench.events import get_bus
@@ -395,6 +471,8 @@ class TranscriptionPipeline:
         skip_ghost: bool,
         diarize_mode: str = "fast",
         diarize_threshold: float = 0.65,
+        sensitive: bool = False,
+        align: bool | None = None,
     ) -> Transcript:
         """Split a file by chapter indices and transcribe each chunk."""
         from audiobench.chapters.cue_parser import ChapterInfo
@@ -475,6 +553,8 @@ class TranscriptionPipeline:
                     chapter_id=chap.id,
                     diarize_mode=diarize_mode,
                     diarize_threshold=diarize_threshold,
+                    sensitive=sensitive,
+                    align=align,
                 )
                 
                 # Shift timestamps
@@ -738,17 +818,26 @@ class TranscriptionPipeline:
             self._db_initialized = True
 
     def _emit_event(self, job_id: int | None, **kwargs) -> None:
-        """Write a terse machine-readable event to the job's events file."""
+        """Emit a structured pipeline event to the journal DB via log_event().
+
+        Prior implementation wrote key=value lines to data_dir/job_logs/job_{id}.events.
+        That flat file is no longer written — all events route through log_event() so
+        the Observatory can observe them without polling a file on disk.
+        """
         if not job_id:
             return
-        import time
-
-        line = " ".join(f"{k}={v}" for k, v in kwargs.items())
-        line += f" ts={int(time.time())}"
-        log_dir = self._settings.data_dir / "job_logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / f"job_{job_id}.events", "a") as f:
-            f.write(line + "\n")
+        phase = kwargs.pop("phase", "unknown")
+        # Build a concise human-readable message from remaining kwargs
+        extras = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        message = f"{phase}" + (f" ({extras})" if extras else "")
+        log_event(
+            "transcribe",
+            phase,
+            message,
+            entity_type="job",
+            entity_id=job_id,
+            metadata=kwargs if kwargs else None,
+        )
 
     def _write_output(self, transcript: Transcript, fmt: str, output_path: str) -> None:
         """Format transcript and write to file."""
@@ -834,7 +923,7 @@ class TranscriptionPipeline:
 
                 refiner = TranscriptRefiner(client, model=self._settings.clean_model)
                 seg_texts = [seg.text for seg in segments]
-                cleaned = refiner.refine_segments(seg_texts)
+                cleaned, has_failures = refiner.refine_segments(seg_texts)
 
                 if cleaned == seg_texts:
                     logger.info("Refinement produced no changes for #%d", tx_id)

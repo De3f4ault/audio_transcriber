@@ -55,3 +55,10 @@ CREATE TABLE IF NOT EXISTS managed_processes (
     last_error TEXT,
     updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS reconciliation_queue (
+    id             INTEGER PRIMARY KEY,
+    expression_id  INTEGER NOT NULL,
+    work_id        INTEGER NOT NULL,
+    queued_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+);

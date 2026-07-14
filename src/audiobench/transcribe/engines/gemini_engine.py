@@ -35,6 +35,8 @@ from audiobench.core.prompts import (
     GEMINI_DIARIZATION_TRANSLATE_PROMPT,
     GEMINI_TRANSCRIPTION_PROMPT,
     GEMINI_TRANSLATE_PROMPT,
+    GEMINI_TRANSCRIPTION_TEXT_ONLY_PROMPT,
+    GEMINI_DIARIZATION_TEXT_ONLY_PROMPT,
 )
 
 # Default inline upload threshold (100 MB).
@@ -43,8 +45,9 @@ from audiobench.core.prompts import (
 _INLINE_MAX_BYTES_DEFAULT = 100 * 1024 * 1024
 
 # ── Chunking constants ──────────────────────────────────────
-_CHUNK_DURATION = 15 * 60  # 15 minutes per chunk (seconds)
-_CHUNK_OVERLAP = 30  # 30 seconds overlap between chunks
+_CHUNK_DURATION = int(2.5 * 60)  # 2.5 minutes per chunk (seconds)
+_CHUNK_OVERLAP = 10  # 10 seconds overlap between chunks
+_CHUNK_DURATION_ALIGN = 15 * 60  # 15 minutes per chunk for alignment
 # With the Files API handling up to 2 GB per file, we relax the threshold
 # to 45 minutes (from 20 min). Long files still benefit from chunking due
 # to the model's practical output-token limit per request.
@@ -139,6 +142,7 @@ class GeminiEngine(TranscriptionEngine):
         beam_size: int = 5,
         on_phase: object | None = None,
         on_segment: object | None = None,
+        align: bool = False,
         **kwargs,
     ) -> Transcript:
         """Send audio to Gemini and return a Transcript.
@@ -172,6 +176,33 @@ class GeminiEngine(TranscriptionEngine):
 
         # Choose prompt based on task and diarization.
         diarize = kwargs.get("diarize", False)
+        
+        # ── Auto-trigger logic for alignment ────────────────
+        from audiobench.core.settings import get_settings
+        settings = get_settings()
+        align_threshold = getattr(settings, "align_threshold_min", 15) * 60
+        
+        from audiobench.transcribe.audio_converter import probe
+
+        try:
+            info = probe(audio_path)
+            duration = info.duration
+        except Exception:
+            duration = 0.0
+
+        if not align and "align" not in kwargs:
+            if duration > align_threshold:
+                logger.info(f"File duration {duration/60:.1f}m > {align_threshold/60:.1f}m. Auto-triggering alignment.")
+                align = True
+
+        if align:
+            prompt = GEMINI_DIARIZATION_TEXT_ONLY_PROMPT if diarize else GEMINI_TRANSCRIPTION_TEXT_ONLY_PROMPT
+            if language and task != "translate":
+                prompt += f"\nThe audio is spoken in language code: {language}\n"
+            return self._transcribe_chunked_text_only(
+                audio_path, prompt, on_phase, duration, on_segment, language
+            )
+
         if diarize and task == "translate":
             prompt = GEMINI_DIARIZATION_TRANSLATE_PROMPT
         elif diarize:
@@ -183,15 +214,6 @@ class GeminiEngine(TranscriptionEngine):
 
         if language and task != "translate":
             prompt += f"\nThe audio is spoken in language code: {language}\n"
-
-        # ── Check if chunking is needed ─────────────────────
-        from audiobench.transcribe.audio_converter import probe
-
-        try:
-            info = probe(audio_path)
-            duration = info.duration
-        except Exception:
-            duration = 0.0
 
         if duration > self._chunk_threshold:
             return self._transcribe_chunked(
@@ -554,6 +576,118 @@ class GeminiEngine(TranscriptionEngine):
                 on_segment(seg)
         return transcript
 
+    def _dedup_chunk_boundary(self, prev_segments: list[Segment], next_segments: list[Segment]) -> list[Segment]:
+        """Deduplicate segments exactly matching at the boundary of two 15-minute chunks."""
+        if not prev_segments or not next_segments:
+            return next_segments
+            
+        # Get the last 3 segments from previous chunk to compare against
+        # first 3 segments of next chunk
+        prev_tail = [s.text.strip().lower() for s in prev_segments[-3:]]
+        
+        drop_count = 0
+        for i in range(min(3, len(next_segments))):
+            next_text = next_segments[i].text.strip().lower()
+            if next_text in prev_tail:
+                drop_count += 1
+                logger.info(f"Dropped duplicate boundary segment: '{next_text}'")
+            else:
+                break
+                
+        return next_segments[drop_count:]
+
+    def _transcribe_chunked_text_only(
+        self,
+        audio_path: Path,
+        prompt: str,
+        on_phase: object | None = None,
+        total_duration: float = 0.0,
+        on_segment: object | None = None,
+        language: str | None = None,
+    ) -> Transcript:
+        """Split long audio into 15-minute chunks and transcribe with text-only prompts."""
+        import shutil
+        from audiobench.transcribe.audio_converter import split_audio
+
+        chunks = split_audio(
+            audio_path,
+            chunk_duration=_CHUNK_DURATION_ALIGN,
+            overlap=_CHUNK_OVERLAP,
+        )
+
+        logger.info(
+            "Text-only pipeline: Chunked %s into %d parts (15-min each)",
+            audio_path.name,
+            len(chunks),
+        )
+
+        all_segments: list[Segment] = []
+        chunk_dir = chunks[0][0].parent if chunks else None
+        
+        detected_language = language or "en"
+        total_words = 0
+
+        try:
+            for i, (chunk_path, time_offset) in enumerate(chunks):
+                if on_phase and callable(on_phase):
+                    on_phase(
+                        "transcribing",
+                        f"Transcribing chunk {i + 1}/{len(chunks)}...",
+                        i / len(chunks),
+                    )
+
+                logger.info("Transcribing chunk %d/%d (15-min): %s", i + 1, len(chunks), chunk_path.name)
+
+                try:
+                    chunk_transcript = self._transcribe_single(
+                        chunk_path,
+                        prompt,
+                        None,
+                        None,  # No on_segment yet because timestamps are 0.0
+                    )
+                    
+                    if chunk_transcript.language and chunk_transcript.language != "en":
+                        detected_language = chunk_transcript.language
+                        
+                    raw_segments = chunk_transcript.segments
+                    
+                    if all_segments:
+                        raw_segments = self._dedup_chunk_boundary(all_segments, raw_segments)
+                    
+                    if not raw_segments:
+                        continue
+
+                    for seg in raw_segments:
+                        seg.id = len(all_segments)
+                        # We don't have real timestamps yet, so we just use 0.0 or approximations
+                        # The alignment pipeline will fix these.
+                        seg.start = 0.0
+                        seg.end = 0.0
+                        
+                        all_segments.append(seg)
+                        total_words += len(seg.text.split())
+
+                except EngineError as e:
+                    logger.warning("Chunk %d/%d failed (skipping): %s", i + 1, len(chunks), e)
+                    
+        finally:
+            if chunk_dir and chunk_dir != audio_path.parent:
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+
+        if not all_segments:
+            raise EngineError("All chunks failed in text-only pipeline.")
+
+        return Transcript(
+            text=" ".join(s.text.strip() for s in all_segments),
+            segments=all_segments,
+            language=detected_language,
+            language_probability=0.99,
+            duration_seconds=total_duration,
+            word_count=total_words,
+            file_name=audio_path.name,
+            file_hash="",
+        )
+
     @staticmethod
     def _stitch_transcripts(
         chunk_results: list[tuple[Transcript, float]],
@@ -833,19 +967,44 @@ class GeminiEngine(TranscriptionEngine):
         except json.JSONDecodeError as e:
             logger.warning(
                 "Gemini response is not valid JSON (likely truncated at "
-                "output-token limit). Attempting repair…"
+                "output-token limit). Attempting repair with json_repair…"
             )
-            data = self._repair_truncated_json(raw_text)
+
+            data = None
+            try:
+                import json_repair
+                repaired = json_repair.repair_json(raw_text, return_objects=True)
+                # json_repair returns {} or "" for completely unrecoverable input,
+                # and may return a dict with no segments on partial failure.
+                # Accept it only if it has at least one segment.
+                if isinstance(repaired, dict) and repaired.get("segments"):
+                    data = repaired
+                    logger.warning(
+                        "json_repair succeeded — recovered %d segments",
+                        len(data["segments"]),
+                    )
+                else:
+                    logger.warning(
+                        "json_repair returned unusable result (%r), trying manual repair",
+                        type(repaired).__name__,
+                    )
+            except ImportError:
+                logger.warning("json-repair not installed")
+
+            # Last resort: manual truncation repair
             if data is None:
-                logger.error("JSON repair failed. First 500 chars: %s", raw_text[:500])
-                raise EngineError(
-                    message="Failed to parse Gemini transcription response",
-                    details=f"Invalid JSON: {e}. Raw response: {raw_text[:200]}...",
-                ) from e
-            logger.warning(
-                "Repair succeeded — recovered %d segments (tail may be missing)",
-                len(data.get("segments", [])),
-            )
+                data = self._repair_truncated_json(raw_text)
+                if isinstance(data, dict) and data.get("segments"):
+                    logger.warning(
+                        "Manual repair succeeded — recovered %d segments (tail may be missing)",
+                        len(data["segments"]),
+                    )
+                else:
+                    logger.error("JSON repair failed. First 500 chars: %s", raw_text[:500])
+                    raise EngineError(
+                        message="Failed to parse Gemini transcription response",
+                        details=f"Invalid JSON: {e}. Raw response: {raw_text[:200]}...",
+                    ) from e
 
         language = data.get("language", "en")
         raw_segments = data.get("segments", [])
@@ -853,6 +1012,28 @@ class GeminiEngine(TranscriptionEngine):
         segments: list[Segment] = []
         full_text_parts: list[str] = []
         total_words = 0
+
+        def _safe_float(val: Any, default: float = 0.0) -> float:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                # If the LLM generated something like "1.0.9", try to strip the second decimal
+                if isinstance(val, str) and val.count(".") > 1:
+                    parts = val.split(".")
+                    try:
+                        return float(f"{parts[0]}.{parts[1]}")
+                    except (ValueError, TypeError):
+                        pass
+                return default
+
+        def _safe_int(val: Any, default: int = 0) -> int:
+            # Gemini sometimes returns [11] (a list) instead of 11 (int)
+            if isinstance(val, list):
+                val = val[0] if val else default
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return default
 
         for seg_data in raw_segments:
             seg_text = seg_data.get("text", "").strip()
@@ -864,16 +1045,16 @@ class GeminiEngine(TranscriptionEngine):
                 words.append(
                     Word(
                         word=w.get("word", ""),
-                        start=float(w.get("start", 0.0)),
-                        end=float(w.get("end", 0.0)),
+                        start=_safe_float(w.get("start", 0.0)),
+                        end=_safe_float(w.get("end", 0.0)),
                         probability=1.0,
                     )
                 )
 
             segment = Segment(
-                id=seg_data.get("id", len(segments)),
-                start=float(seg_data.get("start", 0.0)),
-                end=float(seg_data.get("end", 0.0)),
+                id=_safe_int(seg_data.get("id", len(segments)), default=len(segments)),
+                start=_safe_float(seg_data.get("start", 0.0)),
+                end=_safe_float(seg_data.get("end", 0.0)),
                 text=seg_text,
                 words=words,
                 speaker=seg_data.get("speaker"),

@@ -136,19 +136,13 @@ class ExpressionRepository:
         items_to_process = list(unique_items.values())
 
         # ── Step 2: separate already-known from genuinely new ───────────────
-        if known_hashes is not None:
-            # O(1) per check — pure RAM, zero SQL
-            need_db_lookup: list[dict] = []
-            already_known: list[dict] = []
-            for item in items_to_process:
-                if item["_hash"] in known_hashes:
-                    already_known.append(item)
-                else:
-                    need_db_lookup.append(item)
-        else:
-            # No in-memory set — fall back to SQL IN() query
-            need_db_lookup = items_to_process
-            already_known = []
+        # We NO LONGER drop `already_known` items early. 
+        # Even if we know an expression exists in SQLite via `known_hashes`, 
+        # we MUST query the DB for its ID so we can return the `ExpressionRecord`.
+        # If we drop it here, the caller (RAG sweep) will never pass it to LanceDB 
+        # for embedding, breaking startup recovery!
+        need_db_lookup = items_to_process
+        already_known = []
 
         # ── Step 3: for items still uncertain, query DB once ────────────────
         deduped: list[ExpressionRecord] = []
@@ -187,6 +181,7 @@ class ExpressionRepository:
                             source_type=item["source_type"],
                             source_id=item.get("source_id"),
                             speaker=item.get("speaker"),
+                            work_id=item.get("work_id"),
                         )
                         session.add(rec)
                         new_records.append(rec)
