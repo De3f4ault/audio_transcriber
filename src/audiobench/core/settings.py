@@ -581,3 +581,8 @@ def get_settings() -> AudioBenchSettings:
         del json_data["hf_token"]
 
     return AudioBenchSettings(**json_data)
+
+
+def invalidate_settings_cache() -> None:
+    """Clear the cached settings so the next call to get_settings() reloads from disk."""
+    get_settings.cache_clear()

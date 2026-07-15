@@ -14,6 +14,10 @@ from audiobench.cli.display.theme import ACCENT, BOLD, DIM, WARNING, console
 
 T = TypeVar("T")
 
+# Tune this after use — 150ms is a baseline, not a measured value.
+# Check daemon logs post-ship: if autocomplete spam returns, lower it.
+# If suggestions feel laggy, raise it.
+_AUTOCOMPLETE_DEBOUNCE_MS: int = 150
 
 def prompt_menu(
     title: str,
@@ -98,6 +102,7 @@ def prompt_string(
     default: str = "",
     validator: Callable[[str], bool] | None = None,
     validation_msg: str = "Invalid input.",
+    enable_autocomplete: bool = False,
 ) -> str:
     """Prompt for a string input.
 
@@ -106,15 +111,74 @@ def prompt_string(
         default: Default if empty.
         validator: Optional function to validate the input.
         validation_msg: Error message if validation fails.
+        enable_autocomplete: If True, uses prompt_toolkit with daemon autocomplete.
 
     Returns:
         The user's string.
     """
     console.print(f"\n  {prompt}")
 
+    if enable_autocomplete:
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.completion import Completer, Completion
+            import time
+            
+            class DaemonSemanticCompleter(Completer):
+                def __init__(self) -> None:
+                    from audiobench.daemon.factory import get_daemon_client
+                    self.client = get_daemon_client()
+                    self._last_text = ""
+                    self._last_fire_time = 0.0
+                    
+                def get_completions(self, document, complete_event):
+                    text = document.text
+                    if len(text) < 3:
+                        return
+                    
+                    now = time.monotonic()
+                    text_changed = text != self._last_text
+                    self._last_text = text
+                    self._last_fire_time = now
+                    
+                    # Only suppress if text just changed and it's not a manual trigger
+                    # (complete_event.completion_requested means the user explicitly pressed TAB)
+                    if text_changed and not complete_event.completion_requested:
+                        if now - self._last_fire_time < _AUTOCOMPLETE_DEBOUNCE_MS / 1000.0:
+                            return
+                        
+                    try:
+                        # fetch fast-path results
+                        results = self.client.autocomplete(text, top_k=7)
+                        for r in results:
+                            # r is {"expression_id": ..., "text": ..., "speaker": ..., "source_type": ...}
+                            content = r.get("text", "")
+                            if content:
+                                speaker = r.get("speaker")
+                                source_type = r.get("source_type")
+                                display_text = content if len(content) <= 60 else content[:57] + "..."
+                                display_meta = f"[{speaker}]" if speaker else f"[{source_type}]" if source_type else ""
+                                yield Completion(
+                                    content, 
+                                    start_position=-len(text),
+                                    display=display_text,
+                                    display_meta=display_meta
+                                )
+                    except Exception:
+                        pass
+                        
+            session = PromptSession(completer=DaemonSemanticCompleter())
+        except ImportError:
+            # Fallback to standard input if prompt_toolkit is somehow missing
+            enable_autocomplete = False
+
     while True:
         try:
-            choice = input("  → ").strip()
+            if enable_autocomplete:
+                choice = session.prompt("  → ").strip()
+            else:
+                choice = input("  → ").strip()
+                
             if not choice:
                 choice = default
 

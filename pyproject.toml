@@ -38,6 +38,7 @@ dependencies = [
     "rich>=13.0.0",
     "prompt-toolkit>=3.0.0",
     "textual>=0.50.0",
+    "json-repair>=0.61.0",
 ]
 
 [project.optional-dependencies]
@@ -57,6 +58,10 @@ ai = ["requests>=2.31.0"]
 vosk = ["vosk>=0.3.45"]
 google = ["google-genai>=1.0.0", "tenacity>=8.5.0"]
 api = ["fastapi>=0.100.0", "uvicorn>=0.23.0", "python-multipart>=0.0.6", "sse-starlette>=1.6.5", "litellm>=1.0.0"]
+align = [
+    "ctc-forced-aligner>=1.0.0",
+    "transformers>=4.40.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
@@ -65,7 +70,7 @@ dev = [
     "mypy>=1.10.0",
 ]
 docs = ["zensical>=0.0.23"]
-all = ["audiobench[memory,streaming,diarization,tts,ai,vosk,google,api,dev,docs]"]
+all = ["audiobench[memory,streaming,diarization,tts,ai,vosk,google,api,dev,docs,align]"]
 
 [project.scripts]
 audiobench = "audiobench.cli.app:cli"

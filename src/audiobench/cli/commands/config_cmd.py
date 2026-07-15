@@ -137,6 +137,10 @@ def config(ctx: click.Context, interactive_mode: bool) -> None:
             updated.save()
             console.print(f"\n  [{SUCCESS}]✓ Configuration saved to {settings.config_file}[/]")
 
+            # Notify the daemon to drop its old settings cache
+            from audiobench.daemon.client import DaemonClient
+            DaemonClient().reload_settings()
+
         except KeyboardInterrupt:
             sys.exit(0)
 
@@ -165,6 +169,10 @@ def config_set(key: str, value: str) -> None:
 
         # Update the singleton in-place so subsequent code in this run sees it
         setattr(current_settings, key, getattr(updated_settings, key))
+
+        # Notify the daemon to drop its old settings cache
+        from audiobench.daemon.client import DaemonClient
+        DaemonClient().reload_settings()
 
         console.print(f"  [{SUCCESS}]✓[/] Configuration updated")
         console.print(f"    [{DIM}]{key} = {getattr(updated_settings, key)}[/]")

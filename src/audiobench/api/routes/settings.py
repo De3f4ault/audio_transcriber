@@ -30,6 +30,10 @@ def update_settings(updates: dict[str, Any]) -> dict:
             if hasattr(settings, k):
                 setattr(settings, k, getattr(updated_settings, k))
 
+        # Notify the daemon to drop its old settings cache
+        from audiobench.daemon.client import DaemonClient
+        DaemonClient().reload_settings()
+
         return updated_settings.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
