@@ -183,6 +183,20 @@ class DaemonClient:
         """Return True if the daemon is alive and responsive."""
         return bool(self.daemon_is_healthy())
 
+    def reload_settings(self) -> None:
+        """Tell the daemon to drop its cached settings and reload from disk.
+        Silently returns if the daemon is not running. Warns if the daemon is running but the IPC fails.
+        """
+        import logging
+        if not self.ping():
+            return
+            
+        try:
+            self._send("reload_settings", {})
+        except Exception as e:
+            logging.warning(f"Failed to reload daemon settings (IPC error: {e}). You may need to restart the daemon.")
+
+
     def search(
         self,
         query: str,

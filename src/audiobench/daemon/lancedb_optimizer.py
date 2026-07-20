@@ -166,25 +166,21 @@ def _do_optimize_all_tables(triggered_by: str = "cli_command") -> dict[str, Any]
     
     for table_name in tables:
         try:
-            # The 'expressions' table is fragmented by many delete+reinsert cycles
-            # during recovery, which triggers a Rust panic in lance-index 7.0.0's
-            # inverted index builder (out-of-bounds in builder.rs:856).
-            # Skip it here — segment_vectors and query_cache compact safely.
-            # expressions will be compacted once lance-index is updated or the
-            # table state normalises after a clean, full-rebuild session.
-            if table_name == "expressions":
-                logger.info("Skipping optimize for 'expressions' table (inverted-index bug workaround).")
-                continue
-
             logger.info("Optimizing LanceDB table '%s'...", table_name)
             table = db.open_table(table_name)
-            
+
             # optimize runs compaction and version cleanup.
             # IMPORTANT: cleanup_older_than must NOT be 0 — LanceDB's MVCC
             # needs time to promote new writes to stable versions. Using hours=0
             # (or delete_unverified=True) can vacuum freshly written rows before
             # they are checkpointed, causing silent data loss on the next boot.
             # 7 days matches the LanceDB default and is safe for this workload.
+            #
+            # NOTE: The 'expressions' table previously had a create_fts_index()
+            # call that caused a Rust panic in lance-index 7.0.0 during optimize.
+            # That FTS index has been permanently dropped (repair_expressions_table.py)
+            # and is no longer created (memory_store.py). Optimize is now safe on
+            # all tables.
             table.optimize(
                 cleanup_older_than=datetime.timedelta(days=7),
             )

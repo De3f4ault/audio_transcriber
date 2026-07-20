@@ -71,9 +71,11 @@ def _handle_ping(args: dict[str, Any]) -> dict[str, Any]:
     process = psutil.Process()
     memory_mb = process.memory_info().rss / (1024 * 1024)
 
+    sweep_consecutive_failures = 0
     try:
         state = get_sweep_state()
         queue_depth = state.unindexed_transcript_count() + state.pending_segment_count()
+        sweep_consecutive_failures = state.consecutive_sweep_failures
     except Exception:
         queue_depth = 0
 
@@ -89,6 +91,7 @@ def _handle_ping(args: dict[str, Any]) -> dict[str, Any]:
         "embedding_model_version": store_version,
         "memory_mb": round(memory_mb, 2),
         "queue_depth": queue_depth,
+        "sweep_consecutive_failures": sweep_consecutive_failures,
         "models": {
             "embedding": store_version,
         },
@@ -356,6 +359,23 @@ def _handle_autocomplete(args: dict[str, Any]) -> dict[str, Any]:
         vector = model.encode(f"search_query: {prefix}").tolist()
         
     results = index.lookup(vector, k=int(args.get("top_k", 5)))
+    
+    expression_ids = [r["expression_id"] for r in results if "expression_id" in r]
+    if expression_ids:
+        from audiobench.storage.expression_repository import ExpressionRepository
+        repo = ExpressionRepository()
+        expr_map = repo.get_by_ids(expression_ids)
+        
+        enriched_results = []
+        for r in results:
+            expr_id = r.get("expression_id")
+            if expr_id in expr_map:
+                expr = expr_map[expr_id]
+                r["speaker"] = expr.speaker
+                r["source_type"] = expr.source_type
+                enriched_results.append(r)
+        results = enriched_results
+
     return {"results": results}
 
 
@@ -471,7 +491,15 @@ def _handle_optimize(args: dict[str, Any]) -> dict[str, Any]:
             _optimize_in_progress = False
 
 
+def _handle_reload_settings(args: dict[str, Any]) -> dict[str, Any]:
+    """Invalidate the in-memory settings cache so the daemon reloads on next access."""
+    from audiobench.core.settings import invalidate_settings_cache
+    invalidate_settings_cache()
+    return {"status": "ok"}
+
+
 _HANDLERS: dict[str, Any] = {
+    "reload_settings": _handle_reload_settings,
     "ping": _handle_ping,
     "embed": _handle_embed,
     "search": _handle_search,
@@ -555,7 +583,15 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
         if not raw:
             return
         raw_str = raw.decode("utf-8").strip()
-        logger.debug("Received from %s: %s", peer, raw_str[:120])
+        
+        # Before logging, check if it's autocomplete (high-frequency, low-signal)
+        try:
+            parsed_cmd = json.loads(raw_str).get("cmd", "") if raw_str else ""
+        except json.JSONDecodeError:
+            parsed_cmd = ""
+            
+        if parsed_cmd != "autocomplete":
+            logger.debug("Received from %s: %s", peer, raw_str[:120])
 
         async for response_str in _dispatch(raw_str):
             writer.write((response_str + "\n").encode("utf-8"))
@@ -754,11 +790,26 @@ def _do_sweep_once() -> None:
                 logger.info(
                     "RAG sweep: vectorized %d segments in one batch.", len(rows)
                 )
+                # ── Success: reset the segment-level failure counter ────────
+                state.consecutive_sweep_failures = 0
             except Exception as seg_exc:
                 logger.error(
                     "RAG sweep: failed to batch vectorize segments: %s", seg_exc
                 )
                 state.requeue_segments(seg_ids)
+                # Track on SweepState immediately — visible in `daemon status`
+                # even before the threshold is reached.
+                state.consecutive_sweep_failures += 1
+                if state.consecutive_sweep_failures >= _SWEEP_MAX_CONSECUTIVE_FAILURES:
+                    # Re-raise so the outer circuit breaker fires its exponential
+                    # backoff. Without this, the outer loop sees no exception from
+                    # the segment block and resets its own counter — making it
+                    # blind to exactly this failure shape.
+                    raise RuntimeError(
+                        f"Segment vectorization failed {state.consecutive_sweep_failures} "
+                        f"consecutive time(s) — outer circuit breaker engaging. "
+                        f"Last error: {seg_exc}"
+                    ) from seg_exc
 
     reconciled = _reconcile_metadata()
     if reconciled > 0:
@@ -880,12 +931,24 @@ def _refresh_sweep_state_incremental(state) -> None:
         logger.warning("SweepState incremental refresh failed: %s", exc)
 
 
+# Circuit breaker threshold — how many consecutive sweep failures before the loop
+# backs off exponentially and logs at ERROR level.
+# Starting guess: 5. Not derived from data — watch real failure cadence once live
+# and adjust. Named here so it's findable and honest about being a starting point.
+_SWEEP_MAX_CONSECUTIVE_FAILURES = 5
+
+
 def _rag_consistency_sweep_sync() -> None:
     """Periodic background worker — runs forever, sweeping every 5 minutes.
 
     The first pass starts after a 10-second warm-up delay so the daemon can
     finish initialisation and start accepting client connections before any
     heavy embedding work begins.
+
+    Circuit breaker: after _SWEEP_MAX_CONSECUTIVE_FAILURES consecutive failures
+    the loop backs off exponentially (capped at 1 hour) and logs at ERROR so
+    the failure is visible in `audiobench daemon status`, not just buried in
+    DEBUG output.
     """
     SWEEP_INTERVAL_SECONDS = 300  # 5 minutes
 
@@ -912,11 +975,39 @@ def _rag_consistency_sweep_sync() -> None:
                     _optimize_in_progress = False
         threading.Thread(target=run_bg_startup, name="lancedb-optimize-startup", daemon=True).start()
 
+    consecutive_failures = 0
+
     while True:
         try:
             _do_sweep_once()
+            # Outer-level success: reset the outer counter only.
+            # _sweep_state.consecutive_sweep_failures is owned by the inner
+            # segment handler — it resets itself on a successful segment batch.
+            if consecutive_failures > 0:
+                logger.info(
+                    "RAG sweep recovered after %d consecutive outer failure(s).",
+                    consecutive_failures,
+                )
+            consecutive_failures = 0
+
         except Exception as exc:
-            logger.error("RAG sweep loop: unexpected error: %s", exc)
+            consecutive_failures += 1
+            if _sweep_state is not None:
+                _sweep_state.consecutive_sweep_failures = consecutive_failures
+
+            if consecutive_failures >= _SWEEP_MAX_CONSECUTIVE_FAILURES:
+                # Exponential backoff, capped at 1 hour.
+                backoff = min(SWEEP_INTERVAL_SECONDS * consecutive_failures, 3600)
+                logger.error(
+                    "RAG sweep has failed %d consecutive time(s) — backing off %ds. "
+                    "Run `audiobench daemon status` to inspect. Last error: %s",
+                    consecutive_failures, backoff, exc,
+                )
+                time.sleep(backoff)
+                continue
+            else:
+                logger.error("RAG sweep loop: unexpected error: %s", exc)
+
         logger.info("RAG sweep: sleeping %ds until next pass.", SWEEP_INTERVAL_SECONDS)
         time.sleep(SWEEP_INTERVAL_SECONDS)
 
@@ -1000,6 +1091,14 @@ async def _serve(socket_path: Path, pid_path: Path) -> None:
     )
     sweep_thread.start()
     logger.info("RAG sweep thread started (interval=300s).")
+
+    from audiobench.daemon.pipeline_recovery import pipeline_recovery_sweep_loop
+    pipeline_sweep_thread = threading.Thread(
+        target=pipeline_recovery_sweep_loop,
+        name="pipeline-sweep",
+        daemon=True,
+    )
+    pipeline_sweep_thread.start()
 
     # Set permissions so any user can connect (adjust to 0o600 for single-user)
     socket_path.chmod(0o666)

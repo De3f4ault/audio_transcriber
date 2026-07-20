@@ -67,11 +67,9 @@ def submit_job(args: list[str], audio_file: str | None = None) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = log_dir / f"job_{job_id}.log"
-    events_path = log_dir / f"job_{job_id}.events"
 
-    # Pre-create files
+    # Pre-create log file
     log_path.touch()
-    events_path.touch()
 
     # Add --job-id argument to the command so child process can self-report
     # We insert it right after the subcommand, e.g. "transcribe --job-id 7 file.mp4"
@@ -99,7 +97,7 @@ def submit_job(args: list[str], audio_file: str | None = None) -> int:
     )
     log_file.close()  # Parent closes its copy — child still has it open
 
-    repo.update_job_started(job_id, proc.pid, str(log_path), str(events_path))
+    repo.update_job_started(job_id, proc.pid, str(log_path), events_path=None)
     return job_id
 
 
@@ -161,3 +159,46 @@ def startup_recovery() -> None:
         pid = job.get("pid")
         if pid and not is_alive(pid):
             repo.mark_job_failed(job["id"], exit_code=-1)
+
+
+def _pid_watcher_loop(iterations: int | None = None, interval: float = 30.0) -> None:
+    """Poll running jobs and mark any with dead PIDs as failed.
+
+    Args:
+        iterations: How many poll cycles to run. ``None`` means run forever
+            (the normal daemon case). Pass a small integer in tests to avoid
+            an infinite loop.
+        interval: Seconds to sleep between cycles. Pass 0 in tests.
+    """
+    import time as _time
+
+    count = 0
+    while iterations is None or count < iterations:
+        try:
+            repo = JobRepository()
+            for job in repo.get_running_jobs():
+                pid = job.get("pid")
+                if pid and not is_alive(pid):
+                    repo.mark_job_failed(job["id"], exit_code=-1)
+        except Exception:
+            pass  # Never crash the daemon over a watcher error
+        count += 1
+        if interval > 0:
+            _time.sleep(interval)
+
+
+def start_pid_watcher(interval: float = 30.0) -> "threading.Thread":
+    """Spawn the continuous PID watcher as a background daemon thread.
+
+    Returns the started thread so the caller can inspect it (e.g. in tests).
+    """
+    import threading
+
+    t = threading.Thread(
+        target=_pid_watcher_loop,
+        kwargs={"interval": interval},
+        name="pid-watcher",
+        daemon=True,
+    )
+    t.start()
+    return t

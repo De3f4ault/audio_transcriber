@@ -58,6 +58,11 @@ class SweepState:
     # O(1) transcript queue: transcript IDs waiting for chunking + indexing
     unindexed_transcript_ids: deque[int] = field(default_factory=deque)
 
+    # Circuit breaker — consecutive sweep failures before backoff kicks in.
+    # Written only from the sweep thread; read by _handle_ping for CLI observability.
+    # Not protected by _lock: written by one thread, read for display only.
+    consecutive_sweep_failures: int = 0
+
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     # ------------------------------------------------------------------

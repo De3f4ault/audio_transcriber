@@ -136,8 +136,27 @@ def UnindexedExpressionRecovery(sweep_state=None) -> int:
 
     missing_tx = {r[1] for r in rows if r[0] not in indexed_ids and r[1] is not None}
     if missing_tx:
-        sweep_state.unindexed_transcript_ids.extend(list(missing_tx))
-        logger.info("UnindexedExpressionRecovery: queued %d transcript(s) to recover missing expressions.", len(missing_tx))
+        # Reset is_indexed=0 in SQLite so these transcripts are picked up by
+        # the sweep loop's incremental refresh (which queries WHERE is_indexed=0)
+        # on EVERY tick, not just once in the startup deque.  Without this reset
+        # the transcripts stay marked is_indexed=1 and are silently skipped on
+        # any restart that happens before the sweep finishes writing them.
+        from audiobench.core.db_session import get_session as _gs2
+        with _gs2() as s2:
+            ids_list = ", ".join(str(i) for i in missing_tx)
+            s2.execute(
+                sql_text(
+                    f"UPDATE transcriptions SET is_indexed=0 WHERE id IN ({ids_list})"
+                )
+            )
+            s2.commit()
+        sweep_state.push_transcripts(list(missing_tx))
+        logger.info(
+            "UnindexedExpressionRecovery: reset is_indexed=0 and queued %d transcript(s) "
+            "to recover %d missing LanceDB expression(s).",
+            len(missing_tx),
+            sum(1 for r in rows if r[0] not in indexed_ids and r[1] in missing_tx),
+        )
     return len(missing_tx)
 
 
