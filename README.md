@@ -1,4 +1,4 @@
-# 🎙️ AudioBench
+# AudioBench
 
 **Offline AI audio toolkit** — transcribe, search, chat, visualize, and speak.
 
@@ -12,34 +12,38 @@ Turn any audio file into a searchable knowledge base that runs entirely on your 
 
 ## What You Get in One Command
 
-| | Capability | Command | What it does |
-|---|---|---|---|
-| 🎤 | **Transcribe** | `audiobench transcribe file.m4a` | Offline speech-to-text with word timestamps |
-| 🔴 | **Live** | `audiobench listen` | Real-time microphone transcription |
-| 🗣️ | **Speakers** | `--diarize` | Identify who said what |
-| 💬 | **Chat** | `audiobench chat 3` | Ask questions about any transcript |
-| 🔍 | **Search** | `audiobench search "keyword"` | Full-text search across all history |
-| 📊 | **Visualize** | `audiobench inspect file.m4a` | Waveform + spectrogram in one shot |
-| 🔊 | **Speak** | `audiobench speak "Hello"` | Text-to-speech (offline Piper TTS) |
-| 🔧 | **Analyze** | `audiobench analyze file.m4a` | Loudness, silence regions, quality |
-| 🔖 | **Bookmark** | `audiobench bookmark list 3` | Timestamp markers and region annotations |
-| 🤖 | **AI Bookmark** | `audiobench bookmark auto 66` | AI-powered auto-bookmarking with type classification |
+| Capability | Command | What it does |
+|---|---|---|
+| **Transcribe** | `audiobench transcribe file.m4a` | Offline speech-to-text with word timestamps |
+| **Live** | `audiobench listen` | Real-time microphone transcription |
+| **Speakers** | `--diarize` | Identify who said what |
+| **Chat** | `audiobench chat 3` | Ask questions about any transcript |
+| **Search** | `audiobench search "keyword"` | Full-text search across all history |
+| **Visualize** | `audiobench inspect file.m4a` | Waveform + spectrogram in one shot |
+| **Speak** | `audiobench speak "Hello"` | Text-to-speech (offline Piper TTS) |
+| **Analyze** | `audiobench analyze file.m4a` | Loudness, silence regions, quality |
+| **Bookmark** | `audiobench bookmark list 3` | Timestamp markers and region annotations |
+| **AI Bookmark** | `audiobench bookmark auto 66` | AI-powered auto-bookmarking with type classification |
+| **Daemon** | `audiobench daemon start` | Background service for automatic indexing & intelligence loops |
+| **Memory RAG** | `audiobench memory search "query"` | Hybrid vector similarity search over transcript expressions |
+| **Jobs** | `audiobench jobs list` | Manage background audio processing queue |
+| **Database** | `audiobench db status` | Idempotent SQLite migrations, backfill & repair tools |
 
 ---
 
 ## See AudioBench in Action
 
-### 📊 Audio Spectrogram
+### Audio Spectrogram
 > `audiobench inspect recording.flac`
 
 ![Spectrogram — full frequency analysis of a 27-minute conversation](docs/images/spectrogram.png)
 
-### 🌊 Waveform
+### Waveform
 > `audiobench inspect recording.flac`
 
 ![Waveform — visualize speech, silence, and volume across the recording](docs/images/waveform.png)
 
-### 🗣️ Speaker Diarization
+### Speaker Diarization
 > `audiobench transcribe conversation.m4a --diarize --engine gemini`
 
 ```
@@ -231,7 +235,7 @@ audiobench listen --save meeting.txt
 
 - **Cadence**: Text appears every ~4 seconds of continuous speech or after a 0.4s pause.
 - **Model**: Defaults to `base` (tuned with 4 CPU threads for ~0.5x real-time speed).
-- **History**: Live sessions appear in `audiobench history` as "🎤 Live session" and can be searched or spoken via TTS.
+- **History**: Live sessions appear in `audiobench history` as "Live session" and can be searched or spoken via TTS.
 
 ---
 

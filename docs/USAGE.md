@@ -517,3 +517,77 @@ audiobench bookmark export 3                      # JSON
 audiobench bookmark export 3 --format audacity    # Audacity label track
 audiobench bookmark import 3 labels.txt           # Auto-detects format
 ```
+
+---
+
+## 16. Background Daemon Service
+
+The AudioBench background daemon (`audiobench daemon`) manages automatic indexing, background intelligence loops, and queue worker tasks.
+
+```bash
+# Start background daemon
+audiobench daemon start
+
+# Check status and running background loops
+audiobench daemon status
+
+# Stop daemon
+audiobench daemon stop
+
+# Restart daemon & recover stale locks
+audiobench daemon restart
+```
+
+---
+
+## 17. RAG Vector Memory & Knowledge Retrieval
+
+Search audio transcript expressions using hybrid vector similarity via embedded LanceDB:
+
+```bash
+# Search memory store using vector similarity
+audiobench memory search "key discussions on system architecture"
+
+# Reformulate search query via LLM pipeline
+audiobench memory reformulate "what did we decide about database scaling?"
+
+# Ingest new transcripts/expressions manually
+audiobench memory ingest --transcript-id 42
+```
+
+---
+
+## 18. Asynchronous Job Queue Management
+
+Monitor and control background audio processing tasks:
+
+```bash
+# List all active and completed background jobs
+audiobench jobs list
+
+# Check status of a specific job
+audiobench jobs status <JOB_ID>
+
+# Cancel a running background job
+audiobench jobs cancel <JOB_ID>
+
+# Clear completed job history
+audiobench jobs clear
+```
+
+---
+
+## 19. Database Maintenance & Migrations
+
+Manage SQLite migrations, backfills, and database integrity:
+
+```bash
+# Check current database schema & migration status
+audiobench db status
+
+# Run pending database migrations idempotently
+audiobench db migrate
+
+# Backfill vector map associations
+audiobench db backfill
+```
