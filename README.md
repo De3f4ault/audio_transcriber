@@ -1,12 +1,24 @@
 # AudioBench
 
-**Offline AI audio toolkit** — transcribe, search, chat, visualize, and speak.
-
-Turn any audio file into a searchable knowledge base that runs entirely on your machine.
+**Offline AI audio intelligence toolkit** — a complete pipeline from raw audio to a hybrid vector-searchable knowledge graph, running entirely on your machine.
 
 > No API keys required · No cloud · No data leaves your laptop
 
 **Python 3.10+** · **MIT License** · **CPU-optimized** (`int8` quantization)
+
+---
+
+## What AudioBench Really Is
+
+Under the hood, AudioBench is not just a wrapper around Whisper. It is an end-to-end intelligence pipeline—a "digestive system" for your audio:
+
+1. **Ingestion (The Database):** Audio is transcribed via `faster-whisper`, diarized via ECAPA-TDNN, and stored in a robust SQLite relational database as `transcriptions` and `segments` (down to the word timestamp level).
+2. **Digestion (The Daemon):** A background daemon sweeps the database for new, unindexed transcripts. It chunks them into semantic "expressions" (typically 2-sentence rolling windows with overlap) to preserve context.
+3. **Embedding (The Nomic Engine):** These semantic chunks are passed through `nomic-embed-text-v1.5` to generate 768-dimensional dense vectors. 
+4. **Long-Term Memory (LanceDB):** The vectors, along with their metadata, are atomically merged into LanceDB, providing a scalable vector store that sits in perfect parity with the SQLite relational store.
+5. **Short-Term Memory (The Autocomplete Index):** On startup, the daemon rebuilds an in-memory HNSW graph from the LanceDB vectors, enabling lightning-fast, sub-millisecond autocomplete and semantic similarity searches.
+
+This architecture enables hybrid RAG (Retrieval-Augmented Generation) chat, instant semantic search across hundreds of hours of audio, and automated intelligence loops—all running locally on commodity hardware.
 
 ---
 
@@ -571,64 +583,48 @@ audiobench/                    ← Project root
 
 ```
 src/audiobench/
-├── core/                           ← Infrastructure
-│   ├── settings.py                 ← Pydantic settings (env vars, .env, defaults)
-│   ├── logger_factory.py           ← Logging setup
-│   ├── db_base.py                  ← SQLAlchemy DeclarativeBase
-│   ├── db_engine.py                ← Engine + init_db
-│   ├── db_session.py               ← Session factory
-│   └── error_types.py              ← Custom exceptions
-│
-├── transcribe/                     ← Transcription pipeline
-│   ├── transcriber.py              ← Pipeline orchestrator
-│   ├── audio_converter.py          ← FFmpeg wrapper (filters, conversion)
-│   ├── audio_filters.py            ← Text quality filters
-│   ├── transcription_result.py     ← Pydantic models (Segment, Transcript, Word)
-│   └── engines/
-│       ├── engine_protocol.py      ← Engine interface
-│       ├── engine_registry.py      ← Factory/registry
-│       └── whisper_engine.py       ← faster-whisper (batched + sequential)
-│
-├── chat/                           ← AI chat feature
-│   ├── chat_session.py             ← Chat orchestrator
-│   ├── chat_store.py               ← DB persistence
-│   ├── context_builder.py          ← Prompt templates
-│   └── providers/
-│       └── ollama_provider.py      ← Ollama backend
-│
-├── cli/                            ← Presentation layer
-│   ├── app.py                      ← Entry point + global flags
-│   ├── commands/                   ← Auto-discovered commands
-│   │   ├── __init__.py             ← pkgutil auto-discovery
-│   │   ├── transcribe.py, audio.py, chat.py, history.py, ...
-│   ├── display/                    ← Visual rendering
-│   │   ├── theme.py                ← Colors, Rich console, panels
-│   │   └── phase_tracker.py        ← Progress display
-│   ├── io/                         ← Input/Output handling
-│   │   ├── file_collector.py       ← Path resolution, globs, manifests
-│   │   └── output_resolver.py      ← Output path, format, collisions
-│   ├── plugins/                    ← Plugin system
-│   │   ├── loader.py               ← Plugin discovery + loading
-│   │   └── custom_group.py         ← Fuzzy command matching
-│   └── repl/                       ← Interactive shell
-│       ├── __init__.py             ← Main loop
-│       ├── session.py, dispatch.py, dot_commands.py, ...
-│
-├── storage/                        ← Data layer
+├── api/                            ← FastAPI REST web server & routes (chat, history, settings, transcribe)
+├── chapters/                       ← Automatic audio chaptering & topic segmentation
+├── chat/                           ← AI chat, REPL sessions, context builder & LLM providers
+├── cli/                            ← Presentation layer & Click commands
+│   ├── app.py                      ← CLI entrypoint & global options
+│   ├── commands/                   ← Command modules (transcribe, daemon, memory, jobs, db, etc.)
+│   ├── display/                    ← Theme, progress trackers & Observatory TUI
+│   ├── io/                         ← File collection & path resolution
+│   ├── plugins/                    ← Plugin loader & custom groups
+│   └── repl/                       ← Interactive shell (session, dispatch, slash commands)
+├── core/                           ← Infrastructure (settings, logging, db_engine, prompts, errors)
+├── daemon/                         ← Background daemon service
+│   ├── server.py                   ← UNIX socket daemon server & single-instance lock
+│   ├── client.py                   ← IPC client protocol
+│   ├── sweep_state.py              ← Thread-safe state sweeper & batch metrics
+│   └── intelligence/               ← Drift detector, scheduler & operator registries
+├── diarization/                    ← Speaker detection, pyannote & voiceprint verification
+├── events/                         ← Decoupled asynchronous event bus
+├── export/                         ← Export generators (PDF reports & HTML templates)
+├── jobs/                           ← Asynchronous background job queue worker & runner
+├── memory/                         ← LanceDB vector store & RAG memory pipeline
+│   ├── memory_store.py             ← Atomic merge_insert vector memory store
+│   ├── embedding_engine.py         ← nomic-embed-text vector embeddings
+│   ├── query_engine.py             ← RAG hybrid search & query reformulator
+│   └── singletons.py               ← Isolated offline HuggingFace model loaders
+├── observatory/                    ← Real-time telemetry dashboard & TUI widgets
+├── output/                         ← Format writers (txt, srt, vtt, json)
+├── playback/                       ← MPV IPC controller & synchronized lyrics player
+├── security/                       ← Privacy tier scoping & access controls
+├── storage/                        ← Relational database layer
 │   ├── models.py                   ← SQLAlchemy ORM models
 │   ├── repository.py               ← Transcription CRUD operations
-│   └── bookmark_repository.py      ← Bookmark CRUD, Audacity import/export
-│
-├── output/                         ← Format writers (txt, srt, vtt, json)
-├── streaming/                      ← Live transcription
-├── tts/                            ← Text-to-speech (Piper)
-└── diarization/                    ← Speaker detection
+│   ├── bookmark_repository.py      ← Bookmark & Audacity label CRUD
+│   └── migrations/                 ← Idempotent SQLite schema migrations (001–025)
+├── streaming/                      ← Real-time microphone audio transcription
+├── supervisor/                     ← Process supervisor management
+├── transcribe/                     ← Transcription pipeline & engines (whisper, gemini, vosk)
+├── transcription/                  ← Multi-GPU parallel transcription worker
+└── tts/                            ← Text-to-speech engine (Piper TTS)
 
-tests/                              ← Test suite (109 tests)
-├── conftest.py                     ← Shared fixtures
-├── test_core/                      ← Settings, DB engine
-├── test_cli/                       ← Commands, IO, REPL
-└── test_storage/                   ← Repository CRUD
+web/                                ← Modern React + Vite Web UI application
+tests/                              ← Comprehensive unit & integration test suite
 ```
 
 ---
