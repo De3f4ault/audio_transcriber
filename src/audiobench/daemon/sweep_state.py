@@ -63,6 +63,11 @@ class SweepState:
     # Not protected by _lock: written by one thread, read for display only.
     consecutive_sweep_failures: int = 0
 
+    # Diagnostic counter: total segment sub-batches processed since startup.
+    # Used to number each sub-batch in RSS log lines so we can track
+    # cumulative memory growth across batches 1 → N in a single run.
+    seg_batch_count: int = 0
+
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     # ------------------------------------------------------------------

@@ -6,10 +6,11 @@ primary embedding generation, and post-retrieval reranking.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Generator
 
 from huggingface_hub.utils import HfHubHTTPError, LocalEntryNotFoundError
 from requests.exceptions import ConnectionError  # type: ignore[import-untyped]
@@ -58,6 +59,39 @@ def _configure_hf() -> bool:
     return is_offline
 
 
+@contextlib.contextmanager
+def _force_offline_env() -> Generator[None, None, None]:
+    """Context manager that sets HF_HUB_OFFLINE + TRANSFORMERS_OFFLINE for its
+    entire duration, then restores the originals.
+
+    This is the correct way to force offline loading: env vars must remain set
+    for the full depth of SentenceTransformer.__init__, including all lazily
+    invoked sub-loaders such as modeling_hf_nomic_bert.state_dict_from_pretrained.
+    Restoring inside a finally{} block that wraps only the top-level call is
+    insufficient because those sub-loaders run *after* the finally fires.
+    """
+    import huggingface_hub.constants as hf_constants
+    orig_hf = os.environ.get("HF_HUB_OFFLINE")
+    orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
+    orig_const = hf_constants.HF_HUB_OFFLINE
+    
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    hf_constants.HF_HUB_OFFLINE = True
+    try:
+        yield
+    finally:
+        hf_constants.HF_HUB_OFFLINE = orig_const
+        if orig_hf is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = orig_hf
+        if orig_tr is None:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        else:
+            os.environ["TRANSFORMERS_OFFLINE"] = orig_tr
+
+
 def _handle_load_error(e: Exception, model_name: str) -> None:
     """Gracefully handle HuggingFace load errors for new users."""
     if isinstance(e, (LocalEntryNotFoundError, ConnectionError, HfHubHTTPError)):
@@ -80,41 +114,29 @@ def get_boundary_embedder() -> Any:
             if _boundary_embedder is None:
                 is_offline = _configure_hf()
                 logger.info(
-                    "Loading boundary embedder (sentence-transformers/all-MiniLM-L6-v2) [offline=%s]...",
-                    is_offline,
+                    "Loading boundary embedder (sentence-transformers/all-MiniLM-L6-v2) ...",
                 )
                 t0 = time.time()
                 from sentence_transformers import SentenceTransformer
 
+                # Attempt 1: load from local cache — env vars held for the full
+                # depth of SentenceTransformer.__init__ via context manager.
                 try:
-                    # Prefer local cache to avoid unauthenticated/slow HF pings
-                    orig_hf = os.environ.get("HF_HUB_OFFLINE")
-                    orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
-                    os.environ["HF_HUB_OFFLINE"] = "1"
-                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-                    try:
+                    with _force_offline_env():
                         _boundary_embedder = SentenceTransformer(
                             "sentence-transformers/all-MiniLM-L6-v2", local_files_only=True
                         )
-                    finally:
-                        if orig_hf is None:
-                            del os.environ["HF_HUB_OFFLINE"]
-                        else:
-                            os.environ["HF_HUB_OFFLINE"] = orig_hf
-                        if orig_tr is None:
-                            del os.environ["TRANSFORMERS_OFFLINE"]
-                        else:
-                            os.environ["TRANSFORMERS_OFFLINE"] = orig_tr
                 except Exception as e:
                     logger.debug("Failed to load boundary embedder from cache: %s", e)
                     if is_offline:
                         raise
+                    # Attempt 2: online download (first-run path).
                     try:
                         _boundary_embedder = SentenceTransformer(
                             "sentence-transformers/all-MiniLM-L6-v2", local_files_only=False
                         )
-                    except Exception as e:
-                        _handle_load_error(e, "sentence-transformers/all-MiniLM-L6-v2")
+                    except Exception as e2:
+                        _handle_load_error(e2, "sentence-transformers/all-MiniLM-L6-v2")
                 logger.info("Boundary embedder loaded in %.2fs", time.time() - t0)
     return _boundary_embedder
 
@@ -130,45 +152,39 @@ def get_primary_embedder() -> Any:
             if _primary_embedder is None:
                 is_offline = _configure_hf()
                 logger.info(
-                    "Loading primary embedder (nomic-ai/nomic-embed-text-v1.5) [offline=%s]...",
-                    is_offline,
+                    "Loading primary embedder (nomic-ai/nomic-embed-text-v1.5) ...",
                 )
                 t0 = time.time()
                 from sentence_transformers import SentenceTransformer
 
+                # Attempt 1: load from local cache.
+                # IMPORTANT: _force_offline_env() keeps HF_HUB_OFFLINE=1 and
+                # TRANSFORMERS_OFFLINE=1 set for the *entire* duration of
+                # SentenceTransformer.__init__, including the
+                # modeling_hf_nomic_bert.state_dict_from_pretrained() call that
+                # happens deep inside transformers' lazy sub-module loading.
+                # The old pattern (set/finally/restore wrapping only the top call)
+                # was stripping the vars before the custom weight loader ran.
                 try:
-                    # Prefer local cache
-                    orig_hf = os.environ.get("HF_HUB_OFFLINE")
-                    orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
-                    os.environ["HF_HUB_OFFLINE"] = "1"
-                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-                    try:
+                    with _force_offline_env():
                         _primary_embedder = SentenceTransformer(
                             "nomic-ai/nomic-embed-text-v1.5",
                             trust_remote_code=True,
                             local_files_only=True,
                         )
-                    finally:
-                        if orig_hf is None:
-                            del os.environ["HF_HUB_OFFLINE"]
-                        else:
-                            os.environ["HF_HUB_OFFLINE"] = orig_hf
-                        if orig_tr is None:
-                            del os.environ["TRANSFORMERS_OFFLINE"]
-                        else:
-                            os.environ["TRANSFORMERS_OFFLINE"] = orig_tr
                 except Exception as e:
                     logger.debug("Failed to load primary embedder from cache: %s", e)
                     if is_offline:
                         raise
+                    # Attempt 2: online download (first-run path).
                     try:
                         _primary_embedder = SentenceTransformer(
                             "nomic-ai/nomic-embed-text-v1.5",
                             trust_remote_code=True,
                             local_files_only=False,
                         )
-                    except Exception as e:
-                        _handle_load_error(e, "nomic-ai/nomic-embed-text-v1.5")
+                    except Exception as e2:
+                        _handle_load_error(e2, "nomic-ai/nomic-embed-text-v1.5")
                 logger.info("Primary embedder loaded in %.2fs", time.time() - t0)
     return _primary_embedder
 
@@ -192,41 +208,28 @@ def get_reranker() -> Any:
             if _reranker is None:
                 is_offline = _configure_hf()
                 logger.info(
-                    "Loading cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) [offline=%s]...",
-                    is_offline,
+                    "Loading cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) ...",
                 )
                 t0 = time.time()
                 from sentence_transformers import CrossEncoder
 
+                # Attempt 1: load from local cache.
                 try:
-                    # Prefer local cache
-                    orig_hf = os.environ.get("HF_HUB_OFFLINE")
-                    orig_tr = os.environ.get("TRANSFORMERS_OFFLINE")
-                    os.environ["HF_HUB_OFFLINE"] = "1"
-                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-                    try:
+                    with _force_offline_env():
                         _reranker = CrossEncoder(
                             "cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=True
                         )
-                    finally:
-                        if orig_hf is None:
-                            del os.environ["HF_HUB_OFFLINE"]
-                        else:
-                            os.environ["HF_HUB_OFFLINE"] = orig_hf
-                        if orig_tr is None:
-                            del os.environ["TRANSFORMERS_OFFLINE"]
-                        else:
-                            os.environ["TRANSFORMERS_OFFLINE"] = orig_tr
                 except Exception as e:
                     logger.debug("Failed to load reranker from cache: %s", e)
                     if is_offline:
                         raise
+                    # Attempt 2: online download (first-run path).
                     try:
                         _reranker = CrossEncoder(
                             "cross-encoder/ms-marco-MiniLM-L-6-v2", local_files_only=False
                         )
-                    except Exception as e:
-                        _handle_load_error(e, "cross-encoder/ms-marco-MiniLM-L-6-v2")
+                    except Exception as e2:
+                        _handle_load_error(e2, "cross-encoder/ms-marco-MiniLM-L-6-v2")
                 logger.info("Reranker loaded in %.2fs", time.time() - t0)
     return _reranker
 
@@ -263,45 +266,20 @@ def get_colbert_reranker() -> Any:
 
                     ColBERTModel.__init__ = patched_init
 
-                    # Temporarily force offline mode to prevent network ping if cached
-                    original_hf_offline = os.environ.get("HF_HUB_OFFLINE")
-                    original_tr_offline = os.environ.get("TRANSFORMERS_OFFLINE")
-                    os.environ["HF_HUB_OFFLINE"] = "1"
-                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                    # Attempt 1: load from local cache.
                     try:
-                        _colbert_reranker = ColbertReranker(
-                            model_name="answerdotai/answerai-colbert-small-v1", column="content"
-                        )
+                        with _force_offline_env():
+                            _colbert_reranker = ColbertReranker(
+                                model_name="answerdotai/answerai-colbert-small-v1", column="content"
+                            )
                     except Exception as e:
                         logger.debug("Failed to load ColBERT reranker from cache: %s", e)
-                        if original_hf_offline is not None:
-                            os.environ["HF_HUB_OFFLINE"] = original_hf_offline
-                        else:
-                            del os.environ["HF_HUB_OFFLINE"]
-                        if original_tr_offline is not None:
-                            os.environ["TRANSFORMERS_OFFLINE"] = original_tr_offline
-                        else:
-                            del os.environ["TRANSFORMERS_OFFLINE"]
-                        
                         if is_offline:
                             raise
-                            
-                        # Retry online
+                        # Attempt 2: online download (first-run path).
                         _colbert_reranker = ColbertReranker(
                             model_name="answerdotai/answerai-colbert-small-v1", column="content"
                         )
-                    finally:
-                        # Restore original environment if we had to retry
-                        if "HF_HUB_OFFLINE" in os.environ:
-                            if original_hf_offline is not None:
-                                os.environ["HF_HUB_OFFLINE"] = original_hf_offline
-                            else:
-                                del os.environ["HF_HUB_OFFLINE"]
-                        if "TRANSFORMERS_OFFLINE" in os.environ:
-                            if original_tr_offline is not None:
-                                os.environ["TRANSFORMERS_OFFLINE"] = original_tr_offline
-                            else:
-                                del os.environ["TRANSFORMERS_OFFLINE"]
                             
                     logger.info("ColBERT reranker loaded in %.2fs", time.time() - t0)
                 except (ImportError, ModuleNotFoundError) as e:

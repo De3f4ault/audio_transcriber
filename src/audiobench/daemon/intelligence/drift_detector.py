@@ -56,20 +56,24 @@ class DriftDetector(IntelligenceTask):
         iso_a_start = _to_iso(window_a_start)
 
         with get_session() as session:
-            # Window A
+            # Window A: days 15–30 ago (most recent 500, for centroid stability)
             rows_a = session.execute(
                 sql_text("""
                 SELECT id FROM expressions
                 WHERE created_at >= :start AND created_at < :end
+                ORDER BY created_at DESC
+                LIMIT 500
                 """),
                 {"start": iso_a_start, "end": iso_b_start}
             ).mappings().all()
 
-            # Window B
+            # Window B: days 0–15 ago (most recent 500)
             rows_b = session.execute(
                 sql_text("""
                 SELECT id FROM expressions
                 WHERE created_at >= :start AND created_at <= :end
+                ORDER BY created_at DESC
+                LIMIT 500
                 """),
                 {"start": iso_b_start, "end": iso_now}
             ).mappings().all()

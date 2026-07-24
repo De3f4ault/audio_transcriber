@@ -25,27 +25,51 @@ def test_task_runs_after_idle_threshold():
 
 @patch("audiobench.daemon.intelligence.scheduler.psutil")
 def test_task_not_run_when_memory_over_budget(mock_psutil):
+    """Gate fires when current RSS exceeds baseline + max_task_overhead_mb."""
     mock_process = MagicMock()
     mock_mem_info = MagicMock()
-    mock_mem_info.rss = 600 * 1024 * 1024
+    # Simulate baseline of 2000 MB, current RSS of 2600 MB → 600 MB overhead
+    mock_mem_info.rss = 2600 * 1024 * 1024
     mock_process.memory_info.return_value = mock_mem_info
     mock_psutil.Process.return_value = mock_process
-    
-    budget = ResourceBudget(max_memory_mb=500)
+    mock_psutil.cpu_percent.return_value = 0.0
+
+    budget = ResourceBudget(max_task_overhead_mb=500)
     scheduler = IntelligenceScheduler(budget=budget)
+    scheduler._baseline_rss_mb = 2000.0  # settled post-startup baseline
     assert not scheduler._has_resources()
+
+
+@patch("audiobench.daemon.intelligence.scheduler.psutil")
+def test_task_allowed_when_overhead_within_budget(mock_psutil):
+    """Gate passes when RSS overhead is within the allowed ceiling."""
+    mock_process = MagicMock()
+    mock_mem_info = MagicMock()
+    # Baseline 3000 MB, current 3200 MB → 200 MB overhead, budget 1024 MB
+    mock_mem_info.rss = 3200 * 1024 * 1024
+    mock_process.memory_info.return_value = mock_mem_info
+    mock_psutil.Process.return_value = mock_process
+    mock_psutil.cpu_percent.return_value = 0.0
+
+    budget = ResourceBudget(max_task_overhead_mb=1024)
+    scheduler = IntelligenceScheduler(budget=budget)
+    scheduler._baseline_rss_mb = 3000.0
+    assert scheduler._has_resources()
+
 
 @patch("audiobench.daemon.intelligence.scheduler.psutil")
 def test_task_not_run_when_cpu_over_budget(mock_psutil):
     mock_process = MagicMock()
     mock_mem_info = MagicMock()
-    mock_mem_info.rss = 100 * 1024 * 1024
+    # RSS within overhead budget (baseline 3000, current 3100 → 100 MB overhead)
+    mock_mem_info.rss = 3100 * 1024 * 1024
     mock_process.memory_info.return_value = mock_mem_info
     mock_psutil.Process.return_value = mock_process
     mock_psutil.cpu_percent.return_value = 50.0
-    
-    budget = ResourceBudget(max_cpu_percent=15.0)
+
+    budget = ResourceBudget(max_cpu_percent=15.0, max_task_overhead_mb=1024)
     scheduler = IntelligenceScheduler(budget=budget)
+    scheduler._baseline_rss_mb = 3000.0
     assert not scheduler._has_resources()
 
 def test_max_inferences_per_session_enforced():
@@ -90,3 +114,32 @@ async def test_interval_enforced_between_runs():
         can_run = (now_time - scheduler._last_run_times[type(task)]) >= task.INTERVAL_SECONDS
         assert can_run
 
+
+def test_circuit_breaker_engages_at_threshold():
+    """Task enters backoff when consecutive failures reach circuit_breaker_threshold."""
+    budget = ResourceBudget(circuit_breaker_threshold=3)
+    scheduler = IntelligenceScheduler(budget=budget)
+    task_type = MockTask
+
+    exc = RuntimeError("task failed")
+    scheduler._record_task_failure(task_type, exc)
+    scheduler._record_task_failure(task_type, exc)
+    assert not scheduler._is_task_backed_off(task_type)  # 2 failures, not yet
+    scheduler._record_task_failure(task_type, exc)
+    assert scheduler._is_task_backed_off(task_type)  # 3 failures → backed off
+
+
+def test_circuit_breaker_resets_on_success():
+    """Successful run clears backoff state."""
+    budget = ResourceBudget(circuit_breaker_threshold=3)
+    scheduler = IntelligenceScheduler(budget=budget)
+    task_type = MockTask
+
+    exc = RuntimeError("task failed")
+    for _ in range(3):
+        scheduler._record_task_failure(task_type, exc)
+    assert scheduler._is_task_backed_off(task_type)
+
+    scheduler._record_task_success(task_type)
+    assert not scheduler._is_task_backed_off(task_type)
+    assert scheduler._task_consecutive_failures.get(task_type, 0) == 0

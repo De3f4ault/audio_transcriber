@@ -45,13 +45,22 @@ def mock_session():
             elif "SELECT id FROM expressions" in query:
                 params = args[1] if len(args) > 1 else kwargs.get("params", {})
                 # We need to return ids that we can map to vectors
-                since = params.get("start", 0)
                 until = params.get("end", 0)
                 
                 # very crude mocking: if until is recent, it's Window B. If until is past 15 days, it's Window A.
                 import time
+                from datetime import datetime
                 now = time.time()
-                if until > now - 5 * 86400: # recent (Window B)
+                
+                if isinstance(until, str):
+                    try:
+                        until_ts = datetime.fromisoformat(until.replace('Z', '+00:00')).timestamp()
+                    except ValueError:
+                        until_ts = now
+                else:
+                    until_ts = float(until)
+                    
+                if until_ts > now - 5 * 86400: # recent (Window B)
                     res.all.return_value = [{"id": i} for i in range(len(window_b_vectors or []))]
                 else: # older (Window A)
                     res.all.return_value = [{"id": i} for i in range(len(window_a_vectors or []))]

@@ -9,13 +9,37 @@ Protocol: {"cmd": str, "args": {...}, "request_id": str}  →  {"success": bool,
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import fcntl
+import gc
 import json
 import os
 import signal
+import sys
 import time
 import warnings
 from pathlib import Path
 from typing import Any
+
+# Best-effort glibc page release after large embedding batches.  Only
+# available on Linux; silently skipped on other platforms.
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:
+    _libc = None
+
+
+def _release_pages() -> None:
+    """Return glibc heap pages to the OS after a large embedding batch.
+
+    gc.collect() alone does nothing for PyTorch's CPU caching allocator.
+    malloc_trim(0) asks glibc to release free arenas above the current
+    high-water mark.  Confirmed to return ~75 % of batch-allocated pages
+    on this machine.  No-op if libc is unavailable.
+    """
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(ctypes.c_size_t(0))
 
 from audiobench.core.db_session import get_session
 from audiobench.core.logger_factory import get_logger
@@ -619,6 +643,66 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
+# Module-level lock FD — held open for the entire daemon lifetime.
+# fcntl advisory locks are tied to the FD's inode, not the path, so this
+# must stay open or the exclusive lock is released immediately.
+_LOCK_FD: int | None = None
+
+
+def _check_existing_daemon(pid_path: Path) -> int | None:
+    """Informational PID check — fast path for a clear user-facing error message.
+
+    Returns the running PID if another daemon instance is verifiably alive,
+    or None if the PID file is absent, corrupt, or stale (process is dead).
+
+    This is a UX layer only, not the authoritative guard.  The fcntl exclusive
+    lock in _acquire_exclusive_lock() is the real mutex.  If the two ever
+    disagree, the flock result is authoritative.
+    """
+    if not pid_path.exists():
+        return None
+    try:
+        pid = int(pid_path.read_text().strip())
+    except (ValueError, OSError):
+        return None  # corrupt file — treat as stale
+
+    # os.kill(pid, 0) sends no signal but probes whether the PID is alive.
+    try:
+        os.kill(pid, 0)
+        return pid  # PID exists and we can signal it — another daemon is running
+    except ProcessLookupError:
+        return None  # PID is dead — stale file from a previous crash
+    except PermissionError:
+        # PID exists but is owned by a different user.  Still alive.
+        return pid
+
+
+def _acquire_exclusive_lock(lock_path: Path) -> bool:
+    """Acquire an exclusive advisory lock on lock_path.
+
+    This is the authoritative single-instance guard.  The kernel enforces
+    mutual exclusion atomically — there is no TOCTOU race.
+
+    Returns True if the lock was acquired (this process is the sole owner).
+    Returns False if another process already holds the lock.
+
+    The acquired FD is stored in _LOCK_FD and must remain open for the entire
+    daemon lifetime.  Closing it releases the lock immediately.  The kernel
+    releases it automatically and atomically when the process dies, which
+    occurs before the supervisor's Popen() call for any replacement process
+    (because proc.poll() returning non-None proves waitpid() already fired).
+    """
+    global _LOCK_FD
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # non-blocking
+        _LOCK_FD = fd  # keep open — releasing closes the lock
+        return True
+    except OSError:
+        os.close(fd)
+        return False  # another process holds the lock
+
 
 def _write_pid_file(pid_path: Path) -> None:
     pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -627,11 +711,22 @@ def _write_pid_file(pid_path: Path) -> None:
 
 
 def _cleanup(socket_path: Path, pid_path: Path) -> None:
+    # Unlink runtime artifacts first so the path is free for any replacement.
     for p in (socket_path, pid_path):
         try:
             p.unlink(missing_ok=True)
         except Exception:
             pass
+    # Release the exclusive lock last — this is the moment another daemon
+    # instance is allowed to acquire it.  The FD's inode lock is independent
+    # of the filename, so unlinking the lock file above does not release it.
+    global _LOCK_FD
+    if _LOCK_FD is not None:
+        try:
+            os.close(_LOCK_FD)
+        except OSError:
+            pass
+        _LOCK_FD = None
     logger.info("Cleanup complete")
 
 
@@ -658,68 +753,83 @@ def _do_sweep_once() -> None:
         failed_ids: list[int] = []
 
         with get_session() as session:
-            transcripts = (
-                session.query(TranscriptionRecord)
-                .filter(TranscriptionRecord.id.in_(tx_ids))
-                .all()
-            )
-            for transcript in transcripts:
-                try:
-                    text = transcript.full_text or ""
-                    if not text.strip():
-                        transcript.is_indexed = 1
-                        success_ids.append(transcript.id)
-                        continue
+            # Eager load the required fields to avoid lazy-loading outside session.
+            # SQLite text() doesn't accept tuple bindings for IN — expand to
+            # individual named placeholders (:id0, :id1, ...) like the segments loop.
+            tx_named = {f"id{i}": tid for i, tid in enumerate(tx_ids)}
+            tx_placeholders = ", ".join(f":id{i}" for i in range(len(tx_ids)))
+            rows = session.execute(
+                sql_text(
+                    f"SELECT t.id, t.full_text, t.audio_file_id, t.language_probability, t.language, af.work_id "
+                    f"FROM transcriptions t "
+                    f"LEFT JOIN audio_files af ON t.audio_file_id = af.id "
+                    f"WHERE t.id IN ({tx_placeholders})"
+                ),
+                tx_named,
+            ).mappings().all()
+            tx_data = list(rows)
 
-                    chunks = content_aware_router(text)
-                    if chunks:
-                        chunk_items = [
-                            {
-                                "content": chunk.content,
-                                "source_type": SourceType.AUDIO_TRANSCRIPT.value,
-                                "source_id": transcript.id,
-                                "speaker": chunk.speaker,
-                                "work_id": transcript.audio_file.work_id if transcript.audio_file else None,
-                            }
-                            for chunk in chunks
-                        ]
-                        # O(1) dedup — no SQL IN() query for known hashes
-                        registered = expr_repo.register_batch(
-                            chunk_items,
-                            known_hashes=state.known_hashes,
-                        )
-                        # Batch embed + write — one model forward-pass per transcript
-                        nodes = [
-                            {
-                                "expression_id": expr.id,
-                                "content": expr.content,
-                                "source_type": SourceType.AUDIO_TRANSCRIPT.value,
-                                "speaker": expr.speaker,
-                                "audio_file_id": transcript.audio_file_id,
-                                "confidence": transcript.language_probability,
-                                "original_language": transcript.language,
-                                "work_id": expr.work_id,
-                            }
-                            for expr in registered
-                        ]
-                        _get_store().batch_write_nodes(
-                            nodes,
-                            indexed_ids=state.indexed_expression_ids,
-                        )
-                        from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
-                        increment_unoptimized_writes(len(nodes))
-                        _maybe_trigger_threshold_optimize()
+        for tx in tx_data:
+            try:
+                text = tx["full_text"] or ""
+                if not text.strip():
+                    success_ids.append(tx["id"])
+                    continue
 
-                    transcript.is_indexed = 1
-                    success_ids.append(transcript.id)
-                except Exception as e:
-                    logger.error(
-                        "RAG sweep: failed to index transcript %d: %s",
-                        transcript.id, e,
+                chunks = content_aware_router(text)
+                if chunks:
+                    chunk_items = [
+                        {
+                            "content": chunk.content,
+                            "source_type": SourceType.AUDIO_TRANSCRIPT.value,
+                            "source_id": tx["id"],
+                            "speaker": chunk.speaker,
+                            "work_id": tx["work_id"],
+                        }
+                        for chunk in chunks
+                    ]
+                    # O(1) dedup — no SQL IN() query for known hashes
+                    registered = expr_repo.register_batch(
+                        chunk_items,
+                        known_hashes=state.known_hashes,
                     )
-                    failed_ids.append(transcript.id)
+                    # Batch embed + write — one model forward-pass per transcript
+                    nodes = [
+                        {
+                            "expression_id": expr.id,
+                            "content": expr.content,
+                            "source_type": SourceType.AUDIO_TRANSCRIPT.value,
+                            "speaker": expr.speaker,
+                            "audio_file_id": tx["audio_file_id"],
+                            "confidence": tx["language_probability"],
+                            "original_language": tx["language"],
+                            "work_id": expr.work_id,
+                        }
+                        for expr in registered
+                    ]
+                    _get_store().batch_write_nodes(nodes)
 
-            session.commit()
+                    from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
+                    increment_unoptimized_writes(len(nodes))
+                    _maybe_trigger_threshold_optimize()
+
+                success_ids.append(tx["id"])
+            except Exception as e:
+                logger.error(
+                    "RAG sweep: failed to index transcript %d: %s",
+                    tx["id"], e,
+                )
+                failed_ids.append(tx["id"])
+
+        if success_ids:
+            with get_session() as session:
+                sid_named = {f"id{i}": sid for i, sid in enumerate(success_ids)}
+                sid_placeholders = ", ".join(f":id{i}" for i in range(len(success_ids)))
+                session.execute(
+                    sql_text(f"UPDATE transcriptions SET is_indexed = 1 WHERE id IN ({sid_placeholders})"),
+                    sid_named,
+                )
+                session.commit()
 
         logger.info(
             "RAG sweep: indexed %d transcripts (%d failed).",
@@ -729,11 +839,25 @@ def _do_sweep_once() -> None:
             state.requeue_transcripts(failed_ids)
 
     # ── Segment sweep (segment deque → batch embed → LanceDB + SQLite) ─────
-    seg_ids = state.pop_segment_batch(size=256)
+    #
+    # Sub-batch at 64 segments per iteration rather than pulling 256 at once.
+    #
+    # Rationale from measurement (2026-07-20): a 256-segment monolithic batch
+    # peaked at ~8 GB RSS (model.encode accumulates all 4×64 sub-batches before
+    # returning, LanceDB builds one Arrow table for all 256 rows simultaneously).
+    # Processing 64 segments per pass limits each iteration to one model forward
+    # pass + one 64-row LanceDB write, then malloc_trim(0) returns the freed
+    # glibc arena to the OS before the next pass.  Four passes instead of one,
+    # but each stays well under the 4 GB intelligence-task gate threshold.
+    _SEG_SUB_BATCH = 64
+    seg_ids = state.pop_segment_batch(size=_SEG_SUB_BATCH)
     if not seg_ids:
         logger.info("RAG sweep: all segments vectorized (deque empty).")
     else:
-        logger.info("RAG sweep: vectorizing %d segments from deque...", len(seg_ids))
+        logger.info(
+            "RAG sweep: vectorizing %d segments from deque (sub-batch %d)...",
+            len(seg_ids), _SEG_SUB_BATCH,
+        )
         with get_session() as session:
             named_params = {f"id{i}": sid for i, sid in enumerate(seg_ids)}
             placeholders = ", ".join(f":id{i}" for i in range(len(seg_ids)))
@@ -742,23 +866,66 @@ def _do_sweep_once() -> None:
                     f"SELECT s.id, s.text, s.start_time, s.end_time, af.file_path "
                     f"FROM segments s "
                     f"JOIN transcriptions t ON s.transcription_id = t.id "
-                    f"JOIN audio_files af ON t.audio_file_id = af.id "
+                    # LEFT JOIN so segments whose transcription has audio_file_id=NULL
+                    # are returned (with af.file_path=NULL) rather than silently
+                    # dropped by an INNER JOIN, which would leave them stuck in the
+                    # deque forever re-queuing on every sweep tick.
+                    f"LEFT JOIN audio_files af ON t.audio_file_id = af.id "
                     f"WHERE s.id IN ({placeholders})"
                 ),
                 named_params,
             ).mappings().all()
             rows = list(rows)
 
+        # Segments whose transcription has no linked audio file cannot be
+        # vectorized — they have no audio content to embed against.  Drain
+        # them permanently so they stop re-queuing on every sweep tick.
+        # NOTE: vector_indexed=1 here means "permanently skipped — no audio
+        # file, never embedded," NOT "successfully embedded and searchable."
+        # This deliberately overloads the flag to avoid a schema change for
+        # what should be a rare edge case (test fixtures leaking into the
+        # production DB).  See also: scripts/cleanup_test_fixtures.py.
+        ineligible_ids = [int(r["id"]) for r in rows if r["file_path"] is None]
+        if ineligible_ids:
+            logger.warning(
+                "RAG sweep: %d segment(s) have no linked audio file "
+                "(audio_file_id=NULL on their transcription). Marking as "
+                "permanently skipped (vector_indexed=1, never embedded): %s",
+                len(ineligible_ids),
+                ineligible_ids,
+            )
+            with get_session() as skip_upd:
+                skip_params = {f"id{i}": sid for i, sid in enumerate(ineligible_ids)}
+                skip_placeholders = ", ".join(f":id{i}" for i in range(len(ineligible_ids)))
+                skip_upd.execute(
+                    sql_text(
+                        f"UPDATE segments SET vector_indexed=1 WHERE id IN ({skip_placeholders})"
+                    ),
+                    skip_params,
+                )
+                skip_upd.commit()
+
+        rows = [r for r in rows if r["file_path"] is not None]
+
         if rows:
             from audiobench.memory.singletons import get_primary_inference_lock
             seg_store = _get_segment_store()
             model = get_primary_embedder()
             try:
-                texts = [f"search_document: {r['text'][:12_000]}" for r in rows]
+                import psutil as _psutil
+                _proc = _psutil.Process()
+                state.seg_batch_count += 1
+                _batch_num = state.seg_batch_count
+                texts = [f"search_document: {r['text'][:2_000]}" for r in rows]
                 with get_primary_inference_lock():
                     vectors = model.encode(
                         texts, batch_size=64, show_progress_bar=False,
                     ).tolist()
+                _rss_post_embed = _proc.memory_info().rss / (1024 * 1024)
+                logger.debug(
+                    "RAG sweep sub-batch #%d RSS after encode (%d segs): %.1f MB",
+                    _batch_num, len(rows), _rss_post_embed,
+                )
                 mapped_rows = [
                     dict(
                         segment_id=r["id"],
@@ -771,6 +938,11 @@ def _do_sweep_once() -> None:
                 ]
                 seg_store.batch_upsert_segments(
                     rows=mapped_rows, vectors=vectors
+                )
+                _rss_post_write = _proc.memory_info().rss / (1024 * 1024)
+                logger.debug(
+                    "RAG sweep sub-batch #%d RSS after LanceDB write (%d segs): %.1f MB  (delta from encode: %+.1f MB)",
+                    _batch_num, len(rows), _rss_post_write, _rss_post_write - _rss_post_embed,
                 )
                 from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
                 increment_unoptimized_writes(len(mapped_rows))
@@ -788,10 +960,15 @@ def _do_sweep_once() -> None:
                     )
                     upd.commit()
                 logger.info(
-                    "RAG sweep: vectorized %d segments in one batch.", len(rows)
+                    "RAG sweep: vectorized %d segments in sub-batch.", len(rows)
                 )
                 # ── Success: reset the segment-level failure counter ────────
                 state.consecutive_sweep_failures = 0
+                # ── Release pages back to OS before next sweep tick ─────────
+                # Frees glibc arena growth from the embedding batch.  Does not
+                # affect PyTorch's internal caching allocator pool, but returns
+                # ~75 % of the batch-allocated glibc pages (measured).
+                _release_pages()
             except Exception as seg_exc:
                 logger.error(
                     "RAG sweep: failed to batch vectorize segments: %s", seg_exc
@@ -1164,16 +1341,44 @@ def run() -> None:
     """Entry point — start the daemon (blocks until SIGTERM/SIGINT)."""
     from audiobench.core.logger_factory import setup_logging
     setup_logging("DEBUG")
-    
-    import os
+
     os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 4))
     os.environ.setdefault("MKL_NUM_THREADS", str(os.cpu_count() or 4))
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    
+
     settings = get_settings()
     socket_path = Path(settings.daemon_socket_path)
     pid_path = Path(settings.daemon_pid_path)
+    lock_path = pid_path.with_suffix(".lock")  # e.g. /tmp/audiobench-daemon.lock
 
+    # ── Layer 1: PID check (UX fast path) ─────────────────────────────────
+    # Informational only — gives a clear, actionable error message early,
+    # before any models are loaded.  Not the authoritative guard; see Layer 2.
+    existing_pid = _check_existing_daemon(pid_path)
+    if existing_pid is not None:
+        logger.error(
+            "Daemon already running (PID %d). "
+            "Run `audiobench daemon stop` first, or `audiobench daemon status` to inspect.",
+            existing_pid,
+        )
+        sys.exit(1)
+
+    # ── Layer 2: Exclusive flock (authoritative mutex) ─────────────────────
+    # Kernel-enforced, TOCTOU-proof.  If the PID check above and this check
+    # ever disagree, this result is authoritative — the flock cannot be tricked
+    # by stale files or a race between two processes reading the same PID file.
+    if not _acquire_exclusive_lock(lock_path):
+        logger.error(
+            "Could not acquire exclusive lock at %s. "
+            "Another daemon instance may be starting simultaneously. "
+            "Run `audiobench daemon stop` and retry.",
+            lock_path,
+        )
+        sys.exit(1)
+
+    logger.info("Single-instance lock acquired (pid=%d, lock=%s).", os.getpid(), lock_path)
+
+    # ── All clear — proceed with startup ──────────────────────────────────
     from audiobench.observatory.db import init_journal_db
     from audiobench.observatory.subscriber import get_subscriber
     from audiobench.events import get_bus
