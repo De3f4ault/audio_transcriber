@@ -1,8 +1,8 @@
 .PHONY: install dev test lint format clean help
 .PHONY: transcribe transcribe-srt history search info download
-.PHONY: docs docs-serve docs-stop
-.PHONY: translate subtitle listen speak download-voice summarize ask diarize
-.PHONY: repl chat vocab doctor status cleanup preset
+.PHONY: translate subtitle subtitle-hard listen speak download-voice summarize ask diarize
+.PHONY: repl chat vocab doctor status cleanup preset preset-create
+.PHONY: daemon-start daemon-status daemon-stop memory-search memory-ask db-status jobs-list
 
 VENV := venv
 PYTHON := $(VENV)/bin/python
@@ -20,7 +20,6 @@ help: ## Show this help
 install: ## Install base dependencies
 	python -m venv $(VENV)
 	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements.txt
 	$(PIP) install -e .
 
 dev: ## Install with dev dependencies (editable)
@@ -48,7 +47,7 @@ info: ## Show system info and settings
 download: ## Download a model (make download MODEL=large-v3-turbo)
 	$(CLI) download $(or $(MODEL),large-v3-turbo)
 
-# ── New Features ─────────────────────────────────────────────
+# ── Feature Commands ─────────────────────────────────────────
 
 translate: ## Translate audio to English (make translate FILE=audio.m4a)
 	$(CLI) transcribe --translate $(FILE)
@@ -86,11 +85,34 @@ chat: ## Start AI chat (make chat ID=3)
 vocab: ## Word frequency analysis (make vocab ID=3)
 	$(CLI) vocab $(ID)
 
-preset: ## List presets (or: make preset-create NAME=meeting)
+preset: ## List presets
 	$(CLI) preset list
 
 preset-create: ## Create a preset (make preset-create NAME=meeting)
 	$(CLI) preset create $(NAME)
+
+# ── Daemon & Memory ──────────────────────────────────────────
+
+daemon-start: ## Start background daemon
+	$(CLI) daemon start
+
+daemon-status: ## Show daemon status & health
+	$(CLI) daemon status
+
+daemon-stop: ## Stop background daemon
+	$(CLI) daemon stop
+
+memory-search: ## Vector search over memory (make memory-search Q="query")
+	$(CLI) memory search "$(Q)"
+
+memory-ask: ## RAG query over memory (make memory-ask Q="query")
+	$(CLI) memory ask "$(Q)"
+
+db-status: ## Show database status & migration state
+	$(CLI) db status
+
+jobs-list: ## List background processing jobs
+	$(CLI) jobs list
 
 # ── System ───────────────────────────────────────────────────
 
@@ -108,32 +130,15 @@ cleanup: ## Clean old data (make cleanup ARGS="--older-than 30d")
 test: ## Run test suite with coverage
 	$(PYTHON) -m pytest tests/ -v --cov=src/audiobench --cov-report=term-missing
 
-test-unit: ## Run unit tests only
-	$(PYTHON) -m pytest tests/unit/ -v
-
-test-integration: ## Run integration tests
-	$(PYTHON) -m pytest tests/integration/ -v
-
 lint: ## Run linters (ruff + mypy)
-	$(PYTHON) -m ruff check src/ cli/
-	$(PYTHON) -m mypy src/ cli/
+	$(PYTHON) -m ruff check src/
+	$(PYTHON) -m mypy src/
 
 format: ## Auto-format code (black + ruff fix)
-	$(PYTHON) -m black src/ cli/
-	$(PYTHON) -m ruff check --fix src/ cli/
+	$(PYTHON) -m black src/
+	$(PYTHON) -m ruff check --fix src/
 
 clean: ## Clean build artifacts and caches
 	rm -rf build/ dist/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
-
-# ── Documentation ────────────────────────────────────────────
-
-docs: ## Build documentation
-	$(VENV)/bin/zensical build
-
-docs-serve: ## Serve documentation locally
-	$(VENV)/bin/zensical serve
-
-docs-stop: ## Stop the docs server
-	@lsof -ti:8000 | xargs -r kill && echo "Docs server stopped" || echo "No server running"

@@ -1,69 +1,257 @@
 # AudioBench
 
-**Offline AI audio intelligence toolkit** — a complete pipeline from raw audio to a hybrid vector-searchable knowledge graph, running entirely on your machine.
+A personal audio intelligence system. Transcribes audio, chunks it into semantic units, embeds those into a vector store, and runs a background daemon that keeps it all in sync — so that everything you've ever listened to or recorded is searchable, queryable, and available for AI-assisted analysis, entirely offline.
 
-> No API keys required · No cloud · No data leaves your laptop
+> No API keys required · No cloud · No data leaves your machine
 
-**Python 3.10+** · **MIT License** · **CPU-optimized** (`int8` quantization)
-
----
-
-## What AudioBench Really Is
-
-Under the hood, AudioBench is not just a wrapper around Whisper. It is an end-to-end intelligence pipeline—a "digestive system" for your audio:
-
-1. **Ingestion (The Database):** Audio is transcribed via `faster-whisper`, diarized via ECAPA-TDNN, and stored in a robust SQLite relational database as `transcriptions` and `segments` (down to the word timestamp level).
-2. **Digestion (The Daemon):** A background daemon sweeps the database for new, unindexed transcripts. It chunks them into semantic "expressions" (typically 2-sentence rolling windows with overlap) to preserve context.
-3. **Embedding (The Nomic Engine):** These semantic chunks are passed through `nomic-embed-text-v1.5` to generate 768-dimensional dense vectors. 
-4. **Long-Term Memory (LanceDB):** The vectors, along with their metadata, are atomically merged into LanceDB, providing a scalable vector store that sits in perfect parity with the SQLite relational store.
-5. **Short-Term Memory (The Autocomplete Index):** On startup, the daemon rebuilds an in-memory HNSW graph from the LanceDB vectors, enabling lightning-fast, sub-millisecond autocomplete and semantic similarity searches.
-
-This architecture enables hybrid RAG (Retrieval-Augmented Generation) chat, instant semantic search across hundreds of hours of audio, and automated intelligence loops—all running locally on commodity hardware.
+**Python 3.10+** · **MIT License** · **CPU-first** (`int8` quantization, no GPU required)
 
 ---
 
-## What You Get in One Command
+## What It Actually Does
 
-| Capability | Command | What it does |
-|---|---|---|
-| **Transcribe** | `audiobench transcribe file.m4a` | Offline speech-to-text with word timestamps |
-| **Live** | `audiobench listen` | Real-time microphone transcription |
-| **Speakers** | `--diarize` | Identify who said what |
-| **Chat** | `audiobench chat 3` | Ask questions about any transcript |
-| **Search** | `audiobench search "keyword"` | Full-text search across all history |
-| **Visualize** | `audiobench inspect file.m4a` | Waveform + spectrogram in one shot |
-| **Speak** | `audiobench speak "Hello"` | Text-to-speech (offline Piper TTS) |
-| **Analyze** | `audiobench analyze file.m4a` | Loudness, silence regions, quality |
-| **Bookmark** | `audiobench bookmark list 3` | Timestamp markers and region annotations |
-| **AI Bookmark** | `audiobench bookmark auto 66` | AI-powered auto-bookmarking with type classification |
-| **Daemon** | `audiobench daemon start` | Background service for automatic indexing & intelligence loops |
-| **Memory RAG** | `audiobench memory search "query"` | Hybrid vector similarity search over transcript expressions |
-| **Jobs** | `audiobench jobs list` | Manage background audio processing queue |
-| **Database** | `audiobench db status` | Idempotent SQLite migrations, backfill & repair tools |
+Most transcription tools stop at the transcript. AudioBench treats the transcript as the beginning of a pipeline, not the end.
+
+When you transcribe a file, the result lands in SQLite. A background daemon picks it up, runs it through a semantic chunker, embeds each chunk with a local Nomic model (768-dimensional vectors), and writes the vectors atomically into LanceDB. On startup the daemon loads all those vectors into an in-memory HNSW graph for sub-millisecond nearest-neighbour lookup. When you type a search query, three retrieval streams — BM25 full-text, dense vector ANN, and ColBERT late interaction — run in parallel and their results are merged with Reciprocal Rank Fusion before a cross-encoder re-ranks the top candidates. The daemon also runs a small set of intelligence tasks on a schedule: a pattern detector that finds thematically similar expressions across your corpus, a connection surfer that proposes links between ideas, a drift detector and blind spot detector. These write their observations back into the expression graph as first-class records.
+
+Everything runs locally. The daemon is a long-running asyncio process that holds the ML models resident in RAM and accepts requests from CLI commands over a Unix domain socket.
 
 ---
 
-## See AudioBench in Action
-
-### Audio Spectrogram
-> `audiobench inspect recording.flac`
-
-![Spectrogram — full frequency analysis of a 27-minute conversation](docs/images/spectrogram.png)
-
-### Waveform
-> `audiobench inspect recording.flac`
-
-![Waveform — visualize speech, silence, and volume across the recording](docs/images/waveform.png)
-
-### Speaker Diarization
-> `audiobench transcribe conversation.m4a --diarize --engine gemini`
+## Architecture
 
 ```
-[Speaker 1]: So what do you think about the project?
-[Speaker 2]: Honestly it's really impressive.
-[Speaker 1]: We should publish it.
-[Speaker 2]: Let's do it this week.
+Audio file
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Transcription Engine  (faster-whisper, int8 quantization)  │
+│  Optional: ECAPA-TDNN speaker diarization                    │
+└────────────────────────┬────────────────────────────────────┘
+                         │  word-level timestamps
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  SQLite  (single database file: transcriptions.db)          │
+│                                                              │
+│  audio_files ──< transcriptions ──< segments                │
+│  works ──< audio_files                                       │
+│  expressions ──< expression_relations                        │
+│  bookmarks, chapters, job_queue, chat_conversations, ...     │
+└────────────────────────┬────────────────────────────────────┘
+                         │  is_indexed = 0  →  daemon picks up
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  RAG Sweep  (background thread, every 300 seconds)          │
+│                                                              │
+│  1. content_aware_router() cleans and chunks the text       │
+│     - Short texts: single chunk                             │
+│     - Diarized: split by speaker turn, then chunk each      │
+│     - Long texts: AdvancedSemanticChunker                   │
+│       (sliding window cosine similarity, NLTK sentences,    │
+│        percentile-based breakpoints, SentenceSplitter cap)  │
+│                                                              │
+│  2. ExpressionRepository.register()                         │
+│     - SHA-256 content hash deduplification per source_type  │
+│     - Returns existing record if hash matches               │
+│     - Writes new ExpressionRecord to SQLite                 │
+│                                                              │
+│  3. batch_write_nodes() → LanceDB                           │
+│     - merge_insert("expression_id") — atomic upsert         │
+│     - No delete+add race: one transaction per batch         │
+│     - Scalar index on expression_id for O(1) lookup         │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+              ┌──────────┴──────────┐
+              ▼                     ▼
+┌─────────────────────┐   ┌─────────────────────────────────┐
+│  LanceDB            │   │  AutocompleteIndex (hnswlib)     │
+│  (expressions table)│   │                                 │
+│  768-dim vectors    │   │  Built at daemon startup from   │
+│  nomic-embed-text   │   │  all LanceDB vectors.           │
+│  -v1.5              │   │  M=32, ef_construction=200      │
+│                     │   │  Cosine space, 768-dim          │
+│  Parses queries via │   │  O(log n) ANN lookup            │
+│  three streams:     │   │  No model call at lookup time   │
+│  - Dense (ANN)      │   │  — query already embedded by    │
+│  - BM25 (FTS5)      │   │    the daemon's warm model      │
+│  - ColBERT rerank   │   └─────────────────────────────────┘
+└─────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Query Engine                                                │
+│                                                              │
+│  Three retrieval streams in parallel (ThreadPoolExecutor):  │
+│  - FTS5Stream: BM25 keyword search over segments_fts        │
+│  - DenseStream: ANN search via LanceDB + Nomic              │
+│  - ColBERTStream: late-interaction scoring via cross-encoder │
+│                                                              │
+│  Merged with Reciprocal Rank Fusion (rrf_merge)             │
+│  Re-ranked by ms-marco-MiniLM-L-6-v2 cross-encoder          │
+│  Synthesised by local Ollama LLM                            │
+│  Results cached in QueryCacheStore (semantic similarity)    │
+└─────────────────────────────────────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Intelligence Layer  (asyncio scheduler, daemon process)    │
+│                                                              │
+│  PatternDetector  — hourly, finds expressions with high     │
+│    cosine similarity across the corpus, proposes relations  │
+│  ConnectionSurfer — finds cross-source thematic links       │
+│  DriftDetector    — detects vocabulary/topic shift over time│
+│  BlindSpotDetector — identifies underrepresented topics     │
+│  ProposalGenerator — surfaces operator proposals from the   │
+│    above signals for user review                            │
+│                                                              │
+│  Outputs are ExpressionRecords with source_type             │
+│  'system_inference', 'drift_observation', etc.              │
+│  They live in the same graph as transcript expressions.     │
+│  User can confirm or reject via CLI.                        │
+│                                                              │
+│  Note: these tasks run and write outputs, but the volume   │
+│  and quality of their proposals depends on corpus size.    │
+│  With a small corpus they produce little signal.           │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## The Daemon
+
+The daemon is not an optional add-on — it is the memory and intelligence layer. Without it, you have a transcription tool. With it, you have a persistent knowledge system.
+
+```bash
+audiobench daemon start    # start in background
+audiobench daemon status   # health, queue depth, model info, uptime
+audiobench daemon stop     # graceful shutdown
+```
+
+**What happens at startup (in order):**
+
+1. ML models loaded into RAM: Nomic embedder, cross-encoder reranker, boundary embedder for chunking
+2. `MemoryStore` connects to LanceDB; creates `expressions` table + scalar index if needed
+3. `SweepState` loads from SQLite: all content hashes, all LanceDB expression IDs, all pending segment IDs, all unindexed transcript IDs — into in-memory sets and deques for O(1) sweep-tick access
+4. Startup recovery runs three idempotent steps: ghost job cleanup (dead PIDs), unindexed expression backfill (SQLite records absent from LanceDB), work-assignment backfill
+5. `AutocompleteIndex` builds an HNSW graph from all LanceDB expression vectors
+6. Intelligence scheduler starts: `PatternDetector`, `DriftDetector`, `ConnectionSurfer`, `BlindSpotDetector`, `ProposalGenerator` registered and running on their own intervals
+7. Unix socket server opens at the configured path
+8. RAG sweep thread starts (every 300 seconds, runs in a background daemon thread)
+9. Pipeline recovery sweep thread starts
+
+**The sweep loop** runs every 5 minutes. Each tick:
+- Pulls unindexed transcript IDs from the in-memory deque (no SQL)
+- Chunks each transcript, deduplicates by content hash, registers expressions in SQLite, batch-embeds and writes to LanceDB
+- Pulls pending segment IDs in sub-batches of 64 (measured: 256-segment batches peaked at ~8 GB RSS; 64-segment sub-batches keep each forward pass under the intelligence-task gate threshold)
+- After each sub-batch calls `malloc_trim(0)` to return freed glibc arenas to the OS
+- Triggers LanceDB compaction automatically when unoptimized write count crosses a threshold
+
+**The socket protocol** is newline-delimited JSON:
+```
+{"cmd": "search", "args": {"query": "...", "top_k": 5}, "request_id": "abc123"}
+→ {"status": "ok", "success": true, "data": {...}, "request_id": "abc123"}
+```
+
+Commands served: `ping`, `search`, `embed`, `chunk`, `rerank`, `embed_query`, `embed_segment`, `autocomplete`, `check_cache`, `write_cache`, `pipeline`, `operate`, `get_inferences`, `get_proposals`, `confirm_inference`, `reject_inference`, `authorize_proposal`, `optimize`, `status`, `reload_settings`.
+
+---
+
+## Storage
+
+Two stores, kept in strict parity:
+
+### SQLite (`transcriptions.db`)
+
+The relational spine of the system. Core tables:
+
+| Table | Purpose |
+|---|---|
+| `audio_files` | Source file metadata, SHA-256 hash, duration, format |
+| `transcriptions` | One row per transcription run; `is_indexed` flag drives the sweep |
+| `segments` | Individual timed segments within a transcription, word timestamps, `vector_indexed` flag |
+| `expressions` | Semantic chunks: content, SHA-256 hash, source type, speaker, embedding model version |
+| `expression_relations` | Directed edges between expressions (parent/child, source, relation) |
+| `works` | Semantic grouping of audio files by title/author |
+| `bookmarks` | Timestamp markers and region annotations |
+| `chapters` | Chapter metadata for structured audio |
+| `job_queue` | Background job tracking with PID and status |
+| `chat_conversations` / `chat_messages` | Persistent AI chat history |
+| `notes` | Free-form notes attached to transcriptions |
+
+26 SQL migrations + 12 Python migrations. Migrations are idempotent and run at startup.
+
+### LanceDB (`data/lancedb/`)
+
+The vector store. One table: `expressions`.
+
+Schema (`ExpressionNode`): `expression_id` (int), `content` (str), `vector` (768-dim float32), `embedding_model_version`, `embedded_at`, `source_type`, `speaker`, `audio_file_id`, `confidence`, `original_language`, `work_id`.
+
+Writes use `merge_insert("expression_id")` — a single atomic transaction that inserts new rows and updates existing ones, eliminating the delete+add race condition that previously caused expressions to be lost during concurrent `optimize()` calls.
+
+A scalar index on `expression_id` is created at startup. Idempotent on existing tables (confirmed empirically against lancedb==0.25.2 — re-verify on version bump; not a documented API guarantee).
+
+LanceDB compaction runs automatically in a background thread when write count crosses a configurable threshold, and can be triggered on demand via `audiobench daemon optimize`.
+
+---
+
+## Search
+
+```bash
+# Full-text keyword search
+audiobench search "keyword"
+
+# Semantic memory search (requires daemon)
+audiobench memory search "what did we decide about the API design"
+
+# Ask a question across your entire corpus
+audiobench memory ask "what themes appear across all my meetings"
+```
+
+The `memory search` path:
+1. Query reformulated into BM25 keywords + dense embedding string
+2. Three streams run in parallel: FTS5 BM25 over `segments_fts`, dense ANN over LanceDB, ColBERT late-interaction re-scoring
+3. Results merged with Reciprocal Rank Fusion
+4. Top candidates re-ranked by cross-encoder
+5. Semantic cache checked before the LLM synthesis step (cosine distance threshold 0.05 — cache hit skips the model call entirely)
+6. Local Ollama synthesises an answer with the ranked segments as context
+
+---
+
+## Transcription
+
+```bash
+audiobench transcribe meeting.m4a
+audiobench transcribe meeting.m4a -f srt
+audiobench transcribe meeting.m4a --diarize --engine whisper
+audiobench transcribe --accurate interview.wav
+audiobench transcribe --enhance --trim --denoise noisy.m4a
+```
+
+Engine: `faster-whisper` with `int8` CPU quantization. Models: `tiny` through `large-v3-turbo`. Speaker diarization via ECAPA-TDNN voice print matching.
+
+Audio preprocessing chain (when flags are combined): `highpass → denoise (RNNoise) → trim silence → EBU R128 loudness normalization`. The `--denoise` flag supersedes the spectral denoiser inside `--enhance` to avoid double-processing. Use `--check` to preview the exact filter chain before running.
+
+---
+
+## What You Can Do
+
+| Command | What it does |
+|---|---|
+| `audiobench transcribe file.m4a` | Offline speech-to-text with word timestamps |
+| `audiobench listen` | Real-time microphone transcription |
+| `audiobench transcribe --diarize` | Identify who said what |
+| `audiobench chat 3` | AI chat with transcript #3 as context |
+| `audiobench search "keyword"` | Full-text search across all transcripts |
+| `audiobench memory search "query"` | Semantic vector search over the expression graph |
+| `audiobench memory ask "question"` | RAG query: retrieve + synthesise with local LLM |
+| `audiobench inspect file.m4a` | Waveform + spectrogram images |
+| `audiobench speak "text"` | Offline TTS via Piper |
+| `audiobench analyze file.m4a` | Loudness, silence regions, quality report |
+| `audiobench bookmark auto 66` | AI auto-bookmarking with type classification |
+| `audiobench daemon start` | Start the background intelligence daemon |
+| `audiobench daemon status` | Daemon health, queue depth, uptime |
+| `audiobench jobs list` | Background audio processing queue |
+| `audiobench db status` | SQLite migration state, row counts |
 
 ---
 
@@ -78,502 +266,80 @@ cd audiobench
 make install        # creates venv + installs deps
 source venv/bin/activate
 
-# 3. Transcribe
+# 3. Install FFmpeg (required)
+sudo pacman -S ffmpeg        # Arch
+# sudo apt install ffmpeg    # Ubuntu/Debian
+# brew install ffmpeg        # macOS
+
+# 4. Transcribe
 audiobench transcribe meeting.m4a
+
+# 5. Start the daemon (enables search, memory, intelligence)
+audiobench daemon start
 ```
 
-The first run downloads the model (~1.5 GB) to `~/.audiobench/models/`. Subsequent runs start faster.
+The first transcription run downloads the Whisper model (~1.5 GB) to `~/.audiobench/models/`. The daemon's first startup loads three ML models into RAM (~1–2 GB depending on model size).
 
 ---
 
 ## Installation
 
-### Using Make (recommended)
-
 ```bash
-make install          # Base install (transcription only)
-make dev              # Full install (all extras: docs, dev tools, TTS, streaming, AI)
+make install    # base (transcription only)
+make dev        # full (all extras: docs, dev tools, TTS, streaming, AI)
 ```
 
-### Manual
+Or manually:
 
 ```bash
 python -m venv venv
-source venv/bin/activate    # or: source venv/bin/activate.fish
+source venv/bin/activate
 pip install -e .
 ```
 
-### System Dependency
-
-**FFmpeg** is required for audio conversion:
-
-```bash
-# Arch
-sudo pacman -S ffmpeg
-
-# Ubuntu/Debian
-sudo apt install ffmpeg
-
-# macOS
-brew install ffmpeg
-```
-
----
-
-## CLI Commands
-
-### `transcribe` — Core Transcription
-
-```bash
-# Print transcript to terminal
-audiobench transcribe meeting.m4a
-
-# Save as SRT subtitle file
-audiobench transcribe meeting.m4a -f srt
-
-# Auto-detect format from output filename
-audiobench transcribe meeting.m4a -o notes.srt
-
-# Batch: transcribe all m4a files, save to ./out/
-audiobench transcribe *.m4a -o ./out/
-
-# Fast preset (less accurate, ~2x speed)
-audiobench transcribe --fast lecture.mp3
-
-# Accurate preset (slower, best quality)
-audiobench transcribe --accurate interview.wav
-
-# Enhance + trim silence + denoise in one pass
-audiobench transcribe --enhance --trim --denoise meeting.m4a
-
-# Pipe-friendly raw output
-audiobench transcribe -q meeting.m4a | grep "keyword"
-
-# Inspect file metadata and filter chain without transcribing
-audiobench transcribe --check --enhance --denoise recording.m4a
-```
-
-#### Options
-
-| Flag | Short | Description |
-|------|-------|-------------|
-| `--format` | `-f` | Output format: `txt`, `srt`, `vtt`, `json` |
-| `--output` | `-o` | Output path (file or directory) |
-| `--language` | `-l` | Language code (e.g. `en`, `sw`). Default: auto-detect |
-| `--model` | `-m` | Model: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo` |
-| `--fast` | |  Fast preset: beam=1, batch=8 |
-| `--balanced` | |  Balanced preset: beam=3, batch=4 (default) |
-| `--accurate` | |  Accurate preset: beam=5, sequential |
-| `--prompt` | | Guide model with context (e.g. `"Conversation in Swahili and English"`) |
-| `--enhance` | | Spectral noise reduction (highpass + afftdn) + EBU R128 loudness normalization |
-| `--trim` | | Remove leading/trailing silence before transcription |
-| `--denoise` | | AI noise reduction via RNNoise neural network (downloads model on first use) |
-| `--filter` | | Custom ffmpeg audio filter graph |
-| `--no-cache` | | Re-transcribe even if cached |
-| `--no-timestamps` | | Disable word-level timestamps |
-| `--quiet` | `-q` | Raw output only (for piping) |
-| `--check` | | Show file metadata and filter chain, no transcription |
-
-> **Smart filter chain**: When `--denoise` is active, it supersedes the spectral denoiser in `--enhance` (no double denoising). Filters are always applied in the optimal order: `highpass → denoise → trim → loudnorm`. Use `--check` to preview the exact filter chain before processing.
-
-> **First-run note**: `--denoise` downloads the RNNoise model (~293 KB) on first use from GitHub to `~/.audiobench/models/rnnoise/`. Subsequent runs use the cached model.
-
----
-
-### `repl` — Interactive Shell
-
-Drop into a context-aware interactive session with dot-commands, history navigation, and full access to all CLI commands.
-
-```bash
-audiobench repl
-```
-
-Inside the REPL:
-
-```
-audiobench> history                    # List transcriptions
-audiobench> show 3                     # View transcript #3 → sets context
-audiobench [#3 meeting.m4a]> .stats    # Quick stats (context-aware)
-audiobench [#3 meeting.m4a]> .segments # Show timestamped segments
-audiobench [#3 meeting.m4a]> .find "keyword" # Search within transcript
-audiobench [#3 meeting.m4a]> .play     # Play source audio
-audiobench [#3 meeting.m4a]> .edit     # Open in $EDITOR
-audiobench [#3 meeting.m4a]> .next     # Jump to next transcript
-audiobench [#3 meeting.m4a]> .close    # Clear context
-audiobench> .help                      # Show all dot-commands
-```
-
-#### Dot-Commands
-
-| Command | Description |
-|---------|-------------|
-| `.stats` | Word count, duration, language, model |
-| `.show` | Full transcript text |
-| `.segments` | Timestamped segments |
-| `.info` | Detailed metadata (codec, bitrate, model settings) |
-| `.find "text"` | Search within the active transcript |
-| `.play` | Play audio (`ffplay`) |
-| `.play 01:25` | Play from timestamp |
-| `.edit` | Edit transcript in `$EDITOR`, saves to DB |
-| `.path` | Show source audio file path |
-| `.open` | Open audio in system default player |
-| `.next` / `.prev` | Navigate between transcripts |
-| `.recent` | Show 5 most recent transcriptions |
-| `.search "text"` | Global search across all transcripts |
-| `.close` | Clear current context |
-| `.help` | List all dot-commands |
-
----
-
-### `listen` — Real-Time Transcription (Live STT)
-
-Transcribe microphone input in real-time. Audio is processed continuously using voice activity detection (VAD). Results are automatically saved to your history database.
-
-```bash
-# Basic live transcription
-audiobench listen
-
-# Force a specific language (faster & more accurate if known)
-audiobench listen --language en
-
-# Use the fastest model (lower accuracy)
-audiobench listen --model tiny
-
-# Also save transcript to a text file
-audiobench listen --save meeting.txt
-```
-
-#### Live STT Tuning
-
-- **Cadence**: Text appears every ~4 seconds of continuous speech or after a 0.4s pause.
-- **Model**: Defaults to `base` (tuned with 4 CPU threads for ~0.5x real-time speed).
-- **History**: Live sessions appear in `audiobench history` as "Live session" and can be searched or spoken via TTS.
-
----
-
-### `speak` — Text-to-Speech (TTS)
-
-Speak text, files, or past transcripts aloud using the offline Piper TTS engine. High-quality voices are downloaded on-demand.
-
-```bash
-# Speak text directly
-audiobench speak "Hello world"
-
-# Speak a text file
-audiobench speak notes.txt
-
-# Speak a previous transcript from history
-audiobench speak --id 3
-
-# Save TTS output to a WAV file instead of playing
-audiobench speak "Hello" -o greeting.wav
-
-# Use a specific high-quality voice
-audiobench speak --voice en_US-lessac-high "Hello world"
-```
-
-#### Recommended High-Quality Voices
-
-- `en_US-lessac-high` (Female, Clear & Natural)
-- `en_US-ryan-high` (Male, Clear & Articulate)
-- `en_US-ljspeech-high` (Female, Audiobook style)
-
----
-
-### `history` — View Past Transcriptions
-
-```bash
-audiobench history            # Show last 20 transcriptions
-audiobench history --limit 50 # Show last 50
-```
-
-### `search` — Full-Text Search
-
-```bash
-audiobench search "keyword"
-audiobench search "yoga" --limit 5
-```
-
-### `export` — Re-export to Another Format
-
-```bash
-audiobench export 3 -f vtt           # Export ID #3 as VTT
-audiobench export 3 -f srt -o sub/   # Save to sub/ directory
-```
-
-### `show` — View a Transcription
-
-```bash
-audiobench show 3              # View transcript #3 with metadata
-```
-
-### `delete` — Remove from History
-
-```bash
-audiobench delete 3          # Delete transcription #3
-audiobench delete --all      # Delete all history
-```
-
-### `download` — Pre-download Models
-
-```bash
-audiobench download large-v3-turbo   # Download for offline use
-audiobench download small            # Smaller, faster model
-```
-
-### `info` — System Info & Settings
-
-```bash
-audiobench info
-```
-
-Shows: Python version, device (CPU/CUDA), model, compute type, storage paths, database size, and all configuration values.
-
-### `chat` — AI Chat with Transcript Context
-
-```bash
-audiobench chat                # Start AI chat session
-audiobench chat 3              # Chat with transcript #3 as context
-```
-
-Full-featured AI chat with readline history, multi-line input, `/export`, `/retry`, and markdown rendering.
-
-### `bookmark` — Timestamp Markers & Annotations
-
-Mark and manage important moments in any audio file:
-
-```bash
-# List bookmarks for a file
-audiobench bookmark list 3              # By audio file ID
-audiobench bookmark list recording.m4a  # By file path
-
-# Add a bookmark manually
-audiobench bookmark add 3 01:25 "Key decision made"
-audiobench bookmark add 3 05:30-08:15 "Budget discussion" --type highlight
-
-# AI auto-bookmarking — let AI find the important moments
-audiobench bookmark auto 66                        # Analyze transcript #66
-audiobench bookmark auto 66 --focus "action items"  # Focus on action items
-audiobench bookmark auto 66 --dry-run               # Preview without saving
-audiobench bookmark auto 66 --model deepseek-v3.2:cloud  # Override model
-
-# Manage bookmarks
-audiobench bookmark rename 1 "New name"    # Rename
-audiobench bookmark note 1 "Added context" # Add notes
-audiobench bookmark type 1 highlight       # Change type
-audiobench bookmark rm 1                   # Delete
-audiobench bookmark search "keyword"       # Search by name
-
-# Export/Import
-audiobench bookmark export 3                       # JSON export
-audiobench bookmark export 3 --format audacity     # Audacity label track
-audiobench bookmark import 3 labels.txt            # Import labels
-```
-
-#### Interactive Playback Bookmarking
-
-During `audiobench play`, use these keybindings:
-
-| Key | Action |
-|-----|--------|
-| `b` | Drop point bookmark at current position |
-| `B` | Start/end region bookmark |
-| `n` / `p` | Jump to next/previous bookmark |
-| `l` | Cycle bookmark type (bookmark → highlight → todo → note → edit) |
-
-### `vocab` — Word Frequency Analysis
-
-```bash
-audiobench vocab 3                      # Top 30 words from transcript #3
-audiobench vocab 3 --top 50             # Top 50 words
-audiobench vocab 3 --min-length 5       # Only words ≥5 chars
-audiobench vocab 3 --format json        # JSON output
-audiobench vocab 3 --format csv         # CSV for spreadsheets
-```
-
-### `preset` — Named Configuration Presets
-
-Save and reuse transcription settings:
-
-```bash
-audiobench preset create meeting --model large-v3 --speed accurate --enhance
-audiobench preset create podcast --language en --format srt
-audiobench preset list
-audiobench preset show meeting
-audiobench preset delete meeting
-
-# Use a preset when transcribing
-audiobench transcribe file.m4a --preset meeting
-```
-
-### `doctor` — System Health Check
-
-```bash
-audiobench doctor
-```
-
-Checks: ffmpeg, ffprobe, faster-whisper, piper-tts, ollama, CUDA availability, disk space, and database connectivity.
-
-### `status` — Usage Statistics
-
-```bash
-audiobench status
-```
-
-Shows database size, transcription count, total hours processed, model cache size, and voice cache size.
-
-### `cleanup` — Clean Old Data
-
-```bash
-audiobench cleanup --older-than 30d        # Delete old transcriptions
-audiobench cleanup --cache                  # Remove model cache
-audiobench cleanup --temp                   # Remove temp files
-audiobench cleanup --older-than 7d --dry-run # Preview what would be deleted
-```
-
-### `install-completion` — Shell Tab Completions
-
-```bash
-audiobench install-completion bash
-audiobench install-completion zsh
-audiobench install-completion fish
-```
-
----
-
-### `analyze` — Audio Intelligence Report
-
-Inspect loudness, silence, and quality characteristics of any audio file.
-
-```bash
-audiobench analyze meeting.m4a
-```
-
-Shows integrated LUFS, loudness range, true peak, silence regions, and recommends which flags to use (`--trim`, `--enhance`, `--denoise`).
-
-### `convert` — Audio Format Conversion
-
-```bash
-audiobench convert recording.m4a -o recording.mp3
-audiobench convert recording.wav -o recording.opus --bitrate 48k
-audiobench convert lecture.mp3 -o fast.mp3 --speed 1.5      # Rubberband time-stretch
-```
-
-Smart codec defaults: MP3 192kbps, Opus 64kbps, OGG q5, FLAC lossless.
-
-### `merge` — Concatenate Audio Files
-
-```bash
-audiobench merge part1.wav part2.wav -o full.wav
-```
-
-### `inspect` — Visual Analysis
-
-```bash
-audiobench inspect recording.m4a                    # Waveform + spectrogram
-audiobench inspect recording.m4a --waveform         # Waveform only
-audiobench inspect recording.m4a --spectrum          # Spectrogram only
-audiobench inspect recording.m4a -o ./images/        # Save to directory
-```
-
-Generates PNG images of the audio waveform and/or spectrogram.
-
----
-
-## Plugin System
-
-Extend AudioBench with custom commands by placing Python files in `data/plugins/`.
-
-```python
-# data/plugins/my_tool.py
-import click
-
-@click.command()
-@click.argument("text")
-def shout(text):
-    """Shout some text."""
-    click.echo(text.upper())
-
-def register(cli):
-    cli.add_command(shout)
-```
-
-Plugins are loaded automatically on startup. If no `register()` function is defined, Click commands at the module level are auto-registered.
-
----
-
-## Output Formats
-
-| Format | Extension | Use Case |
-|--------|-----------|----------|
-| `txt` | `.txt` | Plain text, default |
-| `srt` | `.srt` | Subtitles (most video players) |
-| `vtt` | `.vtt` | Web subtitles (HTML5 `<track>`) |
-| `json` | `.json` | Programmatic access, word-level data |
+**FFmpeg** is required for audio conversion and preprocessing.
 
 ---
 
 ## Configuration
 
-Settings are loaded in priority order:
-
-1. **CLI flags** (highest priority)
-2. **Environment variables** (prefixed with `AUDIOBENCH_`)
-3. **`.env` file** in project root
-4. **Defaults**
-
-Copy `.env.example` to get started:
+Settings load in priority order: CLI flags → environment variables (`AUDIOBENCH_*`) → `.env` file → defaults.
 
 ```bash
 cp .env.example .env
 ```
 
-### Key Settings
-
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `AUDIOBENCH_MODEL_NAME` | `large-v3-turbo` | Whisper model size |
+|---|---|---|
+| `AUDIOBENCH_MODEL_NAME` | `large-v3-turbo` | Whisper model |
 | `AUDIOBENCH_DEVICE` | `auto` | `auto`, `cpu`, `cuda` |
-| `AUDIOBENCH_COMPUTE_TYPE` | `int8` | `int8` (CPU), `float16` (CUDA), `float32` |
-| `AUDIOBENCH_LANGUAGE` | *(empty)* | Auto-detect. Set to `en`, `sw`, `fr`, etc. |
+| `AUDIOBENCH_COMPUTE_TYPE` | `int8` | `int8` (CPU), `float16` (CUDA) |
+| `AUDIOBENCH_LANGUAGE` | *(auto-detect)* | e.g. `en`, `sw`, `fr` |
 | `AUDIOBENCH_SPEED_PRESET` | `balanced` | `fast`, `balanced`, `accurate` |
-| `AUDIOBENCH_BATCH_SIZE` | `4` | Batch inference size (1–16) |
-| `AUDIOBENCH_CPU_THREADS` | `0` | CPU threads (`0` = auto-detect) |
-| `AUDIOBENCH_OUTPUT_FORMAT` | `txt` | Default output format |
 | `AUDIOBENCH_LOG_LEVEL` | `WARNING` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `AUDIOBENCH_BOOKMARK_MODEL` | `qwen3-coder:480b-cloud` | Ollama model for AI bookmark extraction |
-
----
-
-## Speed Presets
-
-| Preset | Beam Size | Batch Size | Temperature | Condition on Previous | Use Case |
-|--------|-----------|------------|-------------|----------------------|----------|
-| `--fast` | 1 | 8 | 0 (no fallback) | No | Quick drafts, long recordings |
-| `--balanced` | 3 | 4 | Fallback chain | No | Daily use (default) |
-| `--accurate` | 5 | 1 (sequential) | Fallback chain | Yes | Important recordings |
+| `AUDIOBENCH_BOOKMARK_MODEL` | `qwen3-coder:480b-cloud` | Ollama model for AI bookmarking |
 
 ---
 
 ## Directory Layout
 
 ```
-audiobench/                    ← Project root
-├── data/                      ← Managed Workspace (gitignored)
+audiobench/
+├── data/                      ← Managed workspace (gitignored)
+│   ├── transcriptions.db      ← SQLite: all relational data
+│   ├── lancedb/               ← LanceDB: vector store
 │   ├── library/               ← Managed audio file collection
-│   ├── exports/               ← Subtitles and transcripts (SRT, VTT, JSON, PDF)
-│   ├── reports/               ← AI summaries and text analysis
-│   ├── logs/                  ← Background job logs
-│   ├── plugins/               ← Custom Python commands
-│   ├── presets/               ← Named configuration presets (TOML)
-│   ├── transcriptions.db      ← SQLite database (history, search, bookmarks)
-│   └── repl_history           ← Interactive shell history
-├── .env                       ← Your configuration (gitignored)
+│   ├── exports/               ← SRT, VTT, JSON, PDF outputs
+│   ├── reports/               ← AI summaries
+│   ├── logs/                  ← Daemon and job logs
+│   ├── plugins/               ← Custom Python CLI commands
+│   └── presets/               ← Named transcription presets (TOML)
+├── .env                       ← Configuration (gitignored)
 └── .env.example               ← Configuration template
 
-~/.audiobench/                 ← Shared resources (multi-GB, reused across projects)
+~/.audiobench/
 ├── models/                    ← Whisper models (~1.5 GB each)
-│   └── rnnoise/               ← RNNoise neural denoise model (~293 KB)
+│   └── rnnoise/               ← RNNoise denoise model (~293 KB)
 └── voices/                    ← Piper TTS voice models
 ```
 
@@ -583,48 +349,53 @@ audiobench/                    ← Project root
 
 ```
 src/audiobench/
-├── api/                            ← FastAPI REST web server & routes (chat, history, settings, transcribe)
-├── chapters/                       ← Automatic audio chaptering & topic segmentation
-├── chat/                           ← AI chat, REPL sessions, context builder & LLM providers
-├── cli/                            ← Presentation layer & Click commands
-│   ├── app.py                      ← CLI entrypoint & global options
-│   ├── commands/                   ← Command modules (transcribe, daemon, memory, jobs, db, etc.)
-│   ├── display/                    ← Theme, progress trackers & Observatory TUI
-│   ├── io/                         ← File collection & path resolution
-│   ├── plugins/                    ← Plugin loader & custom groups
-│   └── repl/                       ← Interactive shell (session, dispatch, slash commands)
-├── core/                           ← Infrastructure (settings, logging, db_engine, prompts, errors)
-├── daemon/                         ← Background daemon service
-│   ├── server.py                   ← UNIX socket daemon server & single-instance lock
-│   ├── client.py                   ← IPC client protocol
-│   ├── sweep_state.py              ← Thread-safe state sweeper & batch metrics
-│   └── intelligence/               ← Drift detector, scheduler & operator registries
-├── diarization/                    ← Speaker detection, pyannote & voiceprint verification
-├── events/                         ← Decoupled asynchronous event bus
-├── export/                         ← Export generators (PDF reports & HTML templates)
-├── jobs/                           ← Asynchronous background job queue worker & runner
-├── memory/                         ← LanceDB vector store & RAG memory pipeline
-│   ├── memory_store.py             ← Atomic merge_insert vector memory store
-│   ├── embedding_engine.py         ← nomic-embed-text vector embeddings
-│   ├── query_engine.py             ← RAG hybrid search & query reformulator
-│   └── singletons.py               ← Isolated offline HuggingFace model loaders
-├── observatory/                    ← Real-time telemetry dashboard & TUI widgets
-├── output/                         ← Format writers (txt, srt, vtt, json)
-├── playback/                       ← MPV IPC controller & synchronized lyrics player
-├── security/                       ← Privacy tier scoping & access controls
-├── storage/                        ← Relational database layer
-│   ├── models.py                   ← SQLAlchemy ORM models
-│   ├── repository.py               ← Transcription CRUD operations
-│   ├── bookmark_repository.py      ← Bookmark & Audacity label CRUD
-│   └── migrations/                 ← Idempotent SQLite schema migrations (001–025)
-├── streaming/                      ← Real-time microphone audio transcription
-├── supervisor/                     ← Process supervisor management
-├── transcribe/                     ← Transcription pipeline & engines (whisper, gemini, vosk)
-├── transcription/                  ← Multi-GPU parallel transcription worker
-└── tts/                            ← Text-to-speech engine (Piper TTS)
+├── core/                      ← Settings, logging, DB engine, session factory
+├── daemon/
+│   ├── server.py              ← asyncio Unix socket server, all command handlers
+│   ├── sweep_state.py         ← In-memory O(1) state: hash sets, deques
+│   ├── startup_recovery.py    ← Idempotent recovery steps run at each startup
+│   ├── pipeline_recovery.py   ← Stuck pipeline detection and repair
+│   ├── autocomplete.py        ← HNSW in-memory autocomplete index (hnswlib)
+│   ├── lancedb_optimizer.py   ← Background LanceDB compaction
+│   └── intelligence/
+│       ├── scheduler.py       ← Asyncio task scheduler with CPU-gate
+│       ├── pattern_detector.py
+│       ├── connection_surfer.py
+│       ├── drift_detector.py
+│       ├── blind_spot_detector.py
+│       ├── proposal_generator.py
+│       ├── calibration.py     ← Confirm/reject tracking
+│       └── operator_registry.py
+├── memory/
+│   ├── chunking.py            ← content_aware_router, AdvancedSemanticChunker
+│   ├── embedding_engine.py    ← Nomic model wrapper, batch embedding
+│   ├── memory_store.py        ← LanceDB adapter, merge_insert, scalar index
+│   ├── query_engine.py        ← Three-stream retrieval, RRF fusion, synthesis
+│   ├── retrieval_streams.py   ← FTS5Stream, DenseStream, ColBERTStream
+│   ├── rrf_fusion.py          ← Reciprocal Rank Fusion
+│   ├── singletons.py          ← Model lifecycle, inference locks
+│   └── query_reformulator.py  ← Query expansion for BM25 + dense
+├── storage/
+│   ├── models.py              ← SQLAlchemy ORM models
+│   ├── expression_repository.py ← Expression CRUD, SHA-256 dedup
+│   ├── repository.py          ← Transcription CRUD
+│   ├── bookmark_repository.py
+│   └── migrations/            ← 26 SQL + 12 Python migrations
+├── jobs/                      ← Background job queue (runner, worker, repository)
+├── observatory/               ← Event bus, structured logging to journal.db
+├── transcribe/                ← faster-whisper pipeline, audio filters, engines
+├── chat/                      ← AI chat, Ollama provider, context builder
+├── cli/                       ← Click commands, REPL, plugin system
+├── tts/                       ← Piper TTS
+├── diarization/               ← ECAPA-TDNN speaker diarization
+└── streaming/                 ← Live microphone transcription
 
-web/                                ← Modern React + Vite Web UI application
-tests/                              ← Comprehensive unit & integration test suite
+tests/                         ← Test suite
+├── conftest.py                ← Shared fixtures (temp DB, patched settings)
+├── test_core/
+├── test_cli/
+├── test_memory/               ← merge_insert race tests, chunking tests
+└── test_storage/
 ```
 
 ---
@@ -632,57 +403,27 @@ tests/                              ← Comprehensive unit & integration test su
 ## Make Targets
 
 ```bash
-make help              # Show all targets
-make install           # Install base dependencies
-make dev               # Install with dev dependencies (editable)
-make test              # Run test suite with coverage
-make lint              # Run ruff + mypy
-make format            # Auto-format with black + ruff
-make clean             # Remove build artifacts
-make transcribe FILE=audio.m4a           # Quick transcribe
-make transcribe-srt FILE=audio.m4a       # Transcribe → SRT
-make translate FILE=audio.m4a            # Translate to English
-make history           # View transcription history
-make search Q="word"   # Search transcriptions
-make info              # Show system info
-make download MODEL=large-v3-turbo       # Download model
+make help              # All targets
+make install           # Base install
+make dev               # Dev install (editable, all extras)
+make test              # Test suite with coverage
+make lint              # ruff + mypy
+make format            # black + ruff
+make transcribe FILE=audio.m4a
 make listen            # Live microphone transcription
-make speak TEXT="Hello"                   # Text-to-speech
-make repl              # Launch interactive shell
+make speak TEXT="Hello"
+make repl              # Interactive shell
 make doctor            # System health check
-make status            # Usage statistics
 ```
 
 ---
 
-## Verbose / Debug Mode
+## Debug Mode
 
 ```bash
-audiobench -v transcribe meeting.m4a     # Verbose (INFO logs)
-audiobench --debug transcribe meeting.m4a # Debug (all logs)
+audiobench -v transcribe meeting.m4a      # INFO logs
+audiobench --debug transcribe meeting.m4a # DEBUG logs
 ```
-
----
-
-## Documentation
-
-AudioBench includes a documentation site built with [Zensical](https://zensical.org/).
-
-```bash
-# Install docs dependencies (included in `make dev`)
-pip install -e ".[docs]"
-
-# Build static docs
-make docs
-
-# Serve locally with live reload
-make docs-serve
-
-# Stop the docs server
-make docs-stop
-```
-
-The generated site is output to `site/`.
 
 ---
 
