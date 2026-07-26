@@ -2,10 +2,10 @@ import pytest
 from unittest.mock import MagicMock
 
 @pytest.fixture
-def db_session():
+def db_session(test_db):  # test_db patches settings, resets engine/session singletons,
+    # and tears down after the test — without it, init_db() resolves the real
+    # data/transcriptions.db path and this fixture leaks rows into production.
     from audiobench.core.db_session import get_session
-    from audiobench.core.db_engine import init_db
-    init_db()
     with get_session() as session:
         yield session
 

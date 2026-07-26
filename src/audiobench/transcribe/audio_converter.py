@@ -275,6 +275,51 @@ class AudioInfo:
     format_name: str  # container format
 
 
+def _decode_duration_fallback(file_path: str) -> float:
+    """Determine audio duration by decoding to a null sink.
+
+    Used when ffprobe cannot read duration from the file headers (e.g. FLAC
+    files with a missing or truncated STREAMINFO block). FFmpeg decodes at
+    1000-3000x real-time on CPU, so a 30-minute file takes under one second.
+
+    Returns:
+        Duration in seconds, or 0.0 if decoding also fails (all failures are
+        logged loudly — this function never silently swallows errors).
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-i", file_path, "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+            timeout=60,  # hard ceiling — no real audio file should take this long
+        )
+        matches = re.findall(r"time=(\d+):(\d+):([\d.]+)", result.stderr)
+        if matches:
+            h, m, s = matches[-1]
+            duration = int(h) * 3600 + int(m) * 60 + float(s)
+            logger.info(
+                "Duration fallback (decode pass): %.3fs for %s",
+                duration,
+                file_path,
+            )
+            return duration
+        # ffmpeg ran but produced no time= output — file may be truly zero-length audio
+        logger.warning(
+            "Duration decode fallback: no time= progress found in stderr for %s — "
+            "file may contain no decodable audio frames.",
+            file_path,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "Duration decode fallback timed out after 60s for %s — "
+            "file may be corrupt or pathologically large.",
+            file_path,
+        )
+    except Exception as exc:
+        logger.error("Duration decode fallback failed for %s: %s", file_path, exc)
+    return 0.0
+
+
 def probe(file_path: str | Path) -> AudioInfo:
     """Get audio metadata via ffprobe. Instant, no file loading.
 
@@ -319,8 +364,18 @@ def probe(file_path: str | Path) -> AudioInfo:
     stream = streams[0]
     fmt = data.get("format", {})
 
-    # Duration: prefer stream duration, fall back to format duration
+    # Duration: prefer stream duration, fall back to format duration.
+    # Some FLAC files (and raw PCM streams) have a valid audio stream but a
+    # missing or corrupt STREAMINFO block, causing ffprobe to return N/A.
+    # In that case we fall back to a fast full-decode pass via ffmpeg.
     duration = float(stream.get("duration") or fmt.get("duration") or 0)
+    if not duration:
+        logger.warning(
+            "ffprobe returned no duration for %s (valid stream but missing header). "
+            "Falling back to decode pass to determine true length.",
+            file_path,
+        )
+        duration = _decode_duration_fallback(file_path)
 
     return AudioInfo(
         duration=duration,
