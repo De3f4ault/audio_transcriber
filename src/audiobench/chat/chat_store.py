@@ -220,6 +220,12 @@ class ChatRepository:
             if not conv:
                 return False
 
+            from audiobench.storage.expression_repository import ExpressionRepository
+            from audiobench.memory.enums import SourceType
+
+            ExpressionRepository().delete_by_source(
+                SourceType.CHAT.value, conversation_id
+            )
             session.delete(conv)
             session.commit()
             logger.info("Deleted conversation #%d", conversation_id)
@@ -277,7 +283,15 @@ class ChatRepository:
     def delete_all_conversations(self) -> int:
         """Delete all conversations. Returns number deleted."""
         with get_session() as session:
-            count = session.query(ChatConversation).count()
+            conv_ids = [r[0] for r in session.query(ChatConversation.id).all()]
+            from audiobench.storage.expression_repository import ExpressionRepository
+            from audiobench.memory.enums import SourceType
+
+            expr_repo = ExpressionRepository()
+            for cid in conv_ids:
+                expr_repo.delete_by_source(SourceType.CHAT.value, cid)
+
+            count = len(conv_ids)
             session.query(ChatMessage).delete()
             session.query(ChatConversation).delete()
             session.commit()

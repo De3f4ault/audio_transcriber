@@ -37,6 +37,7 @@ class ExpressionRepository:
         session_type: str | None = None,
         session_id: int | None = None,
         speaker: str | None = None,
+        work_id: int | None = None,
     ) -> ExpressionRecord:
         """Register a new semantic expression.
 
@@ -51,7 +52,8 @@ class ExpressionRepository:
             # Check for existing semantic content within this source_type to prevent duplication
             existing = session.query(ExpressionRecord).filter_by(
                 content_hash=content_hash,
-                source_type=source_type
+                source_type=source_type,
+                source_id=source_id,
             ).first()
             if existing:
                 logger.debug("Deduplicated expression #%d via content_hash", existing.id)
@@ -66,6 +68,7 @@ class ExpressionRepository:
                 session_type=session_type,
                 session_id=session_id,
                 speaker=speaker,
+                work_id=work_id,
             )
             session.add(record)
             session.commit()
@@ -161,13 +164,14 @@ class ExpressionRepository:
                     )
                     .all()
                 )
-                existing_by_hash = {r.content_hash: r for r in existing}
+                existing_by_key = {(r.content_hash, r.source_id): r for r in existing}
 
                 for item in need_db_lookup:
-                    if item["_hash"] in existing_by_hash:
-                        rec = existing_by_hash[item["_hash"]]
+                    key = (item["_hash"], item.get("source_id"))
+                    if key in existing_by_key:
+                        rec = existing_by_key[key]
                         logger.debug(
-                            "Deduplicated expression #%d via content_hash (DB lookup)",
+                            "Deduplicated expression #%d via content_hash and source_id",
                             rec.id,
                         )
                         deduped.append(rec)
@@ -399,3 +403,43 @@ class ExpressionRepository:
         # Follow the first source relation
         parent_id = out_relations[0].to_expression_id
         return self.get_by_id(parent_id)
+
+    def delete_by_source(self, source_type: str, source_id: int) -> int:
+        """Delete all expressions for a given source entity from SQLite and LanceDB.
+
+        Returns the number of expressions deleted.
+        """
+        with get_session() as session:
+            records = (
+                session.query(ExpressionRecord)
+                .filter_by(source_type=source_type, source_id=source_id)
+                .all()
+            )
+            if not records:
+                return 0
+
+            expr_ids = [r.id for r in records]
+
+            from audiobench.core.settings import get_settings
+            if not get_settings().disable_memory:
+                try:
+                    from audiobench.daemon.factory import get_daemon_client
+                    client = get_daemon_client()
+                    for expr_id in expr_ids:
+                        try:
+                            client.delete(expr_id)
+                        except Exception as e:
+                            logger.warning("Failed to delete vector node %d from daemon: %s", expr_id, e)
+                except Exception as e:
+                    logger.warning("Could not connect to daemon for vector deletion: %s", e)
+
+            for r in records:
+                session.delete(r)
+            session.commit()
+            logger.info(
+                "Deleted %d expression(s) for source_type='%s' source_id=%d",
+                len(records),
+                source_type,
+                source_id,
+            )
+            return len(records)

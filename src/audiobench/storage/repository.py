@@ -145,30 +145,12 @@ class TranscriptionRepository:
                         raise ValueError("Transcription already exists for this audio file.")
                     
                     # Delete old transcriptions and their semantic vectors
-                    from audiobench.daemon.factory import get_daemon_client
-                    from audiobench.storage.models import ExpressionRecord
-                    from audiobench.core.settings import get_settings
-                    
-                    daemon_client = None
-                    if not get_settings().disable_memory:
-                        try:
-                            daemon_client = get_daemon_client()
-                        except Exception as e:
-                            logger.warning("Could not connect to daemon to delete expressions: %s", e)
-                        
+                    from audiobench.storage.expression_repository import ExpressionRepository
                     from audiobench.memory.enums import SourceType
+
+                    expr_repo = ExpressionRepository()
                     for old_tx in existing_txs:
-                        if daemon_client:
-                            old_exprs = session.query(ExpressionRecord).filter_by(
-                                source_type=SourceType.AUDIO_TRANSCRIPT.value, 
-                                source_id=old_tx.id
-                            ).all()
-                            for expr in old_exprs:
-                                try:
-                                    daemon_client.delete(expr.id)
-                                except Exception as e:
-                                    logger.warning("Failed to delete expression %d from daemon: %s", expr.id, e)
-                        
+                        expr_repo.delete_by_source(SourceType.AUDIO_TRANSCRIPT.value, old_tx.id)
                         session.delete(old_tx)
                     session.commit()
 
@@ -242,7 +224,7 @@ class TranscriptionRepository:
                 duration_seconds=transcript.duration_seconds,
                 word_count=transcript.word_count,
                 segment_count=transcript.segment_count,
-                status="completed",
+                pipeline_phase="complete",
                 speaker_map=json.dumps(transcript.speaker_map),
             )
             session.add(tx_record)
@@ -282,17 +264,11 @@ class TranscriptionRepository:
             if privacy_tier < 2:
                 audio_path = audio_metadata.file_path if audio_metadata else None
                 tx_id_for_pass = tx_record.id
-                self._schedule_biometric_pass(saved_segment_ids, audio_path, tx_id_for_pass)
-
-            # --- PHASE 5: Expression Registration & Chunking ---
-            try:
-                self._register_expressions(tx_record.id, transcript, chapter_id, on_phase)
-                tx_record.is_indexed = 1
-                session.commit()
-            except Exception as e:
-                logger.error(
-                    "Failed to register expressions for transcription %d: %s", tx_record.id, e
+                self._schedule_biometric_pass(
+                    saved_segment_ids, audio_path, tx_id_for_pass, run_inline=False
                 )
+
+
 
             return tx_record.id
 
@@ -301,160 +277,125 @@ class TranscriptionRepository:
         segment_ids: list[int],
         audio_path: str | None,
         tx_id: int,
+        run_inline: bool = True,
     ) -> None:
         """Launch a background biometric pass for newly saved segments.
 
-        Fire-and-forget: spawns a daemon thread so the REPL is never blocked.
+        Args:
+            segment_ids: DB IDs of SegmentRecord rows to classify.
+            audio_path:  Path to the source audio file (needed for ECAPA-TDNN slicing).
+            tx_id:       Transcription ID — used only for logging correlation.
+            run_inline:  True  → daemon-thread path (safe in long-lived daemon process).
+                         False → detached-subprocess path (safe for CLI; avoids racing
+                                 C++ tensor teardown on interpreter shutdown, which
+                                 causes SIGABRT — see: 2026-07-27 Track 3 diagnosis).
+
         Skips silently if no voiceprint is enrolled or no audio path given.
+
+        Accepted cost (subprocess path): a subprocess crash leaves the segment at
+        privacy_tier=0 with no automatic retry.  Failures are logged to
+        data/logs/biometric_worker.log and are greppable.  If failures accumulate,
+        the correct escalation is a biometric_status column + daemon sweep pickup.
         """
-        import threading
+        if run_inline:
+            # ── Daemon process path — thread is safe; process lifetime >> thread ──
+            import threading
 
-        def _run() -> None:
-            try:
-                from audiobench.security.voiceprint import (
-                    is_enrolled, tag_segments_batch, _load_audio, _load_ecapa,
-                    _voiceprint_path,
-                )
-                import numpy as np
-                from pathlib import Path
-
-                if not is_enrolled() or not audio_path or not Path(audio_path).exists():
-                    return
-
-                from audiobench.core.db_session import get_session as db_session
-                from audiobench.storage.models import SegmentRecord
-
-                waveform, sr = _load_audio(Path(audio_path))
-                model = _load_ecapa()
-
-                # Collect audio slices for segments in this transcription
-                with db_session() as s:
-                    segs = (
-                        s.query(SegmentRecord)
-                        .filter(SegmentRecord.id.in_(segment_ids))
-                        .filter(SegmentRecord.privacy_tier == 0)
-                        .order_by(SegmentRecord.segment_index)
-                        .all()
+            def _run() -> None:
+                try:
+                    from audiobench.security.voiceprint import (
+                        is_enrolled, tag_segments_batch, _load_audio, _load_ecapa,
                     )
-                    slices = []
-                    ids = []
-                    for seg in segs:
-                        start = int(seg.start_time * sr)
-                        end = int(seg.end_time * sr)
-                        audio_slice = waveform[start:end]
-                        if len(audio_slice) >= int(sr * 0.5):
-                            slices.append(audio_slice)
-                            ids.append(seg.id)
+                    from pathlib import Path
 
-                tag_segments_batch(ids, slices, sr, model=model)
+                    if not is_enrolled() or not audio_path or not Path(audio_path).exists():
+                        return
+
+                    from audiobench.core.db_session import get_session as db_session
+                    from audiobench.storage.models import SegmentRecord
+
+                    waveform, sr = _load_audio(Path(audio_path))
+                    model = _load_ecapa()
+
+                    with db_session() as s:
+                        segs = (
+                            s.query(SegmentRecord)
+                            .filter(SegmentRecord.id.in_(segment_ids))
+                            .filter(SegmentRecord.privacy_tier == 0)
+                            .order_by(SegmentRecord.segment_index)
+                            .all()
+                        )
+                        slices = []
+                        ids = []
+                        for seg in segs:
+                            start = int(seg.start_time * sr)
+                            end = int(seg.end_time * sr)
+                            audio_slice = waveform[start:end]
+                            if len(audio_slice) >= int(sr * 0.5):
+                                slices.append(audio_slice)
+                                ids.append(seg.id)
+
+                    tag_segments_batch(ids, slices, sr, model=model)
+                    logger.info(
+                        "Biometric pass complete for tx #%d (%d segments evaluated)",
+                        tx_id, len(ids),
+                    )
+                except Exception as exc:
+                    logger.warning("Background biometric pass failed for tx #%d: %s", tx_id, exc)
+
+            t = threading.Thread(target=_run, daemon=True, name=f"bio-pass-tx{tx_id}")
+            t.start()
+
+        else:
+            # ── CLI process path — detached subprocess avoids interpreter-shutdown race ──
+            # Guard: check enrollment before paying subprocess startup cost.
+            # is_enrolled() is a single file-existence check — effectively free.
+            try:
+                from audiobench.security.voiceprint import is_enrolled
+                if not is_enrolled():
+                    logger.debug("Biometric pass skipped for tx #%d — no voiceprint enrolled", tx_id)
+                    return
+            except Exception:
+                # voiceprint module unavailable (SpeechBrain not installed) — skip silently.
+                return
+
+            import json
+            import subprocess
+            import sys
+            from audiobench.core.settings import get_settings
+
+            log_dir = get_settings().data_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "biometric_worker.log"
+
+            try:
+                with open(log_file, "a") as lf:
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "audiobench._biometric_worker",
+                            str(tx_id),
+                            audio_path or "",
+                            json.dumps(segment_ids),
+                        ],
+                        stdout=lf,
+                        stderr=lf,
+                        start_new_session=True,  # detach from parent's process group
+                        close_fds=True,
+                    )
                 logger.info(
-                    "Biometric pass complete for tx #%d (%d segments evaluated)",
-                    tx_id, len(ids),
+                    "Biometric pass queued as detached subprocess for tx #%d "
+                    "(log: %s)",
+                    tx_id, log_file,
                 )
             except Exception as exc:
-                logger.warning("Background biometric pass failed for tx #%d: %s", tx_id, exc)
-
-        t = threading.Thread(target=_run, daemon=True, name=f"bio-pass-tx{tx_id}")
-        t.start()
-
-    def _register_expressions(
-        self, transcription_id: int, transcript: Transcript, chapter_id: int | None, on_phase: object | None = None
-    ) -> None:
-        """Process transcription text through daemon and register semantic expressions."""
-        from audiobench.core.settings import get_settings
-        if get_settings().disable_memory:
-            logger.info("Skipping semantic memory registration (disable_memory=True)")
-            return
-
-        from audiobench.daemon.factory import get_daemon_client
-        from audiobench.memory.chunking import Chunk, _clean_text, parent_child_grouper
-        from audiobench.memory.enums import RelationType, SourceType
-        from audiobench.storage.expression_repository import ExpressionRepository
-
-        try:
-            daemon = get_daemon_client()
-        except Exception as e:
-            logger.warning("Daemon not available, skipping semantic memory registration: %s", e)
-            return
-
-        expr_repo = ExpressionRepository()
-
-        # Step 1. Get raw chunks from daemon
-        diarized = bool(transcript.speaker_map)
-        segments_for_daemon = []
-        if diarized:
-            for seg in transcript.segments:
-                segments_for_daemon.append({"speaker": seg.speaker, "text": seg.text})
-
-        if on_phase:
-            on_phase("embedding", "Chunking text...", 0.0)
-
-        chunk_results = daemon.chunk(
-            transcript.text, transcription_id, diarized, segments_for_daemon
-        )
-
-        # Convert chunk dicts to Chunk objects for grouper
-        chunks = [
-            Chunk(content=c["content"], uuid=c["uuid"], tier=c["tier"], speaker=c.get("speaker"))
-            for c in chunk_results
-        ]
-
-        # Step 2. Group into parents
-        parent_groups = parent_child_grouper(chunks)
-
-        # Only Tier 3 sentence chunks are embedded in LanceDB (true parent-child retrieval).
-        # Tier 1 and Tier 2 live in SQLite only for graph-expansion during search.
-        total_embeds = sum(len(pg.children) for pg in parent_groups)
-        current_embed = 0
-
-        def _update_progress():
-            nonlocal current_embed
-            current_embed += 1
-            if on_phase and total_embeds > 0:
-                on_phase("embedding", "Generating embeddings...", float(current_embed) / total_embeds)
-
-        if on_phase:
-            on_phase("embedding", "Generating embeddings...", 0.0)
-
-        # Step 3. Register Tier 1 (full cleaned text) in SQLite only — NOT embedded in LanceDB.
-        # Tier 1 serves as the root anchor for the SQLite expression graph.
-        cleaned_text = _clean_text(transcript.text)
-        t1_expr = expr_repo.register(
-            content=cleaned_text,
-            source_type=SourceType.AUDIO_TRANSCRIPT.value,
-            source_id=transcription_id,
-        )
-
-        # Step 4. Register Tier 2 (SQLite only) and Tier 3 (SQLite + LanceDB)
-        for pg in parent_groups:
-            # Tier 2 parent — registered in SQLite only, NOT embedded in LanceDB.
-            # During search, Tier 3 hits walk up to this node for rich context.
-            t2_expr = expr_repo.register(
-                content=pg.parent_text,
-                source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                source_id=transcription_id,
-            )
-            expr_repo.link(
-                from_id=t2_expr.id, to_id=t1_expr.id, relation_type=RelationType.SOURCE.value
-            )
-
-            # Tier 3 children
-            for child in pg.children:
-                t3_expr = expr_repo.register(
-                    content=child.content,
-                    source_type=SourceType.AUDIO_TRANSCRIPT.value,
-                    source_id=transcription_id,
-                    speaker=child.speaker,
+                logger.warning(
+                    "Failed to launch biometric worker subprocess for tx #%d: %s",
+                    tx_id, exc,
                 )
-                expr_repo.link(
-                    from_id=t3_expr.id, to_id=t2_expr.id, relation_type=RelationType.SOURCE.value
-                )
-                daemon.embed(
-                    t3_expr.id, child.content, SourceType.AUDIO_TRANSCRIPT, speaker=child.speaker
-                )
-                _update_progress()
 
-        logger.info("Registered semantic expressions for transcription %d", transcription_id)
+
 
     def save_live_session(self, transcript: Transcript, on_phase: object | None = None) -> int:
         """Save a live transcription session to the database.
@@ -477,7 +418,7 @@ class TranscriptionRepository:
                 duration_seconds=transcript.duration_seconds,
                 word_count=transcript.word_count,
                 segment_count=transcript.segment_count,
-                status="completed",
+                pipeline_phase="complete",
             )
             session.add(tx_record)
             session.flush()
@@ -498,21 +439,16 @@ class TranscriptionRepository:
                 "Saved live session #%d (%d segments)", tx_record.id, len(transcript.segments)
             )
 
-            try:
-                self._register_expressions(tx_record.id, transcript, None, on_phase)
-                tx_record.is_indexed = 1
-                session.commit()
-            except Exception as e:
-                logger.error(
-                    "Failed to register expressions for live session %d: %s", tx_record.id, e
-                )
+
 
             return tx_record.id
 
     def find_by_hash(self, file_hash: str) -> TranscriptionRecord | None:
         """Find an existing transcription by audio file hash (deduplication).
 
-        Returns the most recent transcription for the given file hash, or None.
+        Returns the most recent *completed* transcription for the given file hash,
+        or None.  Failed/in-progress records are intentionally excluded so they
+        are never mistaken for a valid cache hit and silently skip re-transcription.
         """
         with get_session() as session:
             audio = session.query(AudioFileRecord).filter_by(file_hash=file_hash).first()
@@ -521,7 +457,7 @@ class TranscriptionRepository:
 
             return (
                 session.query(TranscriptionRecord)
-                .filter_by(audio_file_id=audio.id)
+                .filter(TranscriptionRecord.audio_file_id == audio.id, TranscriptionRecord.pipeline_phase.in_(["complete", "completed"]))
                 .order_by(desc(TranscriptionRecord.created_at))
                 .first()
             )
@@ -576,7 +512,7 @@ class TranscriptionRepository:
                         "model": rec.model_name,
                         "word_count": rec.word_count,
                         "duration": rec.duration_seconds,
-                        "status": rec.status,
+                        "status": rec.pipeline_phase,
                         "audio_file_id": rec.audio_file_id,
                         "chapter_id": getattr(rec, "chapter_id", None),
                         "refined_at": rec.refined_at.isoformat() if rec.refined_at else None,
@@ -628,7 +564,7 @@ class TranscriptionRepository:
             # Let's just return all completed transcripts and let the UI query the daemon/expression repo.
             records = (
                 session.query(TranscriptionRecord)
-                .filter_by(status="completed")
+                .filter(TranscriptionRecord.pipeline_phase.in_(["complete", "completed"]))
                 .order_by(desc(TranscriptionRecord.created_at))
                 .all()
             )
@@ -717,7 +653,10 @@ class TranscriptionRepository:
         with get_session() as session:
             rec = (
                 session.query(TranscriptionRecord)
-                .filter_by(audio_file_id=audio_file_id, status="completed")
+                .filter(
+                    TranscriptionRecord.audio_file_id == audio_file_id, 
+                    TranscriptionRecord.pipeline_phase.in_(["complete", "completed"])
+                )
                 .order_by(desc(TranscriptionRecord.created_at))
                 .first()
             )
@@ -941,6 +880,12 @@ class TranscriptionRepository:
             rec = session.query(TranscriptionRecord).filter_by(id=transcription_id).first()
             if rec is None:
                 return False
+            from audiobench.storage.expression_repository import ExpressionRepository
+            from audiobench.memory.enums import SourceType
+
+            ExpressionRepository().delete_by_source(
+                SourceType.AUDIO_TRANSCRIPT.value, transcription_id
+            )
             session.delete(rec)
             session.commit()
             logger.info("Deleted transcription #%d", transcription_id)
@@ -949,7 +894,15 @@ class TranscriptionRepository:
     def delete_all(self) -> int:
         """Delete all transcriptions. Returns number deleted."""
         with get_session() as session:
-            count = session.query(TranscriptionRecord).count()
+            tx_ids = [r[0] for r in session.query(TranscriptionRecord.id).all()]
+            from audiobench.storage.expression_repository import ExpressionRepository
+            from audiobench.memory.enums import SourceType
+
+            expr_repo = ExpressionRepository()
+            for tx_id in tx_ids:
+                expr_repo.delete_by_source(SourceType.AUDIO_TRANSCRIPT.value, tx_id)
+
+            count = len(tx_ids)
             session.query(SegmentRecord).delete()
             session.query(TranscriptionRecord).delete()
             session.commit()
@@ -986,33 +939,22 @@ class TranscriptionRepository:
             # --- DEDUPLICATION ENFORCEMENT ---
             if audio_record and not chapter_id:
                 existing_txs = session.query(TranscriptionRecord).filter_by(audio_file_id=audio_record.id).all()
-                if existing_txs:
-                    if not overwrite:
+                # Only *completed* records count as a duplicate worth blocking.
+                # Failed / in-progress records are silently overwritten so the user
+                # can retry without needing --collision overwrite.
+                has_completed = any(t.pipeline_phase in ("complete", "completed") for t in existing_txs)
+                if existing_txs and (has_completed or overwrite):
+                    # Block only if there is a completed record and the caller
+                    # did not explicitly request an overwrite.
+                    if has_completed and not overwrite:
                         raise ValueError("Transcription already exists for this audio file.")
                     
-                    from audiobench.daemon.factory import get_daemon_client
-                    from audiobench.core.settings import get_settings
-                    
-                    daemon_client = None
-                    if not get_settings().disable_memory:
-                        try:
-                            daemon_client = get_daemon_client()
-                        except Exception as e:
-                            logger.warning("Could not connect to daemon to delete expressions: %s", e)
-                        
+                    from audiobench.storage.expression_repository import ExpressionRepository
                     from audiobench.memory.enums import SourceType
-                    from audiobench.storage.models import ExpressionRecord
+
+                    expr_repo = ExpressionRepository()
                     for old_tx in existing_txs:
-                        if daemon_client:
-                            old_exprs = session.query(ExpressionRecord).filter_by(
-                                source_type=SourceType.AUDIO_TRANSCRIPT.value, 
-                                source_id=old_tx.id
-                            ).all()
-                            for expr in old_exprs:
-                                try:
-                                    daemon_client.delete(expr.id)
-                                except Exception as e:
-                                    logger.warning("Failed to delete expression %d from daemon: %s", expr.id, e)
+                        expr_repo.delete_by_source(SourceType.AUDIO_TRANSCRIPT.value, old_tx.id)
                         session.delete(old_tx)
                     session.commit()
 
@@ -1173,10 +1115,16 @@ class TranscriptionRepository:
         on_phase: Any = None,
         privacy_tier: int = 0,
         audio_metadata: AudioMetadata | None = None,
+        run_inline: bool = False,
     ) -> None:
         """
         After speaker naming: UPDATE status='complete', attempt_count=0.
         Triggers _register_expressions() and background biometric pass.
+
+        Args:
+            run_inline: Passed to _schedule_biometric_pass.
+                        False (default) → detached subprocess path, safe for CLI exit.
+                        True            → daemon-thread path, safe in long-lived daemon.
         """
         with get_session() as session:
             tx_record = session.query(TranscriptionRecord).get(tx_id)
@@ -1200,17 +1148,11 @@ class TranscriptionRepository:
             # ── Background biometric pass ──────────────────────────────────────────
             if privacy_tier < 2:
                 audio_path = audio_metadata.file_path if audio_metadata else None
-                self._schedule_biometric_pass(saved_segment_ids, audio_path, tx_id)
+                self._schedule_biometric_pass(
+                    saved_segment_ids, audio_path, tx_id, run_inline=run_inline
+                )
 
-            # --- PHASE 5: Expression Registration & Chunking ---
-            try:
-                self._register_expressions(tx_id, transcript, chapter_id, on_phase)
-                with get_session() as s2:
-                    tx2 = s2.query(TranscriptionRecord).get(tx_id)
-                    tx2.is_indexed = 1
-                    s2.commit()
-            except Exception as e:
-                logger.error("Failed to register expressions for transcription %d: %s", tx_id, e)
+
 
     def mark_transcription_failed(
         self,
@@ -1257,15 +1199,71 @@ class TranscriptionRepository:
                 return new_count
         return 0
 
+    def touch_transcription(self, tx_id: int) -> None:
+        """Update the updated_at timestamp on a TranscriptionRecord as a heartbeat."""
+        from datetime import datetime, UTC
+        with get_session() as session:
+            tx_record = session.query(TranscriptionRecord).get(tx_id)
+            if tx_record:
+                tx_record.updated_at = datetime.now(UTC)
+                session.commit()
+
     def get_incomplete_transcriptions(self, max_age_minutes: int = 5) -> list[TranscriptionRecord]:
         """
-        Returns all records where pipeline_phase NOT IN ('complete', 'degraded', 'failed')
-        AND updated_at < now() - max_age_minutes.
+        Returns all records where pipeline_phase NOT IN ('complete', 'completed', 'degraded', 'failed')
+        AND updated_at < now() - max_age_minutes (with 60m grace for 'transcribing').
         """
         from datetime import datetime, UTC, timedelta
-        cutoff = datetime.now(UTC) - timedelta(minutes=max_age_minutes)
+        from sqlalchemy import or_, and_
+        cutoff_default = datetime.now(UTC) - timedelta(minutes=max_age_minutes)
+        cutoff_transcribing = datetime.now(UTC) - timedelta(minutes=max(60, max_age_minutes))
         with get_session() as session:
             return session.query(TranscriptionRecord).filter(
-                ~TranscriptionRecord.pipeline_phase.in_(["complete", "degraded", "failed"]),
-                TranscriptionRecord.updated_at < cutoff
+                ~TranscriptionRecord.pipeline_phase.in_(["complete", "completed", "degraded", "failed"]),
+                or_(
+                    and_(
+                        TranscriptionRecord.pipeline_phase != "transcribing",
+                        TranscriptionRecord.updated_at < cutoff_default,
+                    ),
+                    and_(
+                        TranscriptionRecord.pipeline_phase == "transcribing",
+                        TranscriptionRecord.updated_at < cutoff_transcribing,
+                    ),
+                )
             ).all()
+
+    def get_degraded_for_backfill(self, max_backfill_attempts: int = 3) -> list[TranscriptionRecord]:
+        """
+        Returns degraded records eligible for background re-alignment or re-diarization.
+        """
+        from datetime import datetime, UTC
+        from sqlalchemy import or_
+        now = datetime.now(UTC)
+        with get_session() as session:
+            return session.query(TranscriptionRecord).filter(
+                TranscriptionRecord.pipeline_phase == "degraded",
+                TranscriptionRecord.failure_reason.in_(["alignment_failed", "diarization_failed"]),
+                TranscriptionRecord.backfill_attempt_count < max_backfill_attempts,
+                or_(
+                    TranscriptionRecord.backfill_next_attempt_at == None,
+                    TranscriptionRecord.backfill_next_attempt_at <= now,
+                ),
+            ).order_by(TranscriptionRecord.duration_seconds.asc()).all()
+
+    def increment_backfill_attempt(self, tx_id: int, next_attempt_delay_seconds: int) -> None:
+        """Increment backfill_attempt_count and set backfill_next_attempt_at."""
+        from datetime import datetime, UTC, timedelta
+        with get_session() as session:
+            rec = session.query(TranscriptionRecord).get(tx_id)
+            if rec:
+                rec.backfill_attempt_count += 1
+                rec.backfill_next_attempt_at = datetime.now(UTC) + timedelta(seconds=next_attempt_delay_seconds)
+                session.commit()
+
+    def mark_backfill_exhausted(self, tx_id: int) -> None:
+        """Terminal state — all backfill attempts consumed, will never be retried."""
+        with get_session() as session:
+            rec = session.query(TranscriptionRecord).get(tx_id)
+            if rec:
+                rec.failure_reason = "alignment_exhausted"
+                session.commit()

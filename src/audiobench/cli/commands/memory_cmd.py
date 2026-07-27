@@ -23,8 +23,10 @@ import dataclasses
 @dataclasses.dataclass
 class SearchSessionState:
     preset: str = "balanced"
+    initial_preset: str = "balanced"
     mmr_lambda: float = 0.5
     focus_source: str | None = None
+    model: str | None = None
 
     @property
     def mmr_enabled(self) -> bool:
@@ -43,12 +45,32 @@ def _parse_slash_command(line: str, state: SearchSessionState) -> str | None:
     cmd = parts[0].lower()
     
     if cmd == "/set":
-        if len(parts) < 2:
-            return "[red]Usage: /set preset <name> | /set mmr <0.0-1.0>[/red]"
+        if len(parts) == 1:
+            return (
+                "\n[dim]"
+                "  /set <fast | balanced | synthesis | deep | default>\n"
+                "  /set model   <ollama-model-name | gemini | default>\n"
+                "  /set mmr     <0.0-1.0>   (switches to synthesis preset)"
+                "[/dim]\n"
+            )
             
-        if parts[1].lower() == "preset" and len(parts) >= 3:
+        arg1 = parts[1].lower()
+        
+        # Flattened preset setting: `/set deep` or `/set default`
+        if arg1 in ("default", "reset"):
+            state.preset = state.initial_preset
+            return f"[green]Preset reset to default ('{state.preset}')[/green]"
+        elif arg1 in ("fast", "balanced", "deep", "synthesis"):
+            state.preset = arg1
+            return f"[green]Preset updated to '{arg1}'[/green]"
+            
+        # Legacy preset setting: `/set preset deep`
+        if arg1 == "preset" and len(parts) >= 3:
             val = parts[2].lower()
-            if val in ("fast", "balanced", "deep", "synthesis"):
+            if val in ("default", "reset"):
+                state.preset = state.initial_preset
+                return f"[green]Preset reset to default ('{state.preset}')[/green]"
+            elif val in ("fast", "balanced", "deep", "synthesis"):
                 state.preset = val
                 return f"[green]Preset updated to '{val}'[/green]"
             return f"[red]Invalid preset '{val}'[/red]"
@@ -63,6 +85,14 @@ def _parse_slash_command(line: str, state: SearchSessionState) -> str | None:
                 return "[red]λ must be between 0.0 and 1.0[/red]"
             except ValueError:
                 return "[red]Invalid lambda value[/red]"
+                
+        elif parts[1].lower() == "model" and len(parts) >= 3:
+            val = parts[2]
+            if val.lower() == "default":
+                state.model = None
+                return "[green]Model override cleared (using default)[/green]"
+            state.model = val
+            return f"[green]Model set to '{val}'[/green]"
                 
     elif cmd == "/focus":
         if len(parts) >= 2:
@@ -91,8 +121,20 @@ def memory() -> None:
     pass
 
 
+def query_completer(ctx, param, incomplete: str):
+    """Click shell completion for search queries via daemon."""
+    from audiobench.daemon.factory import get_daemon_client
+    try:
+        client = get_daemon_client()
+        results = client.autocomplete(incomplete, top_k=10)
+        from click.shell_completion import CompletionItem
+        return [CompletionItem(r.get("text", "")) for r in results if r.get("text")]
+    except Exception:
+        return []
+
+
 @memory.command()
-@click.argument("query", type=str, required=False)
+@click.argument("query", type=str, required=False, shell_complete=query_completer)
 @click.option(
     "--preset",
     type=click.Choice(["fast", "balanced", "deep", "synthesis"]),
@@ -112,6 +154,11 @@ def memory() -> None:
     default=False,
     help="Bypass the semantic cache and force a new generation.",
 )
+@click.option(
+    "--model",
+    default=None,
+    help="Override synthesis model (e.g. gemini, gpt-4o, llama3)",
+)
 @click.option("--interactive", "-i", is_flag=True, help="Interactive wizard mode.")
 def search(
     query: str | None,
@@ -120,6 +167,7 @@ def search(
     enable_cross_encoder: bool | None,
     enable_colbert: bool | None,
     no_cache: bool,
+    model: str | None,
     interactive: bool,
 ) -> None:
     """Search memory for a semantic query."""
@@ -145,7 +193,7 @@ def search(
 
         try:
             if not query:
-                query = prompt_string("Search query [e.g. 'What did we discuss about X?']")
+                query = prompt_string("Search query [e.g. 'What did we discuss about X?']", enable_autocomplete=True)
                 if not query:
                     console.print("  [dim]Cancelled.[/dim]")
                     return
@@ -174,7 +222,7 @@ def search(
         return
 
     engine = ResearchEngine()
-    state = SearchSessionState(preset=preset)
+    state = SearchSessionState(preset=preset, initial_preset=preset, model=model)
 
     _run_search_loop(engine, query, state)
 
@@ -241,6 +289,68 @@ def inferences() -> None:
         conf = f"{inf.inference_confidence:.2f}" if inf.inference_confidence is not None else "-"
         table.add_row(str(inf.id), inf.content, conf, inf.inference_status or "-")
         console.print(table)
+
+
+@memory.command()
+@click.option("--execute", is_flag=True, help="Execute deletion of orphaned SQLite expression rows and LanceDB vector nodes.")
+@click.option("--batch-size", default=500, type=int, help="Batch size for deletions (default: 500).")
+def purge(execute: bool, batch_size: int) -> None:
+    """Scan and purge orphaned vector nodes and expressions from storage."""
+    from sqlalchemy import select
+    from audiobench.storage.models import ExpressionRecord, TranscriptionRecord
+    from audiobench.memory.memory_store import MemoryStore
+    from audiobench.cli.display.theme import SUCCESS, DIM
+
+    with get_session() as session:
+        active_tx_ids = set(session.scalars(select(TranscriptionRecord.id)).all())
+        all_tx_exprs = session.query(ExpressionRecord.id, ExpressionRecord.source_id).filter(
+            ExpressionRecord.source_type == SourceType.AUDIO_TRANSCRIPT.value
+        ).all()
+        orphans = [eid for eid, sid in all_tx_exprs if sid not in active_tx_ids]
+
+    store = MemoryStore()
+    lancedb_orphans: list[int] = []
+    if orphans:
+        # Check in batches if orphan count is very large
+        for i in range(0, len(orphans), batch_size):
+            chunk = orphans[i:i + batch_size]
+            ids_str = ", ".join(str(eid) for eid in chunk)
+            try:
+                lancedb_rows = store.table.search().where(f"expression_id IN ({ids_str})").select(["expression_id"]).to_list()
+                lancedb_orphans.extend(int(r["expression_id"]) for r in lancedb_rows)
+            except Exception:
+                pass
+
+    if not orphans and not lancedb_orphans:
+        console.print(f"[{SUCCESS}]✓ No orphaned expressions or vector nodes found.[/]")
+        return
+
+    table = Table(title="Orphan Scan Summary", show_lines=True)
+    table.add_column("Asset", style="cyan")
+    table.add_column("Orphan Count", justify="right", style="bold yellow")
+    table.add_row("SQLite Expression Records", str(len(orphans)))
+    table.add_row("LanceDB Vector Nodes", str(len(lancedb_orphans)))
+    console.print(table)
+
+    if not execute:
+        console.print(f"[{DIM}]DRY-RUN MODE. To permanently purge these records, run:[/] [bold]audiobench memory purge --execute[/bold]")
+        return
+
+    with console.status("Purging orphaned vectors and expressions..."):
+        if lancedb_orphans:
+            for i in range(0, len(lancedb_orphans), batch_size):
+                batch = lancedb_orphans[i:i + batch_size]
+                b_str = ", ".join(str(eid) for eid in batch)
+                store.table.delete(f"expression_id IN ({b_str})")
+
+        if orphans:
+            with get_session() as session:
+                for i in range(0, len(orphans), batch_size):
+                    batch = orphans[i:i + batch_size]
+                    session.query(ExpressionRecord).filter(ExpressionRecord.id.in_(batch)).delete(synchronize_session=False)
+                session.commit()
+
+    console.print(f"[{SUCCESS}]✓ Successfully purged {len(orphans)} SQLite rows and {len(lancedb_orphans)} LanceDB vector nodes.[/]")
 
 
 @memory.command()
@@ -360,9 +470,15 @@ def _display_results(result: "ResearchResult") -> None:  # type: ignore[name-def
         # Build skipped-stream suffix for header
         skipped_note = ""
         if result.streams_skipped:
-            skipped_labels = " ".join(
-                f"[dim red]{s}✗[/dim red]" for s in result.streams_skipped
-            )
+            # result.streams_skipped is a list of tuples: (name, reason)
+            skipped_labels_list = []
+            for s_name, s_reason in result.streams_skipped:
+                if s_reason == "0 hits":
+                    skipped_labels_list.append(f"[dim red]{s_name}✗[/dim red]")
+                else:
+                    skipped_labels_list.append(f"[dim red]{s_name}✗[/dim red] [dim]({s_reason})[/dim]")
+            
+            skipped_labels = " ".join(skipped_labels_list)
             skipped_note = f"  {skipped_labels}"
 
         console.print(f"[bold]Fragments ({len(result.sources)})[/bold]{skipped_note}")
@@ -891,14 +1007,30 @@ def _open_fragment_reader(
 def _run_search_loop(engine: "ResearchEngine", query: str, state: SearchSessionState) -> None:  # type: ignore[name-defined]
     """Interactive loop for searching, REPL commands, and navigating results."""
     while True:
-        console.print(f"[dim]Searching: preset={state.preset} focus={state.focus_source or 'all'} λ={state.mmr_lambda}[/dim]")
+        # Check for one-off preset overrides in the query
+        active_preset = state.preset
+        query_parts = query.split(maxsplit=1)
+        if query_parts and query_parts[0].lower() in ("/fast", "/balanced", "/deep", "/synthesis"):
+            active_preset = query_parts[0][1:].lower()
+            if len(query_parts) == 1:
+                console.print("[red]Missing query after preset override.[/red]")
+                return
+            query = query_parts[1]
+            console.print(f"[dim]Note: Using one-off override preset '{active_preset}' for this query[/dim]")
+
+        if not query.strip():
+            console.print("[red]Query cannot be empty.[/red]")
+            return
+
+        console.print(f"[dim]Searching: preset={active_preset} focus={state.focus_source or 'all'} λ={state.mmr_lambda}[/dim]")
         
         with console.status("Querying memory graph..."):
             result = engine.search(
                 query=query, 
-                preset=state.preset,
+                preset=active_preset,
                 mmr_lambda=state.mmr_lambda,
-                focus_source=state.focus_source
+                focus_source=state.focus_source,
+                model=state.model
             )
             
         _display_results(result)
@@ -920,6 +1052,13 @@ def _run_search_loop(engine: "ResearchEngine", query: str, state: SearchSessionS
                 return
 
             if choice.startswith("/"):
+                # Check for one-off query overrides first
+                query_parts = choice.split(maxsplit=1)
+                if query_parts[0].lower() in ("/fast", "/balanced", "/deep", "/synthesis") and len(query_parts) > 1:
+                    query = choice
+                    console.print()
+                    break  # re-run outer loop with new query
+                    
                 msg = _parse_slash_command(choice, state)
                 if msg:
                     console.print(f"  {msg}")
@@ -947,6 +1086,7 @@ def _run_search_loop(engine: "ResearchEngine", query: str, state: SearchSessionS
                     console.print()
                     continue
                 if new_query:
+                    # We no longer need to parse here because the outer loop handles it
                     query = new_query
                     console.print()
                     break  # re-run outer loop with new query

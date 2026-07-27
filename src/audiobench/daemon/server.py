@@ -778,40 +778,58 @@ def _do_sweep_once() -> None:
 
                 chunks = content_aware_router(text)
                 if chunks:
-                    chunk_items = [
-                        {
-                            "content": chunk.content,
-                            "source_type": SourceType.AUDIO_TRANSCRIPT.value,
-                            "source_id": tx["id"],
-                            "speaker": chunk.speaker,
-                            "work_id": tx["work_id"],
-                        }
-                        for chunk in chunks
-                    ]
-                    # O(1) dedup — no SQL IN() query for known hashes
-                    registered = expr_repo.register_batch(
-                        chunk_items,
-                        known_hashes=state.known_hashes,
+                    from audiobench.memory.chunking import parent_child_grouper, _clean_text
+                    from audiobench.memory.enums import RelationType
+                    
+                    parent_groups = parent_child_grouper(chunks)
+                    nodes = []
+                    
+                    # Tier 1
+                    cleaned_text = _clean_text(text)
+                    t1_expr = expr_repo.register(
+                        content=cleaned_text,
+                        source_type=SourceType.AUDIO_TRANSCRIPT.value,
+                        source_id=tx["id"],
+                        work_id=tx["work_id"],
                     )
-                    # Batch embed + write — one model forward-pass per transcript
-                    nodes = [
-                        {
-                            "expression_id": expr.id,
-                            "content": expr.content,
-                            "source_type": SourceType.AUDIO_TRANSCRIPT.value,
-                            "speaker": expr.speaker,
-                            "audio_file_id": tx["audio_file_id"],
-                            "confidence": tx["language_probability"],
-                            "original_language": tx["language"],
-                            "work_id": expr.work_id,
-                        }
-                        for expr in registered
-                    ]
-                    _get_store().batch_write_nodes(nodes)
+                    
+                    for pg in parent_groups:
+                        # Tier 2
+                        t2_expr = expr_repo.register(
+                            content=pg.parent_text,
+                            source_type=SourceType.AUDIO_TRANSCRIPT.value,
+                            source_id=tx["id"],
+                            work_id=tx["work_id"],
+                        )
+                        expr_repo.link(t2_expr.id, t1_expr.id, RelationType.SOURCE.value)
+                        
+                        # Tier 3
+                        for child in pg.children:
+                            t3_expr = expr_repo.register(
+                                content=child.content,
+                                source_type=SourceType.AUDIO_TRANSCRIPT.value,
+                                source_id=tx["id"],
+                                speaker=child.speaker,
+                                work_id=tx["work_id"],
+                            )
+                            expr_repo.link(t3_expr.id, t2_expr.id, RelationType.SOURCE.value)
+                            
+                            nodes.append({
+                                "expression_id": t3_expr.id,
+                                "content": child.content,
+                                "source_type": SourceType.AUDIO_TRANSCRIPT.value,
+                                "speaker": child.speaker,
+                                "audio_file_id": tx["audio_file_id"],
+                                "confidence": tx["language_probability"],
+                                "original_language": tx["language"],
+                                "work_id": t3_expr.work_id,
+                            })
 
-                    from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
-                    increment_unoptimized_writes(len(nodes))
-                    _maybe_trigger_threshold_optimize()
+                    if nodes:
+                        _get_store().batch_write_nodes(nodes)
+                        from audiobench.daemon.lancedb_optimizer import increment_unoptimized_writes
+                        increment_unoptimized_writes(len(nodes))
+                        _maybe_trigger_threshold_optimize()
 
                 success_ids.append(tx["id"])
             except Exception as e:

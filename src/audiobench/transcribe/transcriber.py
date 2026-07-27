@@ -274,8 +274,17 @@ class TranscriptionPipeline:
             new_attempt_count = self._repository.increment_attempt_count(tx_id)
             logger.info("Starting attempt %d for tx_id %d", new_attempt_count, tx_id)
             
+            import time
+            last_heartbeat = [time.time()]
             def _progress(pct: float) -> None:
                 emit("transcribing", "Transcribing...", pct)
+                now = time.time()
+                if now - last_heartbeat[0] > 60.0:
+                    last_heartbeat[0] = now
+                    try:
+                        self._repository.touch_transcription(tx_id)
+                    except Exception as e:
+                        logger.debug("Failed to update transcription heartbeat: %s", e)
             def _do_transcribe():
                 if is_gemini:
                     # Gemini is a cloud model — send the original, full-quality
