@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -386,6 +386,12 @@ class ExpressionRecord(Base):
     )
     # Security: mirrors segments.privacy_tier — inherited during expression creation
     privacy_tier: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
+    # Graph topology role — set by the RAG sweep to distinguish tiered nodes.
+    # Values: 'sweep_document' (T1 full text), 'sweep_passage' (T2 context group),
+    # 'sweep_chunk' (T3 embedded leaf). NULL = pre-Track-4 row or non-sweep origin
+    # (chat, memoir, bookmark, etc.). Future consumers must treat NULL as
+    # "role unknown / not a tiered sweep node" — not as an implicit tier value.
+    graph_role: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC), index=True
     )
@@ -444,6 +450,15 @@ class ExpressionRelation(Base):
     weight: Mapped[float] = mapped_column(Float, default=1.0)
     created_by: Mapped[str] = mapped_column(String(64), default="system")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "from_expression_id",
+            "to_expression_id",
+            "relation_type",
+            name="uq_expression_relation_edge",
+        ),
+    )
 
     # Relationships
     source_expression: Mapped[ExpressionRecord] = relationship(

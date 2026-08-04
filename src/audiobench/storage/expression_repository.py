@@ -38,6 +38,7 @@ class ExpressionRepository:
         session_id: int | None = None,
         speaker: str | None = None,
         work_id: int | None = None,
+        graph_role: str | None = None,
     ) -> ExpressionRecord:
         """Register a new semantic expression.
 
@@ -49,11 +50,15 @@ class ExpressionRepository:
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
         with get_session() as session:
-            # Check for existing semantic content within this source_type to prevent duplication
+            # Check for existing semantic content within this source_type to prevent duplication.
+            # graph_role is included in the composite key so that T1/T2/T3 nodes for the
+            # same transcript are never collapsed into one row even when their text is identical
+            # (e.g. a single-chunk transcript where parent_text == full cleaned text).
             existing = session.query(ExpressionRecord).filter_by(
                 content_hash=content_hash,
                 source_type=source_type,
                 source_id=source_id,
+                graph_role=graph_role,
             ).first()
             if existing:
                 logger.debug("Deduplicated expression #%d via content_hash", existing.id)
@@ -69,6 +74,7 @@ class ExpressionRepository:
                 session_id=session_id,
                 speaker=speaker,
                 work_id=work_id,
+                graph_role=graph_role,
             )
             session.add(record)
             session.commit()
@@ -308,20 +314,49 @@ class ExpressionRepository:
     ) -> ExpressionRelation:
         """Create a directed relation between two expressions.
 
+        Idempotent: if an identical edge (from_id, to_id, relation_type) already
+        exists, returns the original relation rather than inserting a duplicate.
+        The returned relation's created_at reflects the original insertion time,
+        not the current call time.
+
+        Raises:
+            ValueError: if from_id == to_id (self-link). This indicates a
+                graph_role dedup collision — check that graph_role is being
+                passed correctly at the call site in _do_sweep_once().
+
         Returns:
-            The created ExpressionRelation.
+            The created or pre-existing ExpressionRelation.
         """
+        if from_id == to_id:
+            raise ValueError(
+                f"Self-link rejected: expression #{from_id} cannot link to itself "
+                f"(relation_type={relation_type!r}). This indicates a graph_role "
+                f"dedup collision — verify graph_role is passed at all three tier "
+                f"register() call sites in _do_sweep_once()."
+            )
         with get_session() as session:
-            relation = ExpressionRelation(
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = (
+                sqlite_insert(ExpressionRelation)
+                .values(
+                    from_expression_id=from_id,
+                    to_expression_id=to_id,
+                    relation_type=relation_type,
+                    weight=weight,
+                    created_by=created_by,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["from_expression_id", "to_expression_id", "relation_type"]
+                )
+            )
+            session.execute(stmt)
+            session.commit()
+            relation = session.query(ExpressionRelation).filter_by(
                 from_expression_id=from_id,
                 to_expression_id=to_id,
                 relation_type=relation_type,
-                weight=weight,
-                created_by=created_by,
-            )
-            session.add(relation)
-            session.commit()
-            session.refresh(relation)
+            ).first()
             logger.info("Linked %d -> %d (type: %s)", from_id, to_id, relation_type)
             session.expunge(relation)
             return relation
