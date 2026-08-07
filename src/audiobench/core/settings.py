@@ -157,7 +157,7 @@ class AudioBenchSettings(BaseSettings):
 
     # --- AI / LLM ---
     ollama_model: str = Field(
-        default="qwen4-next:110b-cloud",
+        default="gpt-oss:120b-cloud",
         description="Default Ollama model for AI features",
     )
     ollama_base_url: str = Field(
@@ -281,12 +281,12 @@ class AudioBenchSettings(BaseSettings):
             "when word-level timestamps are enabled. Chunking prevents truncation."
         ),
     )
-    align_threshold_min: int = Field(
-        default=15,
-        ge=1,
+    align_threshold_min: float = Field(
+        default=0.5,
+        ge=0.0,
         description=(
             "Audio duration in minutes above which to automatically trigger the hybrid "
-            "forced alignment pipeline when using Gemini."
+            "forced alignment pipeline when using Gemini (e.g. 0.5 = 30 seconds)."
         ),
     )
     align_device: str = Field(

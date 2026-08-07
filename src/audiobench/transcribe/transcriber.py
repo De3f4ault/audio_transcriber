@@ -243,6 +243,37 @@ class TranscriptionPipeline:
                     and not any(s.speaker for s in transcript.segments)
                 ):
                     transcript = self._run_diarization(wav_path, transcript, emit, diarize_mode, diarize_threshold)
+
+                # Heal cached Gemini transcripts that have all-zero timestamps.
+                # This happens when:
+                #   a) A previous alignment run failed (old 1D-array bug), or
+                #   b) The run was interrupted before commit_alignment was called.
+                # On the next invocation the file hits the cache and would be
+                # returned with wrong timestamps — so we re-run alignment here.
+                align_threshold = getattr(self._settings, "align_threshold_min", 0.5) * 60
+                effective_duration = transcript.duration_seconds or metadata.duration_seconds
+                needs_alignment = (
+                    is_gemini
+                    and align is not False
+                    and effective_duration > align_threshold
+                    and all(s.start == 0.0 and s.end == 0.0 for s in transcript.segments)
+                )
+                if needs_alignment:
+                    cached_record = self._repository.find_by_hash(metadata.file_hash)
+                    if cached_record:
+                        emit("aligning", "Aligning timestamps...", 0.0)
+                        logger.info("Cache hit: all timestamps are zero — healing via alignment worker")
+                        self._run_alignment_worker(
+                            tx_id=cached_record.id,
+                            audio_path=file_path,
+                            on_progress=on_segment,
+                            transcript=transcript,
+                        )
+                        # Re-read aligned transcript from DB
+                        refreshed = self._repository.get_by_id(cached_record.id)
+                        if refreshed:
+                            transcript = self._reconstruct_transcript_from_record(refreshed, metadata)
+
                 emit("done", "Retrieved from cache")
                 self._emit_event(
                     job_id,
@@ -252,6 +283,7 @@ class TranscriptionPipeline:
                     duration=int(transcript.duration_seconds),
                 )
                 return transcript
+
 
             # Transcribe
             task = "translate" if translate else "transcribe"
@@ -360,6 +392,8 @@ class TranscriptionPipeline:
             self._repository.commit_transcript_text(tx_id, transcript, chapter_id, privacy_tier=3 if sensitive else 0)
             logger.info("Pipeline: transcript text committed")
 
+            post_processing_degraded = False
+
             if enable_diarization and not is_gemini and not is_concurrent_capable:
                 try:
                     transcript = self._run_diarization(wav_path, transcript, emit, diarize_mode, diarize_threshold)
@@ -367,38 +401,36 @@ class TranscriptionPipeline:
                 except Exception as e:
                     logger.warning("Sequential diarization failed (continuing without): %s", e)
                     self._repository.mark_transcription_degraded(tx_id, str(e), "diarizing")
+                    post_processing_degraded = True
 
             # Post-process: forced alignment (engine-agnostic)
-            align_threshold = getattr(self._settings, "align_threshold_min", 15) * 60
+            align_threshold = getattr(self._settings, "align_threshold_min", 0.5) * 60
+            # Gemini transcripts arrive with duration_seconds=0 (the API doesn't echo timing).
+            # Fall back to the audio file metadata duration for gate decisions.
+            effective_duration = transcript.duration_seconds or (
+                metadata.duration_seconds if metadata else 0.0
+            )
             should_align = (
                 align is True
                 or (align is None
                     and is_gemini
-                    and transcript.duration_seconds > align_threshold)
+                    and effective_duration > align_threshold)
             )
 
             if should_align:
-                try:
-                    from audiobench.transcribe.alignment_pipeline import load_align_model, align_transcript
-                    
-                    emit("aligning", "Aligning timestamps...", 0.0)
-                    logger.info("Pipeline: starting forced alignment")
-                    align_model = load_align_model(device=getattr(self._settings, "align_device", "cpu"))
-                    
-                    transcript = align_transcript(
-                        transcript=transcript,
-                        audio_path=file_path,
-                        model=align_model,
-                        on_progress=on_segment,
-                    )
-                    self._repository.commit_alignment(tx_id, transcript)
-                    logger.info("Pipeline: forced alignment committed")
-                except Exception as exc:
-                    logger.warning("Forced alignment failed — saving transcript without timestamps: %s", exc)
-                    self._repository.mark_transcription_degraded(tx_id, str(exc), "aligning")
-                    if on_segment:
-                        for seg in transcript.segments:
-                            on_segment(seg)
+                emit("aligning", "Aligning timestamps...", 0.0)
+                self._run_alignment_worker(
+                    tx_id=tx_id,
+                    audio_path=file_path,
+                    on_progress=on_segment,
+                    transcript=transcript,
+                )
+                # Re-read the aligned transcript from DB so segment objects
+                # have the updated timestamps for the rest of the pipeline.
+                refreshed = self._repository.get_by_id(tx_id)
+                if refreshed:
+                    transcript = self._reconstruct_transcript_from_record(refreshed, metadata)
+                logger.info("Pipeline: forced alignment committed")
             elif on_segment and is_gemini and align is not False and transcript.duration_seconds > align_threshold:
                 # If align was false but we chunked, fire the segments now
                 for seg in transcript.segments:
@@ -418,6 +450,7 @@ class TranscriptionPipeline:
                 on_phase=emit,
                 privacy_tier=3 if sensitive else 0,
                 audio_metadata=metadata,
+                is_degraded=post_processing_degraded,
             )
             logger.info("Pipeline: saved as transcription #%d", tx_id)
             
@@ -740,6 +773,69 @@ class TranscriptionPipeline:
         logger.info("Pipeline: cache hit for hash %s", metadata.file_hash[:12])
         data = self._repository.get_by_id(cached.id)
         return self._reconstruct_transcript(data, metadata) if data else None
+
+    def _run_alignment_worker(
+        self,
+        tx_id: int,
+        audio_path,
+        on_progress=None,
+        transcript=None,
+    ) -> None:
+        """Run alignment in a fresh subprocess to isolate OOM crashes.
+
+        alignment_worker.py loads its own Python interpreter (no Gemini engine,
+        no daemon models in scope). If it crashes with SIGABRT/bad_alloc the
+        parent catches the non-zero exit and continues — the transcript text is
+        already in the DB at this point, so no data is lost.
+
+        Results are committed to the DB by the worker itself; the caller should
+        re-read the DB record if it needs the updated segment timestamps.
+        """
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        worker = Path(__file__).parent.parent / "daemon" / "alignment_worker.py"
+        cmd = [sys.executable, str(worker), str(tx_id), str(audio_path)]
+
+        logger.info(
+            "Alignment: spawning subprocess — tx_id=%d, audio=%s", tx_id, audio_path
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3600,   # 1-hour hard limit
+            )
+            if result.returncode == 0:
+                logger.info("Alignment worker completed successfully (tx_id=%d)", tx_id)
+            else:
+                logger.warning(
+                    "Alignment worker exited with code %d (tx_id=%d) — "
+                    "transcript saved without word-level timestamps.\n"
+                    "stderr: %s",
+                    result.returncode, tx_id, result.stderr[:500],
+                )
+                if on_progress and transcript:
+                    for seg in transcript.segments:
+                        on_progress(seg)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Alignment worker timed out after 1 hour (tx_id=%d)", tx_id
+            )
+            if on_progress and transcript:
+                for seg in transcript.segments:
+                    on_progress(seg)
+        except Exception as exc:
+            logger.warning("Failed to spawn alignment worker: %s", exc)
+            if on_progress and transcript:
+                for seg in transcript.segments:
+                    on_progress(seg)
+
+    def _reconstruct_transcript_from_record(self, data, metadata=None) -> Transcript:
+        """Re-read a transcript from a DB record dict (post-alignment refresh)."""
+        return self._reconstruct_transcript(data, metadata)
 
     def _run_diarization(self, wav_path: str, transcript: Transcript, emit: Callable, diarize_mode: str = "fast", diarize_threshold: float = 0.65) -> Transcript:
         """Run speaker diarization, returning updated transcript (or original on failure)."""

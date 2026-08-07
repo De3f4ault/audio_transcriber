@@ -1,6 +1,7 @@
 """CLI commands for interacting with the semantic memory system."""
 
 import json
+from pathlib import Path
 
 import click
 from rich.console import Console
@@ -18,6 +19,7 @@ logger = get_logger("cli.memory")
 console = Console()
 
 
+from typing import Any
 import dataclasses
 
 @dataclasses.dataclass
@@ -27,13 +29,26 @@ class SearchSessionState:
     mmr_lambda: float = 0.5
     focus_source: str | None = None
     model: str | None = None
+    diversity_weight: float = 0.4
+    pinned_fragments: dict[int, Any] = dataclasses.field(default_factory=dict)
+    pinned_expr_ids: set[int] = dataclasses.field(default_factory=set)
+
+    # Session persistence fields (populated by _run_search_loop on entry)
+    session_id: int = -1             # DB primary key; -1 means persistence unavailable
+    search_count: int = 0            # incremented per query; 1-indexed sequence_num
+    last_synthesis: str | None = None  # most recent synthesis text (for carryforward)
+    # In-memory search history for offline overlap detection (segment_id sets per search)
+    # Maps sequence_num (1-indexed) -> set of segment_ids from that search
+    search_segment_ids: dict[int, set[int]] = dataclasses.field(default_factory=dict)
+    # Maps source_file -> list of sequence_nums it appeared in
+    search_source_files: dict[str, list[int]] = dataclasses.field(default_factory=dict)
 
     @property
     def mmr_enabled(self) -> bool:
         return self.preset == "synthesis"
 
 
-def _parse_slash_command(line: str, state: SearchSessionState) -> str | None:
+def _parse_slash_command(line: str, state: SearchSessionState, last_sources: list[Any] | None = None) -> str | None:
     """Parse interactive REPL commands to mutate session state.
     
     Returns a feedback message if handled, or None if not a valid command.
@@ -49,8 +64,9 @@ def _parse_slash_command(line: str, state: SearchSessionState) -> str | None:
             return (
                 "\n[dim]"
                 "  /set <fast | balanced | synthesis | deep | default>\n"
-                "  /set model   <ollama-model-name | gemini | default>\n"
-                "  /set mmr     <0.0-1.0>   (switches to synthesis preset)"
+                "  /set model          <ollama-model-name | gemini | default>\n"
+                "  /set mmr            <0.0-1.0>   (switches to synthesis preset)\n"
+                "  /set diversity-weight <0.0-2.0>  (0.0 = pure RRF, 0.4 = default)\n"
                 "[/dim]\n"
             )
             
@@ -94,6 +110,16 @@ def _parse_slash_command(line: str, state: SearchSessionState) -> str | None:
             state.model = val
             return f"[green]Model set to '{val}'[/green]"
                 
+        elif parts[1].lower() in ("diversity-weight", "diversity_weight") and len(parts) >= 3:
+            try:
+                val = float(parts[2])
+                if val < 0.0:
+                    return "[red]diversity-weight must be >= 0.0 (0.0 = pure RRF)[/red]"
+                state.diversity_weight = val
+                return f"[green]Diversity weight set to {val:.2f}[/green]"
+            except ValueError:
+                return "[red]Invalid float value for diversity-weight[/red]"
+                
     elif cmd == "/focus":
         if len(parts) >= 2:
             source = " ".join(parts[1:])
@@ -105,12 +131,114 @@ def _parse_slash_command(line: str, state: SearchSessionState) -> str | None:
         state.focus_source = None
         return "[green]Focus cleared.[/green]"
         
+    elif cmd == "/pin":
+        if len(parts) == 1:
+            return "[red]Usage: /pin <1, 2, ...> (indices of fragments from last search)[/red]"
+        if not last_sources:
+            return "[yellow]No search results available to pin from.[/yellow]"
+        pinned_count = 0
+        for p in parts[1:]:
+            try:
+                idx = int(p)
+                if 1 <= idx <= len(last_sources):
+                    fr = last_sources[idx - 1]
+                    state.pinned_fragments[fr.segment_id] = fr
+                    state.pinned_expr_ids.add(fr.segment_id)
+                    pinned_count += 1
+            except ValueError:
+                continue
+        return f"[green]Pinned {pinned_count} fragment(s). Total pinned: {len(state.pinned_fragments)}[/green]"
+        
+    elif cmd == "/unpin":
+        if len(parts) == 1:
+            return "[red]Usage: /unpin <all | 1, 2, ...>[/red]"
+        if parts[1].lower() in ("all", "reset"):
+            state.pinned_fragments.clear()
+            state.pinned_expr_ids.clear()
+            return "[green]All pins cleared.[/green]"
+        if not last_sources:
+            return "[yellow]No search results available to unpin.[/yellow]"
+        unpinned_count = 0
+        for p in parts[1:]:
+            try:
+                idx = int(p)
+                if 1 <= idx <= len(last_sources):
+                    fr = last_sources[idx - 1]
+                    if fr.segment_id in state.pinned_fragments:
+                        del state.pinned_fragments[fr.segment_id]
+                        state.pinned_expr_ids.discard(fr.segment_id)
+                        unpinned_count += 1
+            except ValueError:
+                continue
+        return f"[green]Unpinned {unpinned_count} fragment(s). Total pinned: {len(state.pinned_fragments)}[/green]"
+        
+    elif cmd == "/pins":
+        if not state.pinned_fragments:
+            return "[dim]No fragments currently pinned.[/dim]"
+        lines = [f"[bold]Pinned Fragments ({len(state.pinned_fragments)}):[/bold]"]
+        for idx, fr in enumerate(state.pinned_fragments.values(), 1):
+            src = f" ({_short_source(fr.source_file)})" if getattr(fr, "source_file", None) else ""
+            lines.append(f"  [cyan]{idx}.[/cyan] [dim]#{fr.segment_id}[/dim]{src} — {fr.text[:60]}...")
+        return "\n".join(lines)
+        
     elif cmd == "/forget":
         state.preset = "balanced"
         state.mmr_lambda = 0.5
         state.focus_source = None
+        state.diversity_weight = 0.4
+        state.pinned_fragments.clear()
+        state.pinned_expr_ids.clear()
         return "[green]Session state reset to defaults.[/green]"
         
+    elif cmd == "/history":
+        # List queries in the current session
+        if state.search_count == 0:
+            return "[dim]No searches yet in this session.[/dim]"
+        lines = [f"[bold]Session history ({state.search_count} search{'es' if state.search_count != 1 else ''}):[/bold]"]
+        # search_segment_ids keys are sequence numbers
+        for seq in sorted(state.search_segment_ids.keys()):
+            n_frags = len(state.search_segment_ids[seq])
+            lines.append(f"  [cyan]S{seq}[/cyan]  {n_frags} fragment{'s' if n_frags != 1 else ''}")
+        return "\n".join(lines)
+
+    elif cmd == "/sessions":
+        # List recent sessions from DB
+        try:
+            from audiobench.memory.session_store import list_sessions
+            sessions = list_sessions(limit=15)
+            if not sessions:
+                return "[dim]No sessions found.[/dim]"
+            lines = [f"[bold]Recent search sessions:[/bold]"]
+            for s in sessions:
+                title = s.title or "[dim](untitled)[/dim]"
+                dt = s.created_at[:10] if s.created_at else "?"
+                lines.append(
+                    f"  [cyan]#{s.session_id}[/cyan]  {dt}  {title}  "
+                    f"[dim]{s.query_count} search{'es' if s.query_count != 1 else ''}[/dim]"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return f"[red]Failed to load sessions: {e}[/red]"
+
+    elif cmd == "/summary":
+        # Summarize the current session trajectory
+        if state.search_count == 0:
+            return "[dim]No searches yet in this session to summarize.[/dim]"
+        # Build mechanical summary (always available, offline-safe)
+        lines = [f"[bold]Session summary ({state.search_count} searches):[/bold]"]
+        for seq in sorted(state.search_segment_ids.keys()):
+            lines.append(f"  S{seq}: {len(state.search_segment_ids[seq])} fragments")
+        # Show cross-search source overlaps
+        overlapping = [
+            (src, seqs) for src, seqs in state.search_source_files.items() if len(seqs) > 1
+        ]
+        if overlapping:
+            lines.append("\n[bold]Sources across multiple searches:[/bold]")
+            for src, seqs in overlapping:
+                short = Path(src).stem if src else src
+                lines.append(f"  {short}  [dim]→ S{', S'.join(str(s) for s in seqs)}[/dim]")
+        return "\n".join(lines)
+
     return f"[dim]Unknown command: {cmd}[/dim]"
 
 
@@ -224,7 +352,25 @@ def search(
     engine = ResearchEngine()
     state = SearchSessionState(preset=preset, initial_preset=preset, model=model)
 
+    # Create a persistent session for this invocation (always — no menu, no /save).
+    # Both interactive REPL and standalone command invocations go through here,
+    # ensuring unified persistence regardless of how search was invoked.
+    try:
+        from audiobench.memory.session_store import create_session
+        state.session_id = create_session(preset=preset)
+    except Exception as e:
+        logger.warning("Session persistence unavailable: %s", e)
+        state.session_id = -1
+
     _run_search_loop(engine, query, state)
+
+    # Close the session on exit
+    if state.session_id >= 0:
+        try:
+            from audiobench.memory.session_store import close_session
+            close_session(state.session_id)
+        except Exception as e:
+            logger.warning("Failed to close session: %s", e)
 
 
 @memory.command()
@@ -263,6 +409,39 @@ def threads() -> None:
         console.print(table)
     else:
         console.print("No open threads found.")
+
+
+@memory.command(name="sessions")
+@click.option("--limit", default=20, show_default=True, help="Max sessions to show.")
+def sessions_cmd(limit: int) -> None:
+    """List recent search sessions."""
+    try:
+        from audiobench.memory.session_store import list_sessions
+        sessions = list_sessions(limit=limit)
+    except Exception as e:
+        console.print(f"[red]Failed to load sessions: {e}[/red]")
+        return
+
+    if not sessions:
+        console.print("[dim]No search sessions found. Run 'audiobench memory search' to start one.[/dim]")
+        return
+
+    table = Table(title="Search Sessions", show_lines=False, box=None)
+    table.add_column("ID", style="cyan", no_wrap=True, width=6)
+    table.add_column("Date", style="dim", no_wrap=True, width=10)
+    table.add_column("Title", no_wrap=False)
+    table.add_column("Searches", style="dim", justify="right", width=8)
+    table.add_column("Preset", style="dim", width=10)
+
+    for s in sessions:
+        dt = s.created_at[:10] if s.created_at else "?"
+        title = s.title or "[dim](untitled)[/dim]"
+        n = str(s.query_count)
+        table.add_row(f"#{s.session_id}", dt, title, n, s.preset)
+
+    console.print()
+    console.print(table)
+    console.print()
 
 
 @memory.command()
@@ -439,18 +618,33 @@ _STREAM_COLORS: dict[str, str] = {
 }
 
 
-def _display_results(result: "ResearchResult") -> None:  # type: ignore[name-defined]
-    """Render a ResearchResult to stdout.
+def _display_results(result: "ResearchResult", state: SearchSessionState | None = None) -> None:  # type: ignore[name-defined]
+    """Render a ResearchResult using source-grouped layout (Option Z).
 
-    Layout: fragments list first (with source + stream badges), answer panel last.
-    On synthesis failure: show a ⚠ warning banner instead of the answer.
-    Streams that returned 0 results get a ✗ badge so the user knows what ran.
+    Fragments are grouped by source file, ordered by group relevance (max
+    rrf_score descending), chronological within each group.  Full fragment
+    text is displayed without truncation, wrapped to terminal width.
+
+    Online:  grouped fragments above, synthesis panel below.
+    Offline: grouped fragments only.  No error panel — the absence of a
+             synthesis panel is itself the signal. No apology. No red banner.
+
+    # ROADMAP [Phase 2]: Add `/view compact` toggle — `view_mode: str = "rich"` in
+    # SearchSessionState. Compact = 2-line snippet per fragment inside group box.
+    # Auto-rich when synthesis_failed=True; auto-compact when synthesis succeeded.
+    #
+    # ROADMAP [Phase 3]: Surface parent chunk context per fragment (Option C).
+    # Parent is already fetched in ResearchEngine — pass it through FusedResult
+    # or fetch at display time via ExpressionRepository.get_parents_batch().
     """
-    from audiobench.memory.query_engine import ResearchResult  # local to avoid cycle
+    import shutil
+    import textwrap
+    from collections import defaultdict
+    from rich.panel import Panel
 
     console.print()
 
-    # ── HyDE fallback notice (dim, single line) ───────────────────────────────
+    # ── HyDE notice ──────────────────────────────────────────────────────────
     if result.hyde_fallback:
         console.print(
             "[dim yellow]⚠  HyDE unavailable — falling back to direct query embedding[/dim yellow]"
@@ -461,78 +655,151 @@ def _display_results(result: "ResearchResult") -> None:  # type: ignore[name-def
                 f"[italic]{result.hyde_document}[/italic]",
                 title="[dim]HyDE Generation[/dim]",
                 border_style="dim",
-                expand=False,
+                expand=True,
             )
         )
 
-    # ── Fragments ─────────────────────────────────────────────────────────────
-    if result.sources:
-        # Build skipped-stream suffix for header
-        skipped_note = ""
-        if result.streams_skipped:
-            # result.streams_skipped is a list of tuples: (name, reason)
-            skipped_labels_list = []
-            for s_name, s_reason in result.streams_skipped:
-                if s_reason == "0 hits":
-                    skipped_labels_list.append(f"[dim red]{s_name}✗[/dim red]")
-                else:
-                    skipped_labels_list.append(f"[dim red]{s_name}✗[/dim red] [dim]({s_reason})[/dim]")
-            
-            skipped_labels = " ".join(skipped_labels_list)
-            skipped_note = f"  {skipped_labels}"
+    if not result.sources:
+        console.print("[dim]No results found.[/dim]")
+        console.print()
+        return
 
-        console.print(f"[bold]Fragments ({len(result.sources)})[/bold]{skipped_note}")
-        for i, fr in enumerate(result.sources, 1):
-            ts = f"{_fmt_timestamp(fr.start_time)} → {_fmt_timestamp(fr.end_time)}"
-            score_str = f"[dim](rrf: {fr.rrf_score:.4f})[/dim]"
-            snippet = fr.text[:120].replace("\n", " ")
-            if len(fr.text) > 120:
-                snippet += "…"
+    term_width = shutil.get_terminal_size().columns
 
-            # Source label
-            source_label = ""
-            if fr.source_file:
-                source_label = f"  [dim]{_short_source(fr.source_file)}[/dim]"
+    # ── Header bar ────────────────────────────────────────────────────────────
+    n_frags = len(result.sources)
+    # Unique source names, order preserved, deduped
+    seen: dict[str, None] = {}
+    for fr in result.sources:
+        if fr.source_file:
+            seen[fr.source_file] = None
+    n_sources = len(seen)
 
-            # Stream contribution badges (streams that DID return this hit)
+    elapsed = f"{result.retrieval_time_seconds:.2f}s retrieval"
+    header_parts = [f"{n_frags} fragment{'s' if n_frags != 1 else ''}"]
+    if n_sources > 1:
+        header_parts.append(f"{n_sources} sources")
+    header_parts.append(elapsed)
+
+    skipped_markup = ""
+    if result.streams_skipped:
+        parts = [f"[dim red]{name}✗[/dim red]" for name, _ in result.streams_skipped]
+        skipped_markup = "  " + "  ".join(parts)
+
+    console.print(f"[dim]{' · '.join(header_parts)}[/dim]{skipped_markup}")
+    console.rule(style="dim")
+    console.print()
+
+    # ── Group fragments by source ─────────────────────────────────────────────
+    # Preserve 1-based global indices so /pin <n> and E reader work correctly
+    groups: dict[str, list[tuple[int, object]]] = defaultdict(list)
+    for idx, fr in enumerate(result.sources, 1):
+        groups[fr.source_file].append((idx, fr))  # type: ignore[union-attr]
+
+    # Order groups by max rrf_score — relevance earned by retrieval
+    ordered_sources = sorted(
+        groups.keys(),
+        key=lambda sf: max(fr.rrf_score for _, fr in groups[sf]),  # type: ignore[union-attr]
+        reverse=True,
+    )
+
+    # Wrap width: terminal minus panel borders (2) and padding (4 each side)
+    wrap_width = max(40, term_width - 10)
+
+    # ── Render each source group ──────────────────────────────────────────────
+    for source_file in ordered_sources:
+        group = groups[source_file]
+        # Chronological within group — narrative order
+        group_sorted = sorted(group, key=lambda x: x[1].start_time)  # type: ignore[union-attr]
+
+        source_name   = _short_source(source_file) if source_file else "Unknown source"
+        n_group       = len(group_sorted)
+        group_max_rrf = max(fr.rrf_score for _, fr in group_sorted)  # type: ignore[union-attr]
+
+        lines: list[str] = []
+        for frag_pos, (global_idx, fr) in enumerate(group_sorted):
+            ts = f"[cyan]{_fmt_timestamp(fr.start_time)} → {_fmt_timestamp(fr.end_time)}[/cyan]"  # type: ignore[union-attr]
+
+            # Stream badges
             badges = ""
-            if fr.stream_contributions:
-                parts = []
-                for stream, rank in fr.stream_contributions:
+            if fr.stream_contributions:  # type: ignore[union-attr]
+                badge_parts = []
+                for stream, rank in fr.stream_contributions:  # type: ignore[union-attr]
                     color = _STREAM_COLORS.get(stream, "white")
-                    parts.append(f"[{color}]{stream}[/{color}][dim]#{rank}[/dim]")
-                badges = "  " + " ".join(parts)
+                    badge_parts.append(f"[{color}]{stream}[/{color}][dim]#{rank}[/dim]")
+                badges = "  " + " ".join(badge_parts)
 
-            console.print(
-                f"  [bold]{i}.[/bold] [cyan]{ts}[/cyan] {score_str}{badges}{source_label}\n"
-                f"     [italic]{snippet}[/italic]"
+            pin_badge = ""
+            if state and fr.segment_id in state.pinned_fragments:  # type: ignore[union-attr]
+                pin_badge = "  [bold green]📌[/bold green]"
+
+            # Overlap badge: segment appeared in a prior search in this session
+            overlap_badge = ""
+            if state and state.search_count > 1:  # only meaningful after first search
+                # Check prior searches (all except the current, which hasn't been recorded yet
+                # since overlap tracking happens after display is called)
+                prior_seqs = [
+                    s for s in state.search_segment_ids
+                    if fr.segment_id in state.search_segment_ids[s]  # type: ignore[union-attr]
+                ]
+                if prior_seqs:
+                    seq_labels = ",".join(f"S{s}" for s in sorted(prior_seqs))
+                    overlap_badge = f"  [dim yellow]↩{seq_labels}[/dim yellow]"
+
+            # Meta line: global index · timestamp · stream badges · pin · overlap
+            lines.append(
+                f"  [bold cyan]{global_idx}[/bold cyan]  {ts}{badges}{pin_badge}{overlap_badge}"
             )
+
+            # Full text — no truncation, wrapped to terminal width
+            raw_text = fr.text.replace("\n", " ").strip()  # type: ignore[union-attr]
+            wrapped  = textwrap.fill(raw_text, width=wrap_width)
+            for text_line in wrapped.split("\n"):
+                lines.append(f"     {text_line}")
+
+            if frag_pos < len(group_sorted) - 1:
+                lines.append("")  # blank separator between fragments
+
+        # Source-level overlap: did this source appear in prior searches?
+        source_overlap_note = ""
+        if state and state.search_count > 1 and source_file:
+            prior_source_seqs = [
+                s for s in state.search_source_files.get(source_file, [])
+                if s < state.search_count  # prior searches only
+            ]
+            if prior_source_seqs:
+                seq_labels = ", ".join(f"S{s}" for s in sorted(prior_source_seqs))
+                source_overlap_note = f"  [dim yellow](also in {seq_labels})[/dim yellow]"
+
+        group_header = (
+            f"[dim]──[/dim] [bold]{source_name}[/bold]"
+            f"  [dim]{n_group} fragment{'s' if n_group != 1 else ''}[/dim]"
+            f"{source_overlap_note}"
+        )
+        console.print(group_header)
+        console.print("\n".join(lines))
         console.print()
 
-    # ── Answer (always last) ──────────────────────────────────────────────────
-    if result.synthesis_failed or result.answer is None:
-        console.print(
-            Panel(
-                f"[bold yellow]⚠ Synthesis failed[/bold yellow]\n"
-                f"[dim]{result.synthesis_error or 'Unknown error'}[/dim]\n\n"
-                "[italic]Showing raw fragments instead.[/italic]",
-                title="[bold red]Synthesis Failed[/bold red]",
-                border_style="red",
-                expand=False,
-            )
-        )
-    else:
+    # ── Synthesis panel ───────────────────────────────────────────────────────
+    # Offline / no LLM → synthesis_failed=True → render nothing here.
+    # The absence of this panel is the signal. No error. No apology.
+    if not result.synthesis_failed and result.answer is not None:
         from rich.markdown import Markdown as RichMarkdown
         from audiobench.cli.display.theme import CHAT_CODE_THEME
 
         console.print(
             Panel(
                 RichMarkdown(result.answer, code_theme=CHAT_CODE_THEME),
-                title=f"[bold cyan]Answer[/bold cyan] [dim]({result.query_time_seconds:.2f}s)[/dim]",
+                title=(
+                    f"[bold cyan]Answer[/bold cyan] "
+                    f"[dim]({result.synthesis_time_seconds:.2f}s synthesis)[/dim]"
+                ),
                 border_style="cyan",
-                expand=False,
+                expand=True,
             )
         )
+    console.print()
+    console.print(f"[dim]Total search time: {result.query_time_seconds:.2f}s[/dim]")
     console.print()
 
 
@@ -726,13 +993,13 @@ def _find_related(
     if not preset:
         return None
 
-    from audiobench.memory.query_engine import MemorySearchEngine
-    engine = MemorySearchEngine()
+    from audiobench.memory.query_engine import ResearchEngine
+    engine = ResearchEngine()
 
     with console.status(f"[cyan]Finding related fragments (preset={preset})...[/cyan]"):
         try:
             res = engine.search(fr.text, top_k=10, preset=preset)
-            hits = res.fused
+            hits = res.sources
         except Exception as exc:  # noqa: BLE001
             console.print(f"\n  [red]Related search failed: {exc}[/red]")
             console.print("  [dim]Press any key to continue…[/dim]")
@@ -1030,10 +1297,53 @@ def _run_search_loop(engine: "ResearchEngine", query: str, state: SearchSessionS
                 preset=active_preset,
                 mmr_lambda=state.mmr_lambda,
                 focus_source=state.focus_source,
-                model=state.model
+                model=state.model,
+                diversity_weight=state.diversity_weight,
+                pinned_fragments=list(state.pinned_fragments.values()),
+                prior_synthesis=state.last_synthesis,  # synthesis carryforward
             )
-            
-        _display_results(result)
+
+        # ── Session persistence ───────────────────────────────────────────────
+        state.search_count += 1
+        seq = state.search_count
+
+        # Update last_synthesis for carryforward on next search
+        if result.answer and not result.synthesis_failed:
+            state.last_synthesis = result.answer
+
+        # Update in-memory overlap tracking (offline-safe)
+        seg_ids = {fr.segment_id for fr in result.sources}
+        state.search_segment_ids[seq] = seg_ids
+        for fr in result.sources:
+            if fr.source_file:
+                state.search_source_files.setdefault(fr.source_file, [])
+                if seq not in state.search_source_files[fr.source_file]:
+                    state.search_source_files[fr.source_file].append(seq)
+
+        # Persist to DB (non-blocking on failure)
+        if state.session_id >= 0:
+            try:
+                from audiobench.memory.session_store import (
+                    persist_fragments,
+                    persist_query,
+                    set_session_title,
+                )
+                query_id = persist_query(
+                    session_id=state.session_id,
+                    sequence_num=seq,
+                    query_text=query,
+                    preset=active_preset,
+                    result=result,
+                )
+                if result.sources:
+                    persist_fragments(query_id, result.sources)
+                # Set title from first query
+                if seq == 1:
+                    set_session_title(state.session_id, query)
+            except Exception as e:
+                logger.warning("Failed to persist search query: %s", e)
+
+        _display_results(result, state)
 
         if not result.sources:
             return
@@ -1043,7 +1353,7 @@ def _run_search_loop(engine: "ResearchEngine", query: str, state: SearchSessionS
             console.print(
                 "[dim]Press [bold]Enter[/bold] re-run · [bold]E[/bold] reader · "
                 "[bold]S[/bold] new search · [bold]C[/bold] open chat · [bold]Q[/bold] quit  |  "
-                "or type [bold]/set[/bold] / [bold]/focus[/bold][/dim]"
+                "or type [bold]/set[/bold] / [bold]/focus[/bold] / [bold]/pin[/bold][/dim]"
             )
             try:
                 choice = input("  › ").strip()
@@ -1059,13 +1369,20 @@ def _run_search_loop(engine: "ResearchEngine", query: str, state: SearchSessionS
                     console.print()
                     break  # re-run outer loop with new query
                     
-                msg = _parse_slash_command(choice, state)
+                msg = _parse_slash_command(choice, state, last_sources=result.sources)
                 if msg:
                     console.print(f"  {msg}")
                 continue
 
             choice_upper = choice.upper()
             if choice_upper == "Q":
+                # Close session before returning
+                if state.session_id >= 0:
+                    try:
+                        from audiobench.memory.session_store import close_session
+                        close_session(state.session_id)
+                    except Exception:
+                        pass
                 return
             elif choice_upper == "E":
                 _open_fragment_reader(console, result.sources, initial_idx=0)

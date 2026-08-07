@@ -9,6 +9,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -52,6 +53,13 @@ _CHUNK_DURATION_ALIGN = 15 * 60  # 15 minutes per chunk for alignment
 # to 45 minutes (from 20 min). Long files still benefit from chunking due
 # to the model's practical output-token limit per request.
 _CHUNK_THRESHOLD_DEFAULT = 45 * 60  # 45 minutes (seconds)
+
+# ── Ephemeral chunk cache ────────────────────────────────────
+# Stores successfully transcribed chunks as JSON so a failed run
+# can be resumed without re-sending already-completed chunks.
+def _get_cache_dir() -> Path:
+    from audiobench.core.settings import get_settings
+    return get_settings().data_dir / "cache" / "chunks"
 
 from audiobench.core.constants import get_mime
 
@@ -180,7 +188,7 @@ class GeminiEngine(TranscriptionEngine):
         # ── Auto-trigger logic for alignment ────────────────
         from audiobench.core.settings import get_settings
         settings = get_settings()
-        align_threshold = getattr(settings, "align_threshold_min", 15) * 60
+        align_threshold = getattr(settings, "align_threshold_min", 0.5) * 60
         
         from audiobench.transcribe.audio_converter import probe
 
@@ -225,6 +233,88 @@ class GeminiEngine(TranscriptionEngine):
             )
 
         return self._transcribe_single(audio_path, prompt, on_phase, on_segment)
+
+    # ── Chunk cache helpers ─────────────────────────────────
+
+    @staticmethod
+    def _file_identity_prefix(audio_path: Path) -> str:
+        """16-char prefix that identifies this audio file at this point in time.
+
+        Incorporates path, file size, and mtime so the prefix changes if the
+        file is edited, renamed, or replaced with a different recording.
+        Used to group and scan all cached chunks belonging to one file.
+        """
+        stat = audio_path.stat()
+        raw = f"{audio_path.resolve()}\0{stat.st_size}\0{stat.st_mtime:.6f}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _chunk_cache_key(
+        audio_path: Path,
+        chunk_index: int,
+        time_offset: float,
+        model_name: str,
+        prompt: str,
+        language: str | None,
+        task: str,
+        diarize: bool,
+    ) -> str:
+        """Full deterministic cache key for one specific chunk."""
+        prefix = GeminiEngine._file_identity_prefix(audio_path)
+        chunk_raw = (
+            f"{prefix}\0{chunk_index}\0{time_offset:.3f}\0"
+            f"{model_name}\0{prompt}\0{language}\0{task}\0{diarize}"
+        )
+        chunk_hash = hashlib.sha256(chunk_raw.encode()).hexdigest()[:32]
+        return f"{prefix}_{chunk_hash}"
+
+    @staticmethod
+    def _load_chunk_from_cache(key: str) -> Transcript | None:
+        """Return a cached Transcript, or None on miss or any read error."""
+        path = _get_cache_dir() / f"{key}.json"
+        if not path.exists():
+            return None
+        try:
+            return Transcript.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Chunk cache read failed for %s (ignoring): %s", key, exc)
+            return None
+
+    @staticmethod
+    def _save_chunk_to_cache(key: str, transcript: Transcript) -> None:
+        """Persist a chunk transcript to disk atomically (write-then-rename)."""
+        d = _get_cache_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{key}.json"
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(transcript.model_dump_json(), encoding="utf-8")
+            tmp.rename(path)
+        except Exception as exc:
+            logger.warning("Chunk cache write failed for %s (non-fatal): %s", key, exc)
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def count_cached_chunks(audio_path: Path) -> int:
+        """Return how many chunk cache files exist for this audio file."""
+        d = _get_cache_dir()
+        if not d.exists():
+            return 0
+        prefix = GeminiEngine._file_identity_prefix(audio_path)
+        return sum(1 for _ in d.glob(f"{prefix}_*.json"))
+
+    @staticmethod
+    def clear_chunk_cache(audio_path: Path) -> int:
+        """Delete all chunk cache files for this audio file. Returns count deleted."""
+        d = _get_cache_dir()
+        if not d.exists():
+            return 0
+        prefix = GeminiEngine._file_identity_prefix(audio_path)
+        count = 0
+        for f in d.glob(f"{prefix}_*.json"):
+            f.unlink(missing_ok=True)
+            count += 1
+        return count
 
     # ── Retry-wrapped generate call ─────────────────────────
 
@@ -543,22 +633,43 @@ class GeminiEngine(TranscriptionEngine):
                 )
 
                 try:
-                    # Don't forward on_phase or on_segment to individual chunks —
-                    # _transcribe_chunked already emits chunk-level progress.
-                    transcript = self._transcribe_single(
-                        chunk_path,
-                        prompt,
-                        None,
-                        None,
+                    cache_key = self._chunk_cache_key(
+                        audio_path, i, time_offset,
+                        model_name=self._model_name,
+                        prompt=prompt,
+                        language=None,
+                        task="transcribe",
+                        diarize=False,
                     )
+                    transcript = self._load_chunk_from_cache(cache_key)
+                    if transcript is not None:
+                        logger.info(
+                            "Chunk %d/%d loaded from cache (skipping API call)",
+                            i + 1, len(chunks),
+                        )
+                        if on_phase and callable(on_phase):
+                            on_phase(
+                                "transcribing",
+                                f"Chunk {i + 1}/{len(chunks)} loaded from cache",
+                                (i + 1) / len(chunks),
+                            )
+                    else:
+                        transcript = self._transcribe_single(
+                            chunk_path,
+                            prompt,
+                            None,
+                            None,
+                        )
+                        self._save_chunk_to_cache(cache_key, transcript)
                     chunk_results.append((transcript, time_offset))
                 except EngineError as e:
-                    logger.warning(
-                        "Chunk %d/%d failed (skipping): %s",
+                    logger.error(
+                        "Chunk %d/%d failed — aborting run: %s",
                         i + 1,
                         len(chunks),
                         e,
                     )
+                    raise
         finally:
             # Clean up chunk temp files (but not the original).
             if chunk_dir and chunk_dir != audio_path.parent:
@@ -639,12 +750,34 @@ class GeminiEngine(TranscriptionEngine):
                 logger.info("Transcribing chunk %d/%d (15-min): %s", i + 1, len(chunks), chunk_path.name)
 
                 try:
-                    chunk_transcript = self._transcribe_single(
-                        chunk_path,
-                        prompt,
-                        None,
-                        None,  # No on_segment yet because timestamps are 0.0
+                    cache_key = self._chunk_cache_key(
+                        audio_path, i, time_offset,
+                        model_name=self._model_name,
+                        prompt=prompt,
+                        language=language,
+                        task="transcribe",
+                        diarize=False,
                     )
+                    chunk_transcript = self._load_chunk_from_cache(cache_key)
+                    if chunk_transcript is not None:
+                        logger.info(
+                            "Chunk %d/%d loaded from cache (skipping API call)",
+                            i + 1, len(chunks),
+                        )
+                        if on_phase and callable(on_phase):
+                            on_phase(
+                                "transcribing",
+                                f"Chunk {i + 1}/{len(chunks)} loaded from cache",
+                                (i + 1) / len(chunks),
+                            )
+                    else:
+                        chunk_transcript = self._transcribe_single(
+                            chunk_path,
+                            prompt,
+                            None,
+                            None,  # No on_segment yet because timestamps are 0.0
+                        )
+                        self._save_chunk_to_cache(cache_key, chunk_transcript)
                     
                     if chunk_transcript.language and chunk_transcript.language != "en":
                         detected_language = chunk_transcript.language
@@ -668,7 +801,16 @@ class GeminiEngine(TranscriptionEngine):
                         total_words += len(seg.text.split())
 
                 except EngineError as e:
-                    logger.warning("Chunk %d/%d failed (skipping): %s", i + 1, len(chunks), e)
+                    # Re-raise immediately — same reasoning as _transcribe_chunked:
+                    # post-tenacity errors are session-fatal and skipping produces
+                    # a silently incomplete text corpus fed to the alignment pipeline.
+                    logger.error(
+                        "Chunk %d/%d failed — aborting text-only run: %s",
+                        i + 1,
+                        len(chunks),
+                        e,
+                    )
+                    raise
                     
         finally:
             if chunk_dir and chunk_dir != audio_path.parent:
@@ -1013,6 +1155,35 @@ class GeminiEngine(TranscriptionEngine):
         full_text_parts: list[str] = []
         total_words = 0
 
+        def _collapse_repetitions(text: str, max_repeats: int = 2) -> str:
+            import re
+            # Split by common sentence terminators and keep the delimiters attached.
+            # Using a regex that splits after ., !, or ? followed by space(s).
+            parts = re.split(r'(?<=[.!?])\s+', text.strip())
+            sentences = [p.strip() for p in parts if p.strip()]
+            
+            if not sentences:
+                return text
+                
+            deduped = []
+            current_sentence = None
+            count = 0
+            
+            for s in sentences:
+                s_lower = s.lower()
+                if s_lower == current_sentence:
+                    count += 1
+                    if count <= max_repeats:
+                        deduped.append(s)
+                else:
+                    current_sentence = s_lower
+                    count = 1
+                    deduped.append(s)
+                    
+            # If the entire text was just one sentence repeated without punctuation,
+            # this basic filter won't catch it, but most LLM loops include punctuation.
+            return " ".join(deduped)
+
         def _safe_float(val: Any, default: float = 0.0) -> float:
             try:
                 return float(val)
@@ -1035,10 +1206,17 @@ class GeminiEngine(TranscriptionEngine):
             except (ValueError, TypeError):
                 return default
 
+        last_seg_text = None
         for seg_data in raw_segments:
             seg_text = seg_data.get("text", "").strip()
-            if not seg_text:
+            
+            if seg_text:
+                seg_text = _collapse_repetitions(seg_text)
+                
+            if not seg_text or seg_text.lower() == last_seg_text:
                 continue
+                
+            last_seg_text = seg_text.lower()
 
             words: list[Word] = []
             for w in seg_data.get("words", []):
