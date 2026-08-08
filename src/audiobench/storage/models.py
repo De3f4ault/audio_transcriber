@@ -61,6 +61,9 @@ class AudioFileRecord(Base):
     work_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("works.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    youtube_video_id: Mapped[str | None] = mapped_column(
+        String(11), unique=True, nullable=True, index=True
+    )
 
     # Relationships
     work: Mapped[WorkRecord | None] = relationship(back_populates="audio_files")
@@ -729,7 +732,7 @@ class StudyProject(Base):
 
     # Relationships
     audio_file: Mapped[AudioFileRecord] = relationship()
-    sessions: Mapped[list["StudySession"]] = relationship(
+    sessions: Mapped[list[StudySession]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
 
@@ -760,3 +763,19 @@ class StudySession(Base):
     # Relationships
     project: Mapped[StudyProject] = relationship(back_populates="sessions")
     memoir: Mapped[ExpressionRecord | None] = relationship()
+
+
+class YouTubeChannel(Base):
+    """A cached YouTube channel resolution."""
+
+    __tablename__ = "youtube_channels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    query: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    def __repr__(self) -> str:
+        return f"<YouTubeChannel(query='{self.query}', id='{self.channel_id}')>"
+

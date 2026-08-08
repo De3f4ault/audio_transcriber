@@ -254,6 +254,12 @@ class AudioBenchSettings(BaseSettings):
         description="Transcription engine: whisper (local) or gemini (cloud)",
     )
 
+    # --- YouTube (optional) ---
+    youtube_api_key: str | None = Field(
+        default=None,
+        description="API key for YouTube Data API v3",
+    )
+
     # --- Google Gemini (optional cloud engine) ---
     gemini_api_key: str | None = Field(
         default=None,
@@ -575,7 +581,7 @@ def get_settings() -> AudioBenchSettings:
         env_key = f"AUDIOBENCH_{key.upper()}"
         if env_key in os.environ:
             del json_data[key]
-            
+
     # Also explicitly check for HF_TOKEN
     if "HF_TOKEN" in os.environ and "hf_token" in json_data:
         del json_data["hf_token"]
