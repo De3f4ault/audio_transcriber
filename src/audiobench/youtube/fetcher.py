@@ -81,42 +81,22 @@ def download_audio(video_id: str, output_dir: Path, progress_cb: Any = None) -> 
     ]
 
     import re
-    from rich.progress import Progress, TextColumn, BarColumn
-
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    
+    # Regex to capture the final filename
+    dest_re = re.compile(r"\[(?:ExtractAudio|download)\] Destination:\s+(.+\.m4a)")
     final_path = None
 
-    with Progress(
-        TextColumn("[bold blue]{task.description}", justify="right"),
-        BarColumn(bar_width=None),
-        "[progress.percentage]{task.percentage:>3.1f}%",
-        console=console,
-        expand=True,
-    ) as progress:
-        task_id = progress.add_task("Downloading", total=100.0)
+    for line in process.stdout:
+        print(line, end="", flush=True)  # Stream to log file
         
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        
-        # Regex to parse standard yt-dlp progress line:
-        # [download]  15.3% of ~  20.00MiB at    1.50MiB/s ETA 00:15
-        progress_re = re.compile(r"\[download\]\s+(?P<percent>[0-9\.]+)")
-        # Regex to capture the final filename
-        dest_re = re.compile(r"\[(?:ExtractAudio|download)\] Destination:\s+(.+\.m4a)")
+        d_match = dest_re.search(line)
+        if d_match:
+            final_path = d_match.group(1)
 
-        for line in process.stdout:
-            # Check for progress percentage
-            p_match = progress_re.search(line)
-            if p_match:
-                pct = float(p_match.group("percent"))
-                progress.update(task_id, completed=pct)
-            
-            # Check for final destination
-            d_match = dest_re.search(line)
-            if d_match:
-                final_path = d_match.group(1)
-
-        process.wait()
+    process.wait()
 
     if process.returncode != 0:
         raise RuntimeError(f"Failed to download video {video_id}")
@@ -185,6 +165,11 @@ def fetch_and_register(video_id: str, session: Any) -> tuple[AudioFileRecord | N
         session.add(job_record)
         
         session.commit()
+        
+        # Now that transcription is queued, kick off the daemon worker
+        from audiobench.jobs.queue_worker import _spawn_daemon
+        _spawn_daemon()
+        
         return audio_record, job_record
     except Exception as e:
         session.rollback()

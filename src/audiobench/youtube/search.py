@@ -40,14 +40,15 @@ def _get_api_key() -> str:
     return key
 
 
-def resolve_channel(query: str, session: Any) -> tuple[str, str]:
+def resolve_channel(query: str, session: Any, no_cache: bool = False) -> tuple[str, str]:
     """Resolve a channel name to a channel_id. Caches the result in the database."""
     normalized_query = query.strip().lower()
 
-    # 1. Check Cache
-    cached = session.query(YouTubeChannel).filter_by(query=normalized_query).first()
-    if cached:
-        return cached.channel_id, cached.title or query
+    if not no_cache:
+        # 1. Check Cache
+        cached = session.query(YouTubeChannel).filter_by(query=normalized_query).first()
+        if cached:
+            return cached.channel_id, cached.title or query
 
     # 2. Hit API
     api_key = _get_api_key()
@@ -102,7 +103,15 @@ def _parse_duration(pt_duration: str) -> str:
     return f"{m}:{s:02d}"
 
 
-def search_videos(query: str, channel_id: str | None = None, max_results: int = 15, progress_callback=None) -> list[VideoResult]:
+def search_videos(
+    query: str, 
+    channel_id: str | None = None, 
+    max_results: int = 15, 
+    progress_callback=None,
+    sort: str = "relevance",
+    after: str | None = None,
+    before: str | None = None
+) -> list[VideoResult]:
     """Search for videos via the YouTube Data API."""
     api_key = _get_api_key()
     
@@ -116,10 +125,21 @@ def search_videos(query: str, channel_id: str | None = None, max_results: int = 
         "q": query,
         "type": "video",
         "maxResults": max_results,
+        "order": sort,
         "key": api_key,
     }
     if channel_id:
         params["channelId"] = channel_id
+    
+    def _format_date(d: str) -> str:
+        if len(d) == 10:
+            return f"{d}T00:00:00Z"
+        return d
+        
+    if after:
+        params["publishedAfter"] = _format_date(after)
+    if before:
+        params["publishedBefore"] = _format_date(before)
 
     response = httpx.get(search_url, params=params, timeout=10.0)
     if response.status_code != 200:

@@ -16,10 +16,17 @@ from audiobench.youtube.search import (
 )
 from audiobench.storage.models import YouTubeChannel
 
-@click.group(name="youtube")
-def youtube_group():
+@click.group(name="youtube", invoke_without_command=True)
+@click.option("--job-id", type=int, hidden=True)
+@click.pass_context
+def youtube_group(ctx, job_id):
     """YouTube integration: search and fetch videos."""
-    pass
+    ctx.ensure_object(dict)
+    ctx.obj["job_id"] = job_id
+    
+    if ctx.invoked_subcommand is None:
+        from audiobench.youtube.repl import run_youtube_repl
+        run_youtube_repl()
 
 def _resolve_fetch_target(arg: str) -> str:
     """Return a canonical YouTube URL or ID from either a number (search result) or a URL."""
@@ -39,11 +46,31 @@ def _resolve_fetch_target(arg: str) -> str:
     raise click.BadParameter(f"'{arg}' is not a valid YouTube URL or video ID.")
 
 
+@youtube_group.command("_fetch_internal", hidden=True)
+@click.argument("video_id", type=str)
+@click.pass_context
+def fetch_internal_cmd(ctx, video_id: str):
+    job_id = ctx.obj.get("job_id")
+    with get_session() as session:
+        try:
+            audio_record, queue_record = fetch_and_register(video_id, session)
+            if audio_record:
+                console.print(f"[{SUCCESS}]Saved[/]  {audio_record.file_path}")
+                console.print(f"[{DIM}]Audio file #{audio_record.id} · Queue Job #{queue_record.id} queued for transcription[/]")
+            else:
+                console.print(f"[{DIM}]Already in library, skipping.[/]")
+        except Exception as e:
+            console.print(error_panel("Fetch failed", str(e)))
+            import sys
+            sys.exit(1)
+
+
 @youtube_group.command("fetch")
 @click.argument("target", type=str)
 def fetch_cmd(target: str):
     """Fetch a YouTube video and queue it for transcription."""
-    from audiobench.jobs.queue_worker import _spawn_daemon
+    from audiobench.jobs.runner import submit_job
+    from audiobench.storage.models import AudioFileRecord
     
     try:
         resolved_url = _resolve_fetch_target(target)
@@ -52,34 +79,35 @@ def fetch_cmd(target: str):
         console.print(error_panel("Error", str(e)))
         return
 
-    console.print(f"[{ACCENT}]Preparing to fetch video ID:[/] {video_id}")
-    
+    # Uniqueness check before dispatching
     with get_session() as session:
-        try:
-            with console.status(f"[{DIM}]Downloading audio from YouTube...[/]"):
-                audio_record, job_record = fetch_and_register(video_id, session)
-                
-            if job_record is None:
-                console.print(f"[{DIM}]Already in library:[/] #{audio_record.id} — {audio_record.file_name}")
-                return
-                
-            console.print(f"[{SUCCESS}]Saved[/]  {audio_record.file_path}")
-            console.print(f"[{DIM}]Audio file #{audio_record.id} · Job #{job_record.id} queued for transcription[/]")
-            
-            # Start the background worker if it's not already running
-            _spawn_daemon()
-            
-            console.print(f"\nRun [bold]audiobench jobs watch {job_record.id}[/bold] to follow progress")
-            
-        except Exception as e:
-            console.print(error_panel("Fetch failed", str(e)))
+        existing = session.query(AudioFileRecord).filter_by(youtube_video_id=video_id).first()
+        if existing:
+            console.print(f"[{DIM}]Already in library:[/] #{existing.id} — {existing.file_name}")
+            return
+
+    job_id = submit_job(["youtube", "_fetch_internal", video_id])
+    console.print(f"[{SUCCESS}]Download queued[/] · Job #{job_id}")
+    console.print(f"\nRun [bold]audiobench jobs fg {job_id}[/bold] to follow progress")
 
 
 @youtube_group.command("search")
 @click.argument("query", type=str)
-@click.option("--channel", type=str, help="Search within a specific channel name.")
-@click.option("--limit", type=int, default=15, help="Number of results to fetch.")
-def search_cmd(query: str, channel: str | None, limit: int):
+@click.option("--channel", type=str, help="Restrict to channel name or URL")
+@click.option("--limit", type=int, default=15, help="Max results (default 15)")
+@click.option("--sort", type=click.Choice(["relevance", "date", "viewCount", "rating", "title"]), default="relevance", help="Sort order")
+@click.option("--after", type=str, help="Published after date (YYYY-MM-DD)")
+@click.option("--before", type=str, help="Published before date (YYYY-MM-DD)")
+@click.option("--no-cache", is_flag=True, help="Bypass channel resolution cache")
+def search_cmd(
+    query: str, 
+    channel: str | None, 
+    limit: int,
+    sort: str,
+    after: str | None,
+    before: str | None,
+    no_cache: bool
+):
     """Search YouTube for videos."""
     from rich.table import Table
     
@@ -87,8 +115,11 @@ def search_cmd(query: str, channel: str | None, limit: int):
     with get_session() as session:
         if channel:
             try:
-                with console.status(f"[{DIM}]Resolving channel...[/]"):
-                    channel_id, channel_title = resolve_channel(channel, session)
+                if "youtube.com" in channel or channel.startswith("UC"):
+                    channel_id = _resolve_fetch_target(channel)
+                    channel_title = channel
+                else:
+                    channel_id, channel_title = resolve_channel(channel, session, no_cache=no_cache)
                 console.print(f"[{DIM}]Resolving channel...[/]  {channel_title}  ({channel_id})")
             except Exception as e:
                 console.print(error_panel("Error resolving channel", str(e)))
@@ -98,7 +129,15 @@ def search_cmd(query: str, channel: str | None, limit: int):
             with console.status(f"[{DIM}]Searching YouTube...[/]") as status:
                 def progress(msg):
                     status.update(f"[{DIM}]{msg}[/]")
-                results = search_videos(query, channel_id, limit, progress_callback=progress)
+                results = search_videos(
+                    query, 
+                    channel_id, 
+                    limit, 
+                    progress_callback=progress,
+                    sort=sort,
+                    after=after,
+                    before=before
+                )
                 
             if not results:
                 console.print(f"[{DIM}]No results found for '{query}'[/]")
