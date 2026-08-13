@@ -20,19 +20,16 @@ import datetime
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.reactive import reactive
+from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Static, Input, Label
-from textual.containers import Container
+from textual.widgets import Footer, Input, Label, Static
 
 from audiobench.cli.tui.panels.events import LiveEventsPanel
 from audiobench.cli.tui.panels.health import HealthPanel
-from audiobench.cli.tui.panels.processes import ProcessesPanel
-from audiobench.cli.tui.panels.operations import OperationsPanel
 from audiobench.cli.tui.panels.inferences import InferencesFeed
+from audiobench.cli.tui.panels.operations import OperationsPanel
+from audiobench.cli.tui.panels.processes import ProcessesPanel
 from audiobench.cli.tui.panels.proposals import ProposalsFeed
-
 
 # ── TCSS ──────────────────────────────────────────────────────────────────────
 # Background #101010 matches btop's main_bg.

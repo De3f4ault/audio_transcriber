@@ -6,10 +6,9 @@ import asyncio
 from collections import deque
 
 from rich.text import Text
-from textual.widgets import RichLog
 from textual.binding import Binding
 from textual.message import Message
-
+from textual.widgets import RichLog
 
 # ── Colour maps ────────────────────────────────────────────────────────────────
 

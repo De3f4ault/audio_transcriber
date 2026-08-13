@@ -7,7 +7,6 @@ from pathlib import Path
 from rich.text import Text
 from textual.widgets import Static
 
-
 # ── Gradient bar helpers ───────────────────────────────────────────────────────
 
 _BAR_FILLED = "▮"

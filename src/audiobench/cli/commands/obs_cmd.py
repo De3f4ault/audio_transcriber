@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import click
 
-from audiobench.cli.display.theme import console, DIM
+from audiobench.cli.display.theme import DIM, console
 
 
 # Make `audiobench obs` launch the TUI directly without subcommands
@@ -36,9 +36,9 @@ def obs_command(subsystem: str | None, level: str | None) -> None:
       p  Focus process table
       q  Quit
     """
+    from audiobench.events import get_bus
     from audiobench.observatory.db import init_journal_db
     from audiobench.observatory.subscriber import get_subscriber
-    from audiobench.events import get_bus
 
     init_journal_db()
     get_bus().on("*", get_subscriber().record)
@@ -77,8 +77,8 @@ def logs_command(
       audiobench logs --session last
     """
     import time
-    import datetime
-    from audiobench.observatory.db import init_journal_db, query_events, get_journal_session
+
+    from audiobench.observatory.db import get_journal_session, init_journal_db, query_events
 
     init_journal_db()
 
@@ -90,7 +90,7 @@ def logs_command(
             entity_type, entity_id_str = entity.split(":", 1)
             entity_id = int(entity_id_str)
         except (ValueError, AttributeError):
-            console.print(f"[red]Invalid --entity format. Use TYPE:ID, e.g. audio_file:42[/]")
+            console.print("[red]Invalid --entity format. Use TYPE:ID, e.g. audio_file:42[/]")
             return
 
     # Parse --since flag
@@ -135,7 +135,7 @@ def logs_command(
             )
 
     if follow:
-        console.print(f"[dim]Following Observatory events. Ctrl+C to stop.[/]\n")
+        console.print("[dim]Following Observatory events. Ctrl+C to stop.[/]\n")
         last_id = 0
         try:
             while True:
