@@ -1,7 +1,6 @@
 """Query reformulation using LLMs for multi-strategy retrieval."""
 
 import json
-from typing import Any
 
 from audiobench.chat.providers.ollama_provider import OllamaClient
 from audiobench.core.logger_factory import get_logger
@@ -53,7 +52,7 @@ class QueryReformulator:
                         text = text[3:]
                     if text.endswith("```"):
                         text = text[:-3]
-                    
+
                     data = json.loads(text.strip())
                     return ReformulatedQuery(
                         original=query,
@@ -66,10 +65,10 @@ class QueryReformulator:
                     )
                 except Exception as ex:
                     logger.warning("Failed to parse LLM reformulation JSON: %s. Using fallback.", ex)
-            
+
             case Err(error=reason):
                 logger.warning("LLM reformulation failed: %s. Using fallback.", reason)
-                
+
         # Graceful degradation fallback
         return ReformulatedQuery(
             original=query,

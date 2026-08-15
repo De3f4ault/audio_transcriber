@@ -30,6 +30,18 @@ class SegmentHit:
     embedding: list[float] | None = None
 
 
+@dataclass
+class SynthesisResult:
+    """A prior synthesis or session summary retrieved from LanceDB."""
+
+    expression_id: int
+    content: str
+    source_type: str
+    session_id: int
+    sequence_num: int
+    score: float = 0.0
+
+
 @runtime_checkable
 class RetrievalStream(Protocol):
     """Protocol for all retrieval streams."""
@@ -43,8 +55,8 @@ class FTS5Stream:
     """Full-text SQLite BM25 retrieval stream."""
 
     def retrieve(
-        self, 
-        query: ReformulatedQuery, 
+        self,
+        query: ReformulatedQuery,
         top_k: int = 5,
         focus_source: str | None = None,
     ) -> list[SegmentHit]:
@@ -52,7 +64,7 @@ class FTS5Stream:
         try:
             if not query.bm25_keywords.strip():
                 return []
-                
+
             # Create FTS MATCH query (e.g., OR between keywords)
             keywords = query.bm25_keywords.split()
             match_query = " OR ".join(f'"{k}"' for k in keywords)
@@ -160,7 +172,7 @@ def _mmr_filter(
     # Pre-compute query similarity for every candidate
     q_sims = [cosine(query_vector, vec) for _, vec in candidates]
 
-    selected: list["SegmentHit"] = []
+    selected: list[SegmentHit] = []
     selected_vecs: list[list[float]] = []
     selected_sources: set[str] = set()
     remaining = list(range(len(candidates)))
@@ -236,15 +248,15 @@ class DenseStream:
 
             use_mmr = preset == "synthesis"
             candidate_k = top_k * 3 if use_mmr else top_k
-            
+
             # Request more candidates if filtering by focus to ensure we have enough hits
             fetch_k = candidate_k * 5 if focus_source else candidate_k
             rows = store.search(query_vector, fetch_k, return_vectors=use_mmr)
-            
+
             if focus_source:
                 focus_lower = focus_source.lower()
                 rows = [r for r in rows if focus_lower in r.get("source_file", "").lower()]
-            
+
             # Trim back down to the target candidate size
             rows = rows[:candidate_k]
 
@@ -313,7 +325,7 @@ class ColBERTStream:
             # Partial ColBERT: only return top 5 so RRF validates anchors
             # but leaves the tail open for MMR diversity.
             top_k = min(top_k, 5)
-            
+
         try:
             from audiobench.daemon.factory import get_daemon_client
             from audiobench.memory.memory_store import SegmentVectorStore
@@ -376,4 +388,140 @@ class ColBERTStream:
 
         except Exception as e:
             logger.warning("ColBERTStream retrieval failed: %s", e)
+        return []
+
+class SynthesisStream:
+    """Retrieves prior search synthesis and session summaries from LanceDB.
+
+    Only surfaces synthesis from the *current session* so results from
+    unrelated past sessions never bleed into the active search thread.
+    """
+
+    def retrieve(
+        self,
+        query: ReformulatedQuery,
+        top_k: int = 3,
+        session_id: int | None = None,
+    ) -> list[SynthesisResult]:
+        try:
+            from audiobench.daemon.factory import get_daemon_client
+            from audiobench.memory.memory_store import MemoryStore
+
+            daemon = get_daemon_client()
+
+            embed_text = query.hyde_document if query.hyde_document else query.dense_query
+            if not embed_text:
+                embed_text = query.original
+
+            query_vector = daemon.embed_query(embed_text)
+            store = MemoryStore()
+
+            try:
+                table = store.table
+            except Exception:
+                logger.debug("SynthesisStream: table not initialized")
+                return []
+
+            fetch_k = top_k * 3
+            raw_results = (
+                table.search(query_vector)
+                .where("source_type IN ('search_synthesis', 'search_session_summary')")
+                .limit(fetch_k)
+                .to_list()
+            )
+
+            if not raw_results:
+                return []
+
+            import numpy as np
+            def cosine_dist(a, b):
+                a_arr, b_arr = np.array(a), np.array(b)
+                return 1 - (np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
+
+            deduped_results = []
+            for r in raw_results:
+                if len(deduped_results) >= top_k:
+                    break
+                vec = r.get("vector")
+                if vec is None:
+                    deduped_results.append(r)
+                    continue
+                
+                is_duplicate = False
+                for existing in deduped_results:
+                    e_vec = existing.get("vector")
+                    if e_vec is not None:
+                        dist = cosine_dist(vec, e_vec)
+                        if dist < 0.15:
+                            is_duplicate = True
+                            break
+                if not is_duplicate:
+                    deduped_results.append(r)
+
+            raw_results = deduped_results
+
+            if not raw_results:
+                return []
+
+            expr_ids = [int(r["expression_id"]) for r in raw_results]
+
+            from audiobench.core.db_session import get_session
+            from sqlalchemy import text
+
+            placeholders = ", ".join(f":id{i}" for i in range(len(expr_ids)))
+            params = {f"id{i}": eid for i, eid in enumerate(expr_ids)}
+
+            # session_id filter: only return synthesis from the active session.
+            # Without this, every search draws prior-knowledge hits from all past
+            # sessions regardless of topic, which is the "spilling" behaviour.
+            session_filter = ""
+            if session_id is not None and session_id >= 0:
+                params["active_session_id"] = session_id
+                session_filter = (
+                    "AND ("
+                    "  (e.source_type = 'search_synthesis'       AND sq.session_id = :active_session_id)"
+                    "  OR"
+                    "  (e.source_type = 'search_session_summary' AND ss.id        = :active_session_id)"
+                    ")"
+                )
+
+            sql = text(f"""
+                SELECT e.id, e.source_type,
+                       CASE WHEN e.source_type = 'search_synthesis'
+                            THEN sq.session_id ELSE ss.id END AS session_id,
+                       CASE WHEN e.source_type = 'search_synthesis'
+                            THEN sq.sequence_num ELSE 0 END AS sequence_num
+                FROM expressions e
+                LEFT JOIN search_queries sq
+                       ON e.source_type = 'search_synthesis'       AND e.source_id = sq.id
+                LEFT JOIN search_sessions ss
+                       ON e.source_type = 'search_session_summary' AND e.source_id = ss.id
+                WHERE e.id IN ({placeholders})
+                {session_filter}
+            """)
+
+            with get_session() as session:
+                rows = session.execute(sql, params).mappings().all()
+                meta_map = {r["id"]: r for r in rows}
+
+            hits = []
+            for r in raw_results:
+                eid = int(r["expression_id"])
+                meta = meta_map.get(eid)
+                if not meta:
+                    continue  # filtered out (wrong session or missing join)
+                hits.append(SynthesisResult(
+                    expression_id=eid,
+                    content=r["content"],
+                    source_type=meta["source_type"],
+                    session_id=meta["session_id"] or 0,
+                    sequence_num=meta["sequence_num"] or 0,
+                    score=float(r.get("_distance", 0.0)),
+                ))
+
+            # LanceDB returns ascending L2 distance → most relevant first.
+            return hits
+
+        except Exception as e:
+            logger.warning("SynthesisStream retrieval failed: %s", e)
         return []

@@ -14,8 +14,9 @@ Engineering standards applied (EQ-1 through EQ-4):
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from audiobench.chat.chat_store import ChatRepository
@@ -25,8 +26,8 @@ from audiobench.core.logger_factory import get_logger
 from audiobench.core.settings import get_settings
 from audiobench.daemon.factory import get_daemon_client
 from audiobench.memory.enums import SourceType
-from audiobench.memory.rrf_fusion import FusedResult, _temporal_dedup, rrf_merge
 from audiobench.memory.retrieval_streams import ColBERTStream, DenseStream, FTS5Stream
+from audiobench.memory.rrf_fusion import FusedResult, _temporal_dedup, filter_micro_fragments, rrf_merge
 from audiobench.storage.expression_repository import ExpressionRepository
 from audiobench.storage.models import BookmarkRecord
 
@@ -67,48 +68,114 @@ class QueryResult:
 # ── LLM helpers ──────────────────────────────────────────────────────────────
 
 def _call_ollama(prompt: str, temperature: float, llm: OllamaClient) -> LLMResult:
-    """Attempt generation via local Ollama. Returns Ok or Err — never raises."""
+    """Attempt generation via local Ollama. Returns Ok or Err — never raises.
+
+    Uses /api/chat (not /api/generate) so that cloud-routed Ollama models
+    (e.g. gpt-oss:120b-cloud, gemma4:31b-cloud) work correctly.  Those models
+    are proxied upstream and only expose the Chat Completion endpoint — calling
+    /api/generate against them returns a hard 404.
+
+    Intentionally has NO circuit breaker: Ollama is a localhost service, so
+    a 404 (wrong model name) or connection error should fall through to Gemini
+    on every call — not accumulate failures into a shared circuit state that
+    then blocks all subsequent synthesis.
+    """
     from audiobench.memory.llm_caller import RateLimitError, _retry_with_backoff
-    from audiobench.memory.singletons import get_llm_circuit_breaker
-    
-    breaker = get_llm_circuit_breaker()
-    
-    def _do_call():
+
+    def _do_call() -> str:
         try:
-            return llm.generate(prompt, temperature=temperature)
+            result = llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                think=False,  # synthesis doesn't need chain-of-thought
+            )
+            return result.get("content", "")
         except Exception as e:
             if "429" in str(e) or "Too Many Requests" in str(e):
                 raise RateLimitError(str(e))
             raise e
 
     try:
-        text = breaker.call(lambda: _retry_with_backoff(_do_call, max_retries=2, base_delay=1.0, jitter=True))
+        text = _retry_with_backoff(_do_call, max_retries=2, base_delay=1.0, jitter=True)
         return Ok(value=text)
     except Exception as exc:  # noqa: BLE001
         return Err(error=f"ollama: {exc}")
 
 
+
 def _call_gemini(prompt: str, temperature: float, api_key: str) -> LLMResult:
-    """Attempt generation via Gemini API. Returns Ok or Err — never raises."""
+    """Attempt generation via Gemini API. Returns Ok or Err — never raises.
+
+    Wraps the SDK call in an 8-second thread timeout.  The ``google-genai``
+    SDK has no built-in socket timeout: a DNS failure or TCP routing blackhole
+    (e.g. network is cut) blocks the calling thread indefinitely without this
+    wrapper.
+
+    IMPORTANT: we must NOT use ``with ThreadPoolExecutor() as ex:`` here
+    because its ``__exit__`` calls ``shutdown(wait=True)``, which blocks until
+    every submitted thread finishes — defeating the whole timeout.  Instead we
+    call ``shutdown(wait=False)`` explicitly so the stuck OS thread is truly
+    abandoned the moment our deadline fires.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
     from audiobench.memory.llm_caller import RateLimitError, _retry_with_backoff
-    from audiobench.memory.singletons import get_llm_circuit_breaker
-    
-    breaker = get_llm_circuit_breaker()
-    
-    def _do_call():
+    from audiobench.memory.singletons import get_gemini_circuit_breaker
+
+    _TIMEOUT_S: float = 8.0  # hard cap: DNS + TCP-connect + first byte
+    breaker = get_gemini_circuit_breaker()
+
+    def _do_call() -> str:
         from google import genai  # type: ignore[import]
         try:
             client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash", contents=prompt
-            )
-            if response and response.text:
-                return response.text.strip()
-            raise ValueError("empty response")
+
+            def _generate() -> str:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash", contents=prompt
+                )
+                if response and response.text:
+                    return response.text.strip()
+                raise ValueError("empty response from Gemini")
+
+            # Spin up a dedicated executor.  We call shutdown(wait=False) on
+            # timeout so the stuck network thread is immediately orphaned —
+            # it will eventually die on its own when the OS TCP timeout fires,
+            # but the calling thread moves on instantly.
+            ex = ThreadPoolExecutor(max_workers=1)
+            fut = ex.submit(_generate)
+            try:
+                result = fut.result(timeout=_TIMEOUT_S)
+                ex.shutdown(wait=False)
+                return result
+            except FuturesTimeout:
+                ex.shutdown(wait=False)  # abandon — do NOT wait=True
+                # The thread is still alive inside the OS — we cannot retrieve
+                # its exception.  We know the call hung for >=8s, but NOT why.
+                # Possible causes: DNS, TLS handshake, API key rejected before
+                # first byte, firewall drop, or a slow-start response.
+                raise ConnectionError(
+                    f"Gemini API call timed out after {_TIMEOUT_S}s "
+                    "(possible causes: DNS, TLS, API key, firewall, or routing)"
+                )
         except Exception as e:
-            if "429" in str(e) or "Too Many Requests" in str(e) or "quota" in str(e).lower():
+            # ── Log the raw exception BEFORE any classification ──────────────
+            # This is the ground truth. Everything below is just routing logic.
+            logger.warning(
+                "Gemini raw exception: %s: %s",
+                type(e).__name__,
+                e,
+                exc_info=False,  # no traceback for ConnectionError / RateLimitError spam
+            )
+            err_str = str(e).lower()
+            if "429" in err_str or "too many requests" in err_str or "quota" in err_str:
                 raise RateLimitError(str(e))
-            raise e
+            if "name or service not known" in err_str or "connection" in err_str or "timeout" in err_str or "unavailable" in err_str:
+                raise ConnectionError(str(e))
+            # Unknown error — log full traceback so we can diagnose it
+            logger.exception("Gemini unexpected exception (type=%s)", type(e).__name__)
+            raise
 
     try:
         text = breaker.call(lambda: _retry_with_backoff(_do_call, max_retries=2, base_delay=1.0, jitter=True))
@@ -418,12 +485,16 @@ class ResearchResult:
 
     query: str
     sources: list[FusedResult] = field(default_factory=list)
+    prior_synthesis_hits: list = field(default_factory=list)
     query_time_seconds: float = 0.0
+    retrieval_time_seconds: float = 0.0   # time from start → RRF fusion complete
+    synthesis_time_seconds: float = 0.0   # time for LLM synthesis call only
     answer: str | None = None
-    synthesis_failed: bool = False
+    synthesis_failed: bool = False        # True = hard failure, no answer at all
+    synthesis_is_fallback: bool = False   # True = extractive fallback (LLM unavailable)
     synthesis_error: str | None = None
     # Names of streams that returned 0 results (used by display for ✗ badges)
-    streams_skipped: list[str] = field(default_factory=list)
+    streams_skipped: list[tuple[str, str]] = field(default_factory=list)
     # True when HyDE was requested but fell back to direct query embedding
     hyde_fallback: bool = False
     hyde_document: str | None = None
@@ -441,14 +512,40 @@ class ResearchEngine:
     """
 
     _STREAM_TIMEOUT: float = 15.0  # seconds; streams that exceed this are skipped
+    _SYNTHESIS_RRF_FLOOR: float = 0.020  # Minimum RRF score to reach LLM synthesis
+    _MAX_SYNTHESIS_FRAGMENTS: int = 8
+
+    @staticmethod
+    def _extractive_fallback(frags: list["FusedResult"], query: str) -> str:  # type: ignore[name-defined]
+        """Build a readable answer from the top fragments when no LLM is available.
+
+        This is intentionally minimal: just the fragment text with source/timestamp
+        headers, in relevance order.  It is NOT a synthesis — it is a presentation
+        of the raw evidence so the session stays useful even when offline.
+        """
+        lines = [f"**No LLM available — top retrieved fragments for:** {query}\n"]
+        for i, fr in enumerate(frags[:5], 1):
+            source = Path(fr.source_file).stem if fr.source_file else "unknown"
+            ts = f"{fr.start_time:.1f}s–{fr.end_time:.1f}s"
+            lines.append(f"**[{i}] {source} \u00b7 {ts}**")
+            lines.append(fr.text.strip())
+            if i < len(frags[:5]):
+                lines.append("")
+        return "\n".join(lines)
 
     def search(
-        self, 
-        query: str, 
-        top_k: int = 10, 
+        self,
+        query: str,
+        top_k: int = 10,
         preset: str = "balanced",
         mmr_lambda: float = 0.5,
         focus_source: str | None = None,
+        model: str | None = None,
+        diversity_weight: float = 0.4,
+        pinned_fragments: list[FusedResult] | None = None,
+        prior_synthesis: str | None = None,
+        session_id: int | None = None,
+        query_id: int | None = None,
     ) -> ResearchResult:
         """Run all three streams in parallel, fuse via RRF, synthesise, return results.
 
@@ -456,6 +553,24 @@ class ResearchEngine:
           fast     → FTS5 + Dense, no HyDE, no ColBERT reranker
           balanced → FTS5 + Dense + ColBERT, no HyDE
           deep     → FTS5 + Dense + ColBERT + HyDE (LLM generates hypothetical doc)
+
+        Args:
+            prior_synthesis: Optional synthesis text from the previous search in this
+                session. When provided, injected BEFORE the fragment context block so
+                it reads as background the model may draw on or ignore. The LLM handles
+                relevance judgment — no heuristic decision-making here.
+
+                Prompt order: [PRIOR CONTEXT] → [NEW FRAGMENTS] → [INSTRUCTION]
+                Rationale: fragments are the primary evidence for the current question
+                and should be the most proximate input before the instruction. Prior
+                synthesis framed first is clearly background to set aside if irrelevant;
+                framed last it risks anchoring the LLM on the old answer.
+
+                NOTE: Default ordering chosen with mechanistic reasoning, not yet
+                empirically confirmed. Before treating as settled — test both orderings
+                on a real multi-search thread and observe continuation quality.
+                Same discipline as diversity_weight=0.4 and the 45-minute alignment
+                cutoff: unmeasured default, named as such.
 
         Each stream is called in its own thread.  If a stream raises or times
         out it is silently skipped — partial results are still returned.
@@ -478,7 +593,7 @@ class ResearchEngine:
             use_hyde = True
         elif preset == "synthesis":
             # MMR diversifies the tail. We run ColBERT but restrict it internally
-            # to only return top 5, anchoring the highly relevant head in RRF 
+            # to only return top 5, anchoring the highly relevant head in RRF
             # without destroying MMR diversity in the tail.
             use_colbert = True
             use_hyde = False
@@ -542,24 +657,39 @@ class ResearchEngine:
         fts_hits: list = []
         dense_hits: list = []
         colbert_hits: list = []
+        synthesis_hits: list = []
 
         # ── Stage 2: Parallel stream retrieval ───────────────────────────────
         dense_extra: dict = {"preset": preset, "mmr_lambda": mmr_lambda, "focus_source": focus_source} if use_mmr else {"focus_source": focus_source}
         fts_extra: dict = {"focus_source": focus_source}
-        
+
+        from audiobench.memory.retrieval_streams import SynthesisStream
+
+        # Synthesis stream has its own small cap (2) so prior-knowledge hits never
+        # crowd out actual audio fragment results.  This is independent of top_k.
+        _SYNTHESIS_TOP_K = 2
+
         stream_tasks: dict[str, tuple] = {
             "fts5":  (FTS5Stream(),    fts_hits,    fts_extra),
             "dense": (DenseStream(),   dense_hits,  dense_extra),
+            # Named 'recap' (not 'synthesis') to avoid collision with LLM synthesis
+            # status markers in the UI.  0-hit results here are normal — no prior
+            # session context simply means this is an early search or a new topic.
+            "recap": (SynthesisStream(), synthesis_hits, {"top_k": _SYNTHESIS_TOP_K, "session_id": session_id}),
         }
         if use_colbert:
             stream_tasks["colbert"] = (ColBERTStream(), colbert_hits, {"preset": preset})
 
         stream_timings: dict[str, float] = {}
-        streams_skipped: list[str] = []
+        streams_skipped: list[tuple[str, str]] = []
 
         def _timed_retrieve(name: str, stream: object, bucket: list, extra: dict) -> None:
             t_s = time.perf_counter()
-            if extra:
+            if "top_k" in extra:
+                # Stream supplies its own top_k (e.g. SynthesisStream).
+                k = extra.pop("top_k")
+                hits = stream.retrieve(rq, k, **extra) if extra else stream.retrieve(rq, k)  # type: ignore[attr-defined]
+            elif extra:
                 hits = stream.retrieve(rq, top_k, **extra)  # type: ignore[attr-defined]
             else:
                 hits = stream.retrieve(rq, top_k)  # type: ignore[attr-defined]
@@ -585,8 +715,10 @@ class ResearchEngine:
                 future.result()  # Should return immediately since it's in `done`
                 bucket = stream_tasks[name][1]
                 hit_count = len(bucket)
-                if hit_count == 0:
-                    streams_skipped.append(name)
+                if hit_count == 0 and name != "recap":
+                    # 'recap' returning 0 hits is normal (no prior session context);
+                    # don't surface it as a skipped-stream warning.
+                    streams_skipped.append((name, "0 hits"))
                 log_event(
                     subsystem="memory.search",
                     event_type=f"stream.{name}",
@@ -595,7 +727,7 @@ class ResearchEngine:
                     metadata={"hit_count": hit_count},
                 )
             except Exception as exc:  # noqa: BLE001
-                streams_skipped.append(name)
+                streams_skipped.append((name, "failed"))
                 logger.warning("Stream '%s' failed: %s — skipping", name, exc)
                 log_event(
                     subsystem="memory.search",
@@ -607,7 +739,7 @@ class ResearchEngine:
 
         for future in not_done:
             name = future_to_name[future]
-            streams_skipped.append(name)
+            streams_skipped.append((name, "timeout - inference lock busy or ingestion in progress"))
             logger.warning("Stream '%s' timed out after %.1fs — skipping", name, self._STREAM_TIMEOUT * 2)
             log_event(
                 subsystem="memory.search",
@@ -619,7 +751,7 @@ class ResearchEngine:
 
         # ── Stage 3: RRF fusion ──────────────────────────────────────────────
         t_fuse = time.perf_counter()
-        fused = rrf_merge(fts_hits, dense_hits, colbert_hits, top_n=top_k)
+        fused = rrf_merge(fts_hits, dense_hits, colbert_hits, top_n=top_k, diversity_weight=diversity_weight)
         fuse_ms = (time.perf_counter() - t_fuse) * 1000
         log_event(
             subsystem="memory.search",
@@ -641,11 +773,48 @@ class ResearchEngine:
                 metadata={"removed": dedup_removed, "kept": len(fused)},
             )
 
+        # ── Stage 3.6: Micro-fragment filtering ───────────────────────────────
+        # Drops fragments that are too short to contribute meaningful signal to
+        # synthesis (e.g. 1-second transcription artifacts, single proper nouns).
+        # Removed segments are merged onto the nearest surviving neighbour from
+        # the same source so Fragment Reader H/L navigation has no gaps.
+        pre_micro_count = len(fused)
+        fused = filter_micro_fragments(fused)
+        micro_removed = pre_micro_count - len(fused)
+        if micro_removed:
+            log_event(
+                subsystem="memory.search",
+                event_type="dedup.micro_fragments",
+                message=f"Micro-fragment filter removed {micro_removed} noise fragment(s)",
+                metadata={"removed": micro_removed, "kept": len(fused)},
+            )
+
+        # Prepend any pinned fragments that aren't already in fused
+        if pinned_fragments:
+            existing_sids = {fr.segment_id for fr in fused}
+            to_prepend = [fr for fr in pinned_fragments if fr.segment_id not in existing_sids]
+            fused = to_prepend + fused
+
+        # Snapshot retrieval wall-clock: everything above is retrieval,
+        # everything below is synthesis.  Both are reported separately in the UI.
+        t_retrieval_done = time.perf_counter()
+
+        # Persist synthesis hits used as context for this search
+        if query_id is not None and query_id >= 0 and synthesis_hits:
+            from audiobench.memory.session_store import persist_synthesis_context
+            try:
+                persist_synthesis_context(query_id, synthesis_hits)
+            except Exception as e:
+                logger.warning("Failed to persist synthesis context: %s", e)
+
         if not fused:
             return ResearchResult(
                 query=query,
                 sources=fused,
-                query_time_seconds=time.perf_counter() - t0,
+                prior_synthesis_hits=synthesis_hits,
+                query_time_seconds=t_retrieval_done - t0,
+                retrieval_time_seconds=t_retrieval_done - t0,
+                synthesis_time_seconds=0.0,
                 answer="No relevant segments found.",
                 streams_skipped=streams_skipped,
                 hyde_fallback=hyde_fallback,
@@ -653,25 +822,82 @@ class ResearchEngine:
             )
 
         # ── Stage 4: LLM synthesis ───────────────────────────────────────────
+        pinned_sids = {fr.segment_id for fr in (pinned_fragments or [])}
+        synthesis_frags = []
+        for fr in fused:
+            if len(synthesis_frags) >= self._MAX_SYNTHESIS_FRAGMENTS:
+                break
+            if fr.segment_id in pinned_sids or fr.rrf_score >= self._SYNTHESIS_RRF_FLOOR:
+                synthesis_frags.append(fr)
+
+        if not synthesis_frags and fused:
+            # Fallback to top retrieved fragments if nothing met the floor score
+            synthesis_frags = fused[:min(3, len(fused))]
+
+        def _fmt_header(idx: int, fr: FusedResult) -> str:
+            source_str = f" | {Path(fr.source_file).stem}" if fr.source_file else ""
+            return f"[Fragment {idx + 1}{source_str} | {fr.start_time:.1f}s–{fr.end_time:.1f}s]"
+
         context_text = "\n\n".join(
-            f"[Fragment {i + 1} | {fr.start_time:.1f}s–{fr.end_time:.1f}s]\n{fr.text}"
-            for i, fr in enumerate(fused[:5])
+            f"{_fmt_header(i, fr)}\n{fr.text}"
+            for i, fr in enumerate(synthesis_frags)
         )
+        # ── Synthesis carryforward: inject prior session context ──────────────
+        # Prior synthesis (from the previous search in this session) is injected
+        # BEFORE the fragment block, framing it as optional background context.
+        # The LLM decides whether it's relevant — no heuristic connect/don't-connect
+        # decision that can be wrong. Degrades gracefully to nothing when offline
+        # (prior_synthesis=None is passed when LLM is unavailable).
+        _MAX_PRIOR_WORDS = 1500  # unmeasured default — adjust if sessions hit this ceiling
+        prior_context_block = ""
+        if prior_synthesis:
+            prior_words = prior_synthesis.split()
+            if len(prior_words) > _MAX_PRIOR_WORDS:
+                truncated = " ".join(prior_words[:_MAX_PRIOR_WORDS])
+                prior_synthesis = truncated + " [...truncated]"
+            prior_context_block = (
+                "PRIOR CONTEXT (from your previous search in this session — "
+                "use if relevant, ignore entirely if not):\n"
+                f"{prior_synthesis}\n\n"
+                "---\n\n"
+            )
+
         synthesis_prompt = (
-            "You are a personal memory assistant. Answer the query using ONLY "
-            "the transcript fragments below. If the answer cannot be determined, say so.\n\n"
+            "You are a personal memory assistant. Answer the query primarily grounded in the "
+            "transcript fragments below, but you may bring your own understanding to connect and interpret them.\n\n"
+            "If the fragments do not fully answer the query, explicitly state what they DO illuminate, "
+            "and what they leave open. Reason WITH the fragments rather than just extracting from them.\n\n"
+            f"{prior_context_block}"
             f"QUERY: {query}\n\n"
             f"FRAGMENTS:\n{context_text}\n\n"
-            "Provide a clear, concise answer."
+            "Provide a clear, insightful answer."
         )
 
         settings = get_settings()
-        llm = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
+        model_name = model or settings.ollama_model
+
+        # "ollama" as a literal model name is a common /set model mistake —
+        # treat it as "use the configured default" so we don't send a 404-causing
+        # model name to the /api/chat endpoint.
+        if model_name.lower() == "ollama":
+            model_name = settings.ollama_model
 
         t_synth = time.perf_counter()
-        match _call_llm(synthesis_prompt, temperature=0.2, llm=llm, api_key=settings.gemini_api_key):
+
+        # Allow explicit opt-in to Gemini
+        if model_name.lower() == "gemini":
+            result = _call_gemini(synthesis_prompt, 0.2, settings.gemini_api_key)
+            if isinstance(result, Err):
+                result = Err(error=f"gemini forced: {result.error}")
+        else:
+            llm = OllamaClient(base_url=settings.ollama_base_url, model=model_name)
+            result = _call_llm(synthesis_prompt, temperature=0.2, llm=llm, api_key=settings.gemini_api_key)
+
+        match result:
             case Ok(value=answer):
-                synth_ms = (time.perf_counter() - t_synth) * 1000
+                t_done = time.perf_counter()
+                synth_s = t_done - t_synth
+                synth_ms = synth_s * 1000
                 log_event(
                     subsystem="memory.search",
                     event_type="synthesis.ok",
@@ -682,14 +908,19 @@ class ResearchEngine:
                 return ResearchResult(
                     query=query,
                     sources=fused,
-                    query_time_seconds=time.perf_counter() - t0,
+                    prior_synthesis_hits=synthesis_hits,
+                    query_time_seconds=t_done - t0,
+                    retrieval_time_seconds=t_retrieval_done - t0,
+                    synthesis_time_seconds=synth_s,
                     answer=answer,
                     streams_skipped=streams_skipped,
                     hyde_fallback=hyde_fallback,
                     hyde_document=rq.hyde_document,
                 )
             case Err(error=reason):
-                synth_ms = (time.perf_counter() - t_synth) * 1000
+                t_done = time.perf_counter()
+                synth_s = t_done - t_synth
+                synth_ms = synth_s * 1000
                 logger.error("ResearchEngine synthesis failed: %s", reason)
                 log_event(
                     subsystem="memory.search",
@@ -699,14 +930,25 @@ class ResearchEngine:
                     duration_ms=synth_ms,
                     metadata={"error": reason[:200]},
                 )
+                # ── Extractive fallback ───────────────────────────────────────
+                # Fragments are already retrieved and in memory. Rather than
+                # returning nothing when the LLM is unavailable, surface the top
+                # fragments as a readable answer so the session stays useful.
+                # synthesis_is_fallback=True lets the UI label it distinctly.
+                fallback_answer = self._extractive_fallback(synthesis_frags, query) if synthesis_frags else None
                 return ResearchResult(
                     query=query,
                     sources=fused,
-                    query_time_seconds=time.perf_counter() - t0,
-                    answer=None,
-                    synthesis_failed=True,
+                    prior_synthesis_hits=synthesis_hits,
+                    query_time_seconds=t_done - t0,
+                    retrieval_time_seconds=t_retrieval_done - t0,
+                    synthesis_time_seconds=synth_s,
+                    answer=fallback_answer,
+                    synthesis_failed=fallback_answer is None,   # only truly failed if no frags
+                    synthesis_is_fallback=fallback_answer is not None,
                     synthesis_error=reason,
                     streams_skipped=streams_skipped,
                     hyde_fallback=hyde_fallback,
                     hyde_document=rq.hyde_document,
                 )
+

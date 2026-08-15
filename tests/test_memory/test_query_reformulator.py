@@ -2,10 +2,11 @@
 
 import dataclasses
 import json
+
 import pytest
 
+from audiobench.memory.query_engine import Err, Ok
 from audiobench.memory.query_reformulator import QueryReformulator, ReformulatedQuery
-from audiobench.memory.query_engine import Ok, Err
 
 
 @pytest.fixture

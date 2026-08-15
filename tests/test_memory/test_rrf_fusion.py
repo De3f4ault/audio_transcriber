@@ -8,7 +8,6 @@ import pytest
 from audiobench.memory.retrieval_streams import SegmentHit
 from audiobench.memory.rrf_fusion import FusedResult, K, rrf_merge
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_hit(segment_id: int, start: float = 0.0, end: float = 1.0) -> SegmentHit:
@@ -17,6 +16,7 @@ def _make_hit(segment_id: int, start: float = 0.0, end: float = 1.0) -> SegmentH
         start_time=start,
         end_time=end,
         text=f"segment {segment_id} text",
+        source_file=f"file_{segment_id}.m4a",
     )
 
 
@@ -118,3 +118,14 @@ def test_rrf_scores_descending():
     results = rrf_merge(fts, [], [], top_n=5)
     scores = [r.rrf_score for r in results]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_rrf_max_per_source_capping():
+    """Verify that results from a single source file are capped at max_per_source."""
+    hits = [
+        SegmentHit(segment_id=i, start_time=float(i), end_time=float(i+1), text=f"seg {i}", source_file="same_file.m4a")
+        for i in range(1, 10)
+    ]
+    results = rrf_merge(hits, [], [], top_n=10, max_per_source=2)
+    assert len(results) == 2
+    assert all(r.source_file == "same_file.m4a" for r in results)
