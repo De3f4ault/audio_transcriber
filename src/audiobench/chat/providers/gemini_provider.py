@@ -34,7 +34,22 @@ class GeminiClient:
             from google import genai
 
             if self.settings.gemini_api_key:
-                self._client = genai.Client(api_key=self.settings.gemini_api_key)
+                # Attempt to set a 30 s HTTP timeout at the client level so
+                # streaming and non-streaming calls both bail out promptly when
+                # the network is unavailable.  The google-genai SDK has no
+                # built-in socket timeout; without this a dead network causes
+                # the underlying httpx/grpc connection to hang indefinitely.
+                # We try the HttpOptions path first; older SDK versions that
+                # don't support it fall back to a bare client (the per-call
+                # thread timeout in _call_gemini covers the search path).
+                try:
+                    from google.genai import types as genai_types
+                    self._client = genai.Client(
+                        api_key=self.settings.gemini_api_key,
+                        http_options=genai_types.HttpOptions(timeout=30_000),  # ms
+                    )
+                except (TypeError, AttributeError, Exception):
+                    self._client = genai.Client(api_key=self.settings.gemini_api_key)
                 self._is_available = True
         except ImportError:
             pass

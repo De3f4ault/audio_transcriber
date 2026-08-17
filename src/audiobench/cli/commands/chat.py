@@ -3,22 +3,18 @@
 from __future__ import annotations
 
 import click
-from rich.live import Live
-from rich.text import Text
 
 from audiobench.cli.display.theme import (
     ACCENT,
     APP_NAME,
     BOLD,
-    CHAT_CODE_THEME,
     DIM,
-    PROMPT,
     SUCCESS,
-    chat_console,
     console,
     error_panel,
 )
 from audiobench.core.settings import get_settings
+
 
 def _maybe_pick_chapters(audio_file_id: int, token_threshold: int = 80000) -> list[int] | None:
     """Check if an audio file's transcript is too large and prompt for chapters if so.
@@ -26,22 +22,22 @@ def _maybe_pick_chapters(audio_file_id: int, token_threshold: int = 80000) -> li
     Returns a list of chapter IDs if picked, or None if the file is small enough
     to load entirely.
     """
+    from audiobench.cli.tui.chapter_picker import pick_chapters
     from audiobench.core.db_session import get_session
     from audiobench.storage.models import ChapterRecord
-    from audiobench.cli.tui.chapter_picker import pick_chapters
-    
-    with get_session() as session:
-        chapters = session.query(ChapterRecord).filter_by(audio_file_id=audio_file_id).order_by(ChapterRecord.start_time).all()
-        
+
+    with get_session() as db:
+        chapters = db.query(ChapterRecord).filter_by(audio_file_id=audio_file_id).order_by(ChapterRecord.start_time).all()
+
     if not chapters:
         return None
-        
+
     total_chars = sum((ch.transcript_length or 0) for ch in chapters)
     estimated_tokens = total_chars / 4
-    
+
     if estimated_tokens > token_threshold:
         return pick_chapters(audio_file_id)
-        
+
     return None
 
 # ── Ask Command ─────────────────────────────────────────────
@@ -116,8 +112,8 @@ def ask(
         from audiobench.core.db_session import get_session
         from audiobench.storage.models import AskLog
 
-        with get_session() as session:
-            ask_log = session.query(AskLog).filter_by(audio_file_id=audio_file_id).first()
+        with get_session() as db:
+            ask_log = db.query(AskLog).filter_by(audio_file_id=audio_file_id).first()
             if not ask_log or not ask_log.entries:
                 console.print(f"[dim]No ask log entries found for audio file #{audio_file_id}.[/]")
                 return
@@ -255,10 +251,11 @@ def ask(
         console.print()
 
         # --- PHASE 5.3: Ask Log & Expression Wiring ---
+        import threading
+
         from audiobench.chat.chat_store import ChatRepository
         from audiobench.core.logger_factory import get_logger
         from audiobench.memory.knowledge_ingester import KnowledgeIngester
-        import threading
 
         _logger = get_logger("cmd.ask")
 
@@ -277,13 +274,13 @@ def ask(
             try:
                 from audiobench.core.db_session import get_session
                 from audiobench.storage.models import AskEntry, AskLog
-                
-                with get_session() as session:
-                    entry = session.query(AskEntry).filter_by(id=entry_id).first()
-                    log = session.query(AskLog).filter_by(id=log_id).first()
+
+                with get_session() as db:
+                    entry = db.query(AskEntry).filter_by(id=entry_id).first()
+                    log = db.query(AskLog).filter_by(id=log_id).first()
                     if entry and log:
-                        session.expunge(entry)
-                        session.expunge(log)
+                        db.expunge(entry)
+                        db.expunge(log)
                         ingester = KnowledgeIngester()
                         threading.Thread(
                             target=ingester.ingest_ask_entry,
@@ -358,6 +355,7 @@ def ask(
 )
 @click.option(
     "--summary",
+    "chat_summary",
     type=int,
     default=None,
     help="View the session memoir for a conversation",
@@ -380,7 +378,7 @@ def chat(
     delete_id: int | None,
     think: bool,
     chapter: int | None,
-    summary: int | None,
+    chat_summary: int | None,
     project_id: int | None,
 ) -> None:
     """Interactive AI chat with transcript context.
@@ -399,7 +397,7 @@ def chat(
     """
     from audiobench.chat.chat_session import ChatSession
     from audiobench.chat.chat_store import ChatRepository
-    from audiobench.chat.providers.ollama_provider import AIError, OllamaClient
+    from audiobench.chat.providers.ollama_provider import OllamaClient
     from audiobench.core.db_engine import init_db
     from audiobench.storage.repository import TranscriptionRepository
 
@@ -434,7 +432,7 @@ def chat(
         return
 
     # ── Handle --delete ──
-    if summary is not None:
+    if chat_summary is not None:
         init_db()
         from rich.markdown import Markdown
         from rich.panel import Panel
@@ -442,24 +440,24 @@ def chat(
         from audiobench.core.db_session import get_session
         from audiobench.storage.models import ConversationSummary
 
-        with get_session() as session:
-            record = session.query(ConversationSummary).filter_by(conversation_id=summary).first()
-            if not record:
+        with get_session() as db:
+            summary_record = db.query(ConversationSummary).filter_by(conversation_id=chat_summary).first()
+            if not summary_record:
                 console.print(
                     error_panel(
-                        "Not found", f"Session summary for conversation #{summary} not found."
+                        "Not found", f"Session summary for conversation #{chat_summary} not found."
                     )
                 )
                 import sys
 
                 sys.exit(1)
 
-            md = f"**Narrative**: {record.narrative}\n\n"
-            md += f"**Key Insights**: {record.key_insights}\n\n"
-            md += f"**Open Threads**: {record.open_threads}\n\n"
+            md = f"**Narrative**: {summary_record.narrative}\n\n"
+            md += f"**Key Insights**: {summary_record.key_insights}\n\n"
+            md += f"**Open Threads**: {summary_record.open_threads}\n\n"
 
             console.print(
-                Panel(Markdown(md), title=f"Session Summary #{summary}", border_style="blue")
+                Panel(Markdown(md), title=f"Session Summary #{chat_summary}", border_style="blue")
             )
         import sys
 
@@ -494,21 +492,21 @@ def chat(
     # ── Study Project Integration ──
     current_session_number = None
     transcripts_to_load = []
-    
+
     if project_id is not None:
-        from audiobench.core.db_session import get_session
-        from audiobench.storage.models import StudyProject, StudySession
-        from audiobench.storage.chapter_repository import get_chapter_repo
-        from audiobench.storage.models import ChapterRecord
         import json
         import sys
+
+        from audiobench.core.db_session import get_session
+        from audiobench.storage.chapter_repository import get_chapter_repo
+        from audiobench.storage.models import ChapterRecord, StudyProject, StudySession
 
         with get_session() as db:
             project = db.query(StudyProject).filter_by(id=project_id).first()
             if not project:
                 console.print(error_panel("Not found", f"Study project #{project_id} not found"))
                 sys.exit(1)
-            
+
             # Find the active session
             sess = (
                 db.query(StudySession)
@@ -519,18 +517,18 @@ def chat(
             if not sess:
                 console.print(error_panel("No active session", "Use 'audiobench study resume' to start a new session"))
                 sys.exit(1)
-            
+
             current_session_number = sess.session_number
             audio_file_id = project.audio_file_id
-            
+
             if sess.conversation_id:
                 resume_id = sess.conversation_id
-            
+
             try:
                 chap_list = json.loads(sess.chapter_ids)
             except Exception:
                 chap_list = []
-            
+
             if chap_list:
                 # Load only these chapters
                 for ch_idx in chap_list:
@@ -616,7 +614,7 @@ def chat(
                             from audiobench.core.db_session import get_session
                             from audiobench.storage.chapter_repository import get_chapter_repo
                             from audiobench.storage.models import ChapterRecord
-                            
+
                             for ch_idx in picked:
                                 chap = get_chapter_repo().get_chapter_by_index(audio_file_id, ch_idx)
                                 if chap and chap.id:
@@ -655,14 +653,14 @@ def chat(
     if project_id is not None and resume_id is None:
         from audiobench.core.db_session import get_session
         from audiobench.storage.models import StudySession
-        
+
         conv_id = chat_repo.create_conversation(
             model=session.model,
             title=f"Study Project #{project_id} - Session {current_session_number}",
             session_type="study"
         )
         session._conversation_id = conv_id
-        
+
         with get_session() as db:
             sess = (
                 db.query(StudySession)
@@ -679,10 +677,10 @@ def chat(
 
     from audiobench.chat.chat_repl import ChatREPL
     repl = ChatREPL(
-        session, 
-        tx_repo, 
-        chat_repo, 
-        settings, 
+        session,
+        tx_repo,
+        chat_repo,
+        settings,
         session_type="study" if project_id else "chat",
         project_id=project_id,
         current_session_number=current_session_number,

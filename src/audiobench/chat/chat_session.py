@@ -58,6 +58,8 @@ class ChatSession:
         self._chat_repo = chat_repo
         self._model = model
         self._temperature = temperature
+        self._retry_requested: bool = False
+        self._compare_model: str | None = None
         self._show_thinking = show_thinking
         self._conversation_id = conversation_id
 
@@ -315,7 +317,6 @@ class ChatSession:
         message to the DB and starts title generation in a thread so the
         REPL prompt appears immediately.
         """
-        import threading
 
         response_text = "".join(self._pending_content)
         thinking_text = "".join(self._pending_thinking) or None
@@ -336,19 +337,24 @@ class ChatSession:
         )
 
         # Auto-generate title in background after first exchange
-        if not self._title_generated and self.turn_count >= 1:
-            self._title_generated = True
-            thread = threading.Thread(
-                target=self._generate_title,
-                args=(user_input, response_text),
-                daemon=True,
-            )
-            thread.start()
+        if self.turn_count >= 1:
+            self.generate_title_async(user_input, response_text)
 
         # Cleanup
         self._pending_content.clear()
         self._pending_thinking.clear()
         self._pending_user_input = ""
+
+    def generate_title_async(self, first_message: str, first_response: str) -> None:
+        """Trigger background generation of the conversation title."""
+        if not self._title_generated:
+            self._title_generated = True
+            thread = threading.Thread(
+                target=self._generate_title,
+                args=(first_message, first_response),
+                daemon=True,
+            )
+            thread.start()
 
     def _generate_title(self, first_message: str, first_response: str) -> None:
         """Generate a short title for the conversation using AI."""

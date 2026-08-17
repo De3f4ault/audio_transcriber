@@ -14,6 +14,9 @@ from rich.padding import Padding
 from rich.panel import Panel
 from rich.text import Text
 
+from audiobench.chat.chat_session import ChatSession
+from audiobench.chat.chat_store import ChatRepository
+from audiobench.chat.providers.ollama_provider import AIError, OllamaClient
 from audiobench.cli.display.theme import (
     ACCENT,
     APP_NAME,
@@ -26,13 +29,9 @@ from audiobench.cli.display.theme import (
     console,
     error_panel,
 )
-from audiobench.chat.providers.ollama_provider import AIError
-from audiobench.core.settings import get_settings
 from audiobench.core.db_engine import init_db
-from audiobench.chat.chat_store import ChatRepository
+from audiobench.core.settings import get_settings
 from audiobench.storage.repository import TranscriptionRepository
-from audiobench.chat.chat_session import ChatSession
-from audiobench.chat.providers.ollama_provider import OllamaClient
 
 # ── Chat Help Text ──────────────────────────────────────────
 
@@ -151,10 +150,10 @@ class ChatREPL:
         if self.project_id is None:
             return ""
 
+
         from audiobench.core.db_session import get_session as _db
-        from audiobench.storage.models import StudySession, ConversationSummary
-        from audiobench.memory.memoir_writer import Memoir, CompressionLevel, compress_memoir
-        import json
+        from audiobench.memory.memoir_writer import CompressionLevel, Memoir, compress_memoir
+        from audiobench.storage.models import ConversationSummary, StudySession
 
         current_n = self.current_session_number or 1
 
@@ -237,8 +236,8 @@ class ChatREPL:
             return []
 
         try:
-            from audiobench.memory.retrieval_streams import FTS5Stream
             from audiobench.memory.query_reformulator import ReformulatedQuery
+            from audiobench.memory.retrieval_streams import FTS5Stream
 
             # Minimal reformulation: use the raw question as BM25 keywords
             # (strip the '?' and punctuation)
@@ -426,6 +425,8 @@ class ChatREPL:
             from audiobench.storage.bookmark_repository import (
                 BOOKMARK_TYPES,
                 BookmarkRepository,
+            )
+            from audiobench.storage.bookmark_repository import (
                 _format_timestamp as _bfmt,
             )
 
@@ -474,8 +475,9 @@ class ChatREPL:
             Layout(name="left"),
             Layout(name="right"),
         )
+        from typing import Any
         for side, msg in [("left", msg_a), ("right", msg_b)]:
-            parts = []
+            parts: list[Any] = []
             if msg.get("thinking") and self.session.show_thinking:
                 think_preview = msg["thinking"][:300]
                 if len(msg["thinking"]) > 300:
@@ -609,7 +611,7 @@ class ChatREPL:
                     title="Model Comparison",
                     session_type=self.session_type,
                 )
-
+            assert self.session.conversation_id is not None
             self.chat_repo.add_message(self.session.conversation_id, "user", user_text)
             self.session._messages.append({"role": "user", "content": user_text})
 
@@ -638,7 +640,7 @@ class ChatREPL:
             console.print()
 
             if self.session.turn_count <= 1:
-                self.session._generate_title_async()
+                self.session.generate_title_async(user_text, result["model_a"]["content"])
 
         except KeyboardInterrupt:
             console.print()
@@ -666,7 +668,7 @@ class ChatREPL:
             text = text[3:]
         if text.endswith('"""'):
             text = text[:-3]
-        return text.strip()
+        return str(text.strip())
 
     def _trigger_summary(self) -> None:
         """Trigger summary generation in a background thread."""
@@ -674,6 +676,7 @@ class ChatREPL:
 
         def run_summary():
             import json
+
             from audiobench.chat.summary_generator import SummaryGenerator
             from audiobench.daemon.factory import get_daemon_client
             from audiobench.memory.enums import SourceType
@@ -795,7 +798,7 @@ class ChatREPL:
             console.print(f"  [{BOLD} {ACCENT}]{APP_NAME}[/] — {self.preloaded_title}{conv_label}")
         else:
             console.print(f"  [{BOLD} {ACCENT}]{APP_NAME}[/] — AI Chat{conv_label}")
-        
+
         console.print(f"  [{DIM}]{'─' * 44}[/]")
         console.print(f"    Model:    {self.session.model}")
         ctx_lines = self.session.get_context_summary()

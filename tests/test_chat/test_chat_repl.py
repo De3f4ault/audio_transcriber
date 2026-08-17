@@ -1,5 +1,6 @@
+
 import pytest
-from unittest.mock import MagicMock
+
 
 @pytest.fixture
 def db_session(test_db):  # test_db patches settings, resets engine/session singletons,
@@ -62,7 +63,6 @@ def test_chat_repl_creates_tagged_conversation(db_session, fused_results, mock_u
 
 def test_chat_cmd_uses_chat_repl_not_inline_loop():
     """chat.py must not contain an inline while-loop REPL — it must use ChatREPL."""
-    import ast
     with open("src/audiobench/cli/commands/chat.py") as f:
         source = f.read()
     # ChatREPL must be imported

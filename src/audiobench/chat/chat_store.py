@@ -97,16 +97,17 @@ class ChatRepository:
             # --- PHASE 5: Expression Registration ---
             if role != "system":
                 try:
-                    from audiobench.memory.knowledge_ingester import KnowledgeIngester
                     import threading
-                    
+
+                    from audiobench.memory.knowledge_ingester import KnowledgeIngester
+
                     ingester = KnowledgeIngester()
-                    
+
                     # session.expunge is needed to detach the objects so they can be accessed safely from the thread
                     session.expunge(msg)
                     if conv:
                         session.expunge(conv)
-                    
+
                     # Run ingestion in a background thread to not block the chat
                     threading.Thread(
                         target=ingester.ingest_chat_message,
@@ -220,8 +221,8 @@ class ChatRepository:
             if not conv:
                 return False
 
-            from audiobench.storage.expression_repository import ExpressionRepository
             from audiobench.memory.enums import SourceType
+            from audiobench.storage.expression_repository import ExpressionRepository
 
             ExpressionRepository().delete_by_source(
                 SourceType.CHAT.value, conversation_id
@@ -284,8 +285,8 @@ class ChatRepository:
         """Delete all conversations. Returns number deleted."""
         with get_session() as session:
             conv_ids = [r[0] for r in session.query(ChatConversation.id).all()]
-            from audiobench.storage.expression_repository import ExpressionRepository
             from audiobench.memory.enums import SourceType
+            from audiobench.storage.expression_repository import ExpressionRepository
 
             expr_repo = ExpressionRepository()
             for cid in conv_ids:
