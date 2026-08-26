@@ -1,13 +1,14 @@
 import logging
-import json
 import time
-import numpy as np
 from dataclasses import dataclass, field
+
+import numpy as np
 from sqlalchemy import text as sql_text
 
-from .scheduler import IntelligenceTask
 from audiobench.core.db_session import get_session
 from audiobench.daemon.server import _get_store
+
+from .scheduler import IntelligenceTask
 
 logger = logging.getLogger("audiobench.daemon.intelligence.drift_detector")
 
@@ -46,7 +47,7 @@ class DriftDetector(IntelligenceTask):
         now = time.time()
 
         def _to_iso(unix_ts: float) -> str:
-            return _dt.datetime.fromtimestamp(unix_ts, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            return _dt.datetime.fromtimestamp(unix_ts, tz=_dt.UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
         window_b_start = now - 15 * 86400
         window_a_start = now - 30 * 86400
@@ -77,10 +78,10 @@ class DriftDetector(IntelligenceTask):
                 """),
                 {"start": iso_b_start, "end": iso_now}
             ).mappings().all()
-            
+
         ids_a = [r["id"] for r in rows_a]
         ids_b = [r["id"] for r in rows_b]
-        
+
         if len(ids_a) < self.MIN_ITEMS or len(ids_b) < self.MIN_ITEMS:
             logger.info("Not enough expressions for drift detection.")
             return
@@ -99,29 +100,29 @@ class DriftDetector(IntelligenceTask):
 
         if rc_a.count < self.MIN_ITEMS or rc_b.count < self.MIN_ITEMS:
             return
-            
+
         c_a = rc_a.get_centroid()
         c_b = rc_b.get_centroid()
-        
+
         # Calculate cosine distance: 1 - cosine_similarity
         norm_a = np.linalg.norm(c_a)
         norm_b = np.linalg.norm(c_b)
         if norm_a == 0 or norm_b == 0:
             return
-            
+
         sim = np.dot(c_a, c_b) / (norm_a * norm_b)
         dist = 1.0 - float(sim)
-        
+
         if dist > self.DRIFT_THRESHOLD:
             earliest_id = min(ids_b) if ids_b else None
-            
+
             content = (
                 f"Semantic centroid shift detected over the past 30 days.\n"
                 f"Cosine distance: {dist:.3f} (threshold: {self.DRIFT_THRESHOLD:.2f}).\n"
                 f"Window A centroid covers {rc_a.count} expressions. Window B covers {rc_b.count}.\n"
                 f"Earliest diverging source: expression_id={earliest_id}."
             )
-            
+
             store.add_expression(
                 source_type="system_inference",
                 content=content,

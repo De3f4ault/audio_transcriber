@@ -1,8 +1,9 @@
 import logging
 
-from .scheduler import IntelligenceTask
-from audiobench.daemon.server import _get_store
 from audiobench.daemon.intelligence.calibration import get_calibration_tracker
+from audiobench.daemon.server import _get_store
+
+from .scheduler import IntelligenceTask
 
 logger = logging.getLogger("audiobench.daemon.intelligence.blind_spot_detector")
 
@@ -15,7 +16,7 @@ class BlindSpotDetector(IntelligenceTask):
         logger.info("Running BlindSpotDetector...")
         tracker = get_calibration_tracker()
         store = _get_store()
-        
+
         for region_id, stats in tracker.stats.items():
             if stats.total_inferences >= self.MIN_SAMPLE_SIZE:
                 rate = stats.confirm_rate
@@ -26,7 +27,7 @@ class BlindSpotDetector(IntelligenceTask):
                         f"This region consistently generates low-confidence results.\n"
                         f"Reducing inference frequency for this region by 50%."
                     )
-                    
+
                     try:
                         store.add_expression(
                             source_type="daemon_calibration",

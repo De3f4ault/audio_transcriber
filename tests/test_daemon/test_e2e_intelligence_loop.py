@@ -14,12 +14,11 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
+from sqlalchemy import text as sql_text
 
 from audiobench.core.db_session import get_session
-from sqlalchemy import text as sql_text
 
 
 @pytest.fixture
