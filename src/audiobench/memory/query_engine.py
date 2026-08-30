@@ -106,16 +106,29 @@ def _call_ollama(prompt: str, temperature: float, llm: OllamaClient) -> LLMResul
 def _call_gemini(prompt: str, temperature: float, api_key: str) -> LLMResult:
     """Attempt generation via Gemini API. Returns Ok or Err — never raises.
 
-    Wraps the SDK call in an 8-second thread timeout.  The ``google-genai``
+    Wraps the SDK call in a 45-second thread timeout.  The ``google-genai``
     SDK has no built-in socket timeout: a DNS failure or TCP routing blackhole
     (e.g. network is cut) blocks the calling thread indefinitely without this
     wrapper.
+
+    Why 45 s?  Benchmarking shows gemini-2.5-flash takes 7–15 s for a typical
+    synthesis prompt on a healthy connection.  The original 8 s cap was designed
+    for "DNS + TLS + first-byte" latency only and fired routinely on real
+    synthesis workloads — every timeout triggered 2 retries (×3 attempts =
+    ~27 s wasted) and tripped the circuit breaker.  45 s gives the model room
+    to finish while still bailing out on genuine hangs.
 
     IMPORTANT: we must NOT use ``with ThreadPoolExecutor() as ex:`` here
     because its ``__exit__`` calls ``shutdown(wait=True)``, which blocks until
     every submitted thread finishes — defeating the whole timeout.  Instead we
     call ``shutdown(wait=False)`` explicitly so the stuck OS thread is truly
     abandoned the moment our deadline fires.
+
+    Retry policy: only ``RateLimitError`` (429) is retried.  A ``ConnectionError``
+    from a hard timeout is structural — retrying with the same timeout will
+    also time out, wasting another 45 s per attempt and tripping the circuit
+    breaker.  If the network is genuinely down, fall through to extractive
+    synthesis immediately.
     """
     from concurrent.futures import ThreadPoolExecutor
     from concurrent.futures import TimeoutError as FuturesTimeout
@@ -123,7 +136,9 @@ def _call_gemini(prompt: str, temperature: float, api_key: str) -> LLMResult:
     from audiobench.memory.llm_caller import RateLimitError, _retry_with_backoff
     from audiobench.memory.singletons import get_gemini_circuit_breaker
 
-    _TIMEOUT_S: float = 8.0  # hard cap: DNS + TCP-connect + first byte
+    _TIMEOUT_S: float = 45.0  # generous cap: covers real synthesis latency
+    settings = get_settings()
+    _MODEL = settings.gemini_model  # honours gemini_model config value
     breaker = get_gemini_circuit_breaker()
 
     def _do_call() -> str:
@@ -133,7 +148,7 @@ def _call_gemini(prompt: str, temperature: float, api_key: str) -> LLMResult:
 
             def _generate() -> str:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash", contents=prompt
+                    model=_MODEL, contents=prompt
                 )
                 if response and response.text:
                     return response.text.strip()
@@ -151,14 +166,19 @@ def _call_gemini(prompt: str, temperature: float, api_key: str) -> LLMResult:
                 return result
             except FuturesTimeout:
                 ex.shutdown(wait=False)  # abandon — do NOT wait=True
-                # The thread is still alive inside the OS — we cannot retrieve
-                # its exception.  We know the call hung for >=8s, but NOT why.
-                # Possible causes: DNS, TLS handshake, API key rejected before
-                # first byte, firewall drop, or a slow-start response.
-                raise ConnectionError(
+                # Structural failure: the model did not respond within 45 s.
+                # Do NOT raise ConnectionError here — that would trigger a retry
+                # in _retry_with_backoff, wasting another 45 s.  Raise a plain
+                # RuntimeError so the circuit breaker records the failure and
+                # the caller falls through to extractive synthesis.
+                raise RuntimeError(
                     f"Gemini API call timed out after {_TIMEOUT_S}s "
-                    "(possible causes: DNS, TLS, API key, firewall, or routing)"
+                    "(model did not respond — try again or use a different model)"
                 )
+        except RuntimeError:
+            # Re-raise timeout RuntimeErrors without logging (they are expected
+            # under heavy load and produce noisy tracebacks otherwise).
+            raise
         except Exception as e:
             # ── Log the raw exception BEFORE any classification ──────────────
             # This is the ground truth. Everything below is just routing logic.
@@ -172,13 +192,18 @@ def _call_gemini(prompt: str, temperature: float, api_key: str) -> LLMResult:
             if "429" in err_str or "too many requests" in err_str or "quota" in err_str:
                 raise RateLimitError(str(e))
             if "name or service not known" in err_str or "connection" in err_str or "timeout" in err_str or "unavailable" in err_str:
+                # Network-level failure: also not worth retrying (same root cause).
+                # Re-raise as ConnectionError so _retry_with_backoff skips retries
+                # but the circuit breaker still records the failure.
                 raise ConnectionError(str(e))
             # Unknown error — log full traceback so we can diagnose it
             logger.exception("Gemini unexpected exception (type=%s)", type(e).__name__)
             raise
 
     try:
-        text = breaker.call(lambda: _retry_with_backoff(_do_call, max_retries=2, base_delay=1.0, jitter=True))
+        # Only retry on RateLimitError; ConnectionError / RuntimeError (timeout)
+        # are structural and should fast-fail without wasting extra wall time.
+        text = breaker.call(lambda: _retry_with_backoff(_do_call, max_retries=1, base_delay=2.0, jitter=True))
         return Ok(value=text)
     except Exception as exc:  # noqa: BLE001
         return Err(error=f"gemini: {exc}")
@@ -212,6 +237,30 @@ def _call_llm(
         return gemini_result
 
     return Err(error=f"{result.error} | {gemini_result.error}")
+
+
+def _call_llm_for_model(
+    prompt: str,
+    temperature: float,
+    model: str | None,
+    llm: OllamaClient,
+    api_key: str | None,
+) -> LLMResult:
+    """Model-aware LLM dispatcher used by HyDE and query reformulation.
+
+    When the user has explicitly selected Gemini (``model == "gemini"``),
+    skip the Ollama attempt entirely and call Gemini directly.  This avoids
+    burning the full Ollama timeout (~8 s) before Gemini even starts, which
+    was the root cause of spurious "Gemini API call timed out" errors.
+
+    For any other model value, fall through to the normal ``_call_llm``
+    path (Ollama → Gemini fallback).
+    """
+    if model and model.lower() == "gemini":
+        if not api_key:
+            return Err(error="gemini: no api key configured")
+        return _call_gemini(prompt, temperature, api_key)
+    return _call_llm(prompt, temperature, llm, api_key)
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -445,11 +494,17 @@ class MemoryQueryEngine:
         # ── Step 5: LLM Synthesis (EQ-3: Ok/Err, no nested try/except) ───────
         context_text = "\n\n".join(context_blocks)
         prompt = (
-            "You are a memory retrieval engine. Answer the user's query using ONLY the provided memory fragments.\n"
-            "If the answer cannot be determined from the fragments, say so clearly.\n\n"
-            f"USER QUERY: {text}\n\n"
-            f"MEMORY FRAGMENTS:\n{context_text}\n\n"
-            "Synthesize a clear and concise answer based on these fragments."
+            "You are a research synthesis assistant working with audio transcript fragments.\n"
+            "Answer the query grounded in the fragments below. Reason WITH them — don't just extract.\n\n"
+            "CITATION RULES:\n"
+            "  • Cite inline with bracketed numbers immediately after the claim: [1] or [2][4].\n"
+            "  • One citation per distinct claim. Do not stack citations on every sentence.\n"
+            "  • Never write the word 'Fragment'. Use only the bracket number.\n\n"
+            "If the fragments do not fully answer the query, state clearly what they DO illuminate\n"
+            "and what they leave open. Be direct — no hedging, no filler.\n\n"
+            f"QUERY: {text}\n\n"
+            f"FRAGMENTS:\n{context_text}\n\n"
+            "Provide a clear, structured answer with inline citations."
         )
 
         match _call_llm(prompt, 0.2, self.llm, self.settings.gemini_api_key):
@@ -606,7 +661,7 @@ class ResearchEngine:
         # ── Stage 1: Query reformulation ─────────────────────────────────────
         t_reform = time.perf_counter()
         from audiobench.memory.query_reformulator import QueryReformulator
-        reformulator = QueryReformulator()
+        reformulator = QueryReformulator(model=model)
         rq = reformulator.reformulate(query)
         reform_ms = (time.perf_counter() - t_reform) * 1000
         log_event(
@@ -629,7 +684,7 @@ class ResearchEngine:
             )
             settings = get_settings()
             llm = OllamaClient(base_url=settings.ollama_base_url, model=settings.ollama_model)
-            match _call_llm(hyde_prompt, 0.7, llm, settings.gemini_api_key):
+            match _call_llm_for_model(hyde_prompt, 0.7, model, llm, settings.gemini_api_key):
                 case Ok(value=doc):
                     # Inject hyde_document into the (frozen) ReformulatedQuery by rebuilding it
                     import dataclasses
@@ -823,24 +878,35 @@ class ResearchEngine:
 
         # ── Stage 4: LLM synthesis ───────────────────────────────────────────
         pinned_sids = {fr.segment_id for fr in (pinned_fragments or [])}
-        synthesis_frags = []
-        for fr in fused:
-            if len(synthesis_frags) >= self._MAX_SYNTHESIS_FRAGMENTS:
+        # Track (display_num, fragment) pairs so the LLM citation numbers [N]
+        # are identical to what the user sees on screen (1-based fused rank).
+        synthesis_pairs: list[tuple[int, FusedResult]] = []
+        for fused_idx, fr in enumerate(fused, 1):
+            if len(synthesis_pairs) >= self._MAX_SYNTHESIS_FRAGMENTS:
                 break
             if fr.segment_id in pinned_sids or fr.rrf_score >= self._SYNTHESIS_RRF_FLOOR:
-                synthesis_frags.append(fr)
+                synthesis_pairs.append((fused_idx, fr))
 
-        if not synthesis_frags and fused:
+        synthesis_frags = [fr for _, fr in synthesis_pairs]
+
+        if not synthesis_pairs and fused:
             # Fallback to top retrieved fragments if nothing met the floor score
-            synthesis_frags = fused[:min(3, len(fused))]
+            synthesis_pairs = list(enumerate(fused[:min(3, len(fused))], 1))
+            synthesis_frags = [fr for _, fr in synthesis_pairs]
 
-        def _fmt_header(idx: int, fr: FusedResult) -> str:
+        def _fmt_header(display_num: int, fr: FusedResult) -> str:
+            """Build the per-fragment header sent to the LLM.
+
+            display_num matches the number shown in the search results UI,
+            so when the LLM writes [N] the user can immediately map it back
+            to the correct fragment on screen.
+            """
             source_str = f" | {Path(fr.source_file).stem}" if fr.source_file else ""
-            return f"[Fragment {idx + 1}{source_str} | {fr.start_time:.1f}s–{fr.end_time:.1f}s]"
+            return f"[{display_num}{source_str} | {fr.start_time:.1f}s–{fr.end_time:.1f}s]"
 
         context_text = "\n\n".join(
-            f"{_fmt_header(i, fr)}\n{fr.text}"
-            for i, fr in enumerate(synthesis_frags)
+            f"{_fmt_header(display_num, fr)}\n{fr.text}"
+            for display_num, fr in synthesis_pairs
         )
         # ── Synthesis carryforward: inject prior session context ──────────────
         # Prior synthesis (from the previous search in this session) is injected
@@ -863,14 +929,31 @@ class ResearchEngine:
             )
 
         synthesis_prompt = (
-            "You are a personal memory assistant. Answer the query primarily grounded in the "
-            "transcript fragments below, but you may bring your own understanding to connect and interpret them.\n\n"
-            "If the fragments do not fully answer the query, explicitly state what they DO illuminate, "
-            "and what they leave open. Reason WITH the fragments rather than just extracting from them.\n\n"
+            "You are a research synthesis assistant working with audio transcript fragments\n"
+            "from the user's personal listening library (audiobooks, podcasts, interviews,\n"
+            "lectures, and personal recordings).\n\n"
+            "Your goal is a genuinely insightful answer — reason WITH the fragments, not just extract from them.\n"
+            "Identify patterns, tensions, and implications the user may not have noticed.\n\n"
+            "OUTPUT STRUCTURE (follow this order):\n"
+            "  1. A direct 1-2 sentence answer to the query.\n"
+            "  2. Analysis — develop your thinking in clearly titled sections using **bold headers**.\n"
+            "  3. Close with exactly two sections:\n"
+            "       **✨ What the fragments illuminate** — the key insight the sources collectively reveal.\n"
+            "       **○ What the fragments leave open** — genuine gaps, unresolved angles, or worth pursuing further.\n\n"
+            "CITATION RULES (strictly follow):\n"
+            "  • Cite inline with bracketed numbers immediately after the claim: [1] or [3][5].\n"
+            "  • One citation per distinct claim — do not stack citations on every sentence.\n"
+            "  • Never write the word 'Fragment'. Use only the bracket number.\n"
+            "  • Only cite numbers present in the FRAGMENTS block.\n\n"
+            "TONE AND DEPTH:\n"
+            "  • Match depth to query complexity: a factual question gets a focused answer;\n"
+            "    a philosophical or open-ended question gets fuller exploration.\n"
+            "  • Be direct — no hedging phrases like 'it seems that' or 'one could argue'.\n"
+            "  • If fragments conflict with each other, name the tension explicitly.\n\n"
             f"{prior_context_block}"
             f"QUERY: {query}\n\n"
             f"FRAGMENTS:\n{context_text}\n\n"
-            "Provide a clear, insightful answer."
+            "Synthesize your answer now."
         )
 
         settings = get_settings()

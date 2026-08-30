@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import TypeVar
 
 logger = logging.getLogger("memory.llm_caller")
 
@@ -28,7 +28,7 @@ class CircuitBreaker:
     def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 60.0) -> None:
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
-        
+
         self.failures = 0
         self.state = "CLOSED"
         self.last_failure_time = 0.0
@@ -52,11 +52,22 @@ class CircuitBreaker:
         self._record_success()
         return result
 
+    def reset(self) -> None:
+        """Manually reset the circuit to CLOSED so calls are retried immediately.
+
+        Call this when the user changes model or explicitly requests a retry,
+        so a previous Gemini network failure does not keep blocking local Ollama.
+        """
+        self.failures = 0
+        self.state = "CLOSED"
+        self.last_failure_time = 0.0
+        logger.info("CircuitBreaker manually reset to CLOSED state.")
+
     def _record_failure(self) -> None:
         """Record a failure and potentially trip the circuit."""
         self.failures += 1
         self.last_failure_time = time.monotonic()
-        
+
         if self.state == "HALF_OPEN":
             # Probe failed, trip immediately
             self.state = "OPEN"
@@ -79,7 +90,16 @@ def _retry_with_backoff(
     base_delay: float = 1.0,
     jitter: bool = False,
 ) -> T:
-    """Execute a function with exponential backoff on RateLimitError."""
+    """Execute a function with exponential backoff on RateLimitError.
+
+    Only ``RateLimitError`` (HTTP 429 / quota exceeded) is retried — these
+    are transient and waiting resolves them.
+
+    ``ConnectionError`` (network failure, TCP timeout) and ``RuntimeError``
+    (hard deadline timeout from the thread pool) are **not** retried: the same
+    root cause will reproduce on the next attempt, wasting equal time and
+    potentially tripping the circuit breaker with redundant failures.
+    """
     import random
 
     retries = 0
@@ -88,13 +108,14 @@ def _retry_with_backoff(
             return fn()
         except RateLimitError as exc:
             if retries >= max_retries:
-                logger.error("Max retries (%d) exceeded after RateLimitError.", max_retries)
+                logger.error("Max retries (%d) exceeded after rate-limit: %s", max_retries, exc)
                 raise exc
-            
+
             delay = base_delay * (2 ** retries)
             if jitter:
                 delay = delay * random.uniform(0.5, 1.5)
-                
+
             retries += 1
-            logger.warning("Rate limit hit. Retrying in %.2fs (attempt %d/%d).", delay, retries, max_retries)
+            logger.warning("Rate-limit hit (retry %d/%d), sleeping %.2fs: %s", retries, max_retries, delay, exc)
             time.sleep(delay)
+
